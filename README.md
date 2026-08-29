@@ -35,9 +35,64 @@ omo install ./local/path
 
 1. omo를 실행하고 `/login glm-zcode`를 입력합니다.
 2. 브라우저에서 Z.AI 로그인 페이지가 열립니다. 로그인을 완료합니다.
-3. 로그인 후 브라우저가 `zcode://` 주소로 리다이렉트됩니다. 주소창의 전체 URL을 복사해 터미널에 붙여넣습니다.
-   > **보안:** 붙여넣는 완전한 `zcode://` 콜백 URL에는 일회용 인증 정보가 포함되므로 전체 URL을 비공개로 유지하세요.
+3. 로그인이 끝나면 브라우저가 `zcode://oauth/callback?code=...&state=...` 주소로 리다이렉트됩니다. **이 전체 URL을 복사해 터미널에 붙여넣습니다.** 복사 방법은 아래 [콜백 URL 가져오기](#콜백-url-가져오기)를 참고하세요.
 4. 끝. 자동으로 토큰 교환과 API 키 프로비저닝이 진행되고 로그인이 완료됩니다.
+
+## 콜백 URL 가져오기
+
+리다이렉트 주소가 `https://`가 아니라 `zcode://` 커스텀 프로토콜이라, **ZCode 데스크톱 앱이 설치되어 있으면 OS가 그 주소를 앱으로 넘겨버립니다.** 그래서 주소창에 URL이 남지 않고 ZCode 앱만 열리는 현상이 생깁니다. 아래 방법으로 URL을 가로채 복사하세요.
+
+> **가장 중요**
+>
+> - 브라우저가 띄우는 **"ZCode을(를) 여시겠습니까?" 다이얼로그는 반드시 `취소`** 하세요.
+> - 앱을 열어버리면 일회용 authorization code가 **ZCode 앱에서 소모**되어, 같은 URL을 붙여넣어도 교환에 실패합니다. 그때는 `/login glm-zcode`부터 다시 시작해야 합니다.
+> - 이 URL에는 일회용 인증 정보가 들어 있습니다. 절대 공유하지 마세요 (PKCE가 없는 플로우라 코드 유출 시 계정 접근에 악용될 수 있습니다).
+
+### 방법 A — Chrome / Edge (권장)
+
+1. `/login glm-zcode` 실행 후 브라우저가 열리면, **로그인하기 전에** 개발자도구를 엽니다 (`F12` 또는 macOS `⌥⌘I`).
+2. **Network(네트워크) 탭**으로 이동한 뒤 **`Preserve log`(로그 유지)** 를 체크합니다. 리다이렉트로 기록이 지워지는 것을 막아 줍니다.
+3. Z.AI 로그인을 완료합니다.
+4. "ZCode을(를) 여시겠습니까?" 다이얼로그가 뜨면 **취소**를 누릅니다.
+5. Network 탭 목록에서 `zcode://oauth/callback?...` 항목을 찾습니다. 보통 실패 상태(`ERR_UNKNOWN_URL_SCHEME`)로 표시됩니다.
+6. 그 항목을 우클릭 → **Copy → Copy link address** (또는 항목 클릭 후 Headers의 Request URL 복사) 로 전체 URL을 복사합니다.
+7. 터미널의 omo 프롬프트에 붙여넣습니다.
+
+### 방법 B — Firefox (가장 간단)
+
+1. Firefox로 로그인 플로우를 진행합니다.
+2. 앱 열기 다이얼로그를 **취소**합니다.
+3. **주소창에 `zcode://oauth/callback?code=...&state=...` 전체 URL이 그대로 남아 있습니다.** 그대로 복사해 붙여넣으면 됩니다.
+
+### 방법 C — ZCode 앱이 설치되지 않은 환경
+
+ZCode 데스크톱 앱이 없는 브라우저 프로필/기기라면 프로토콜 핸들러가 없어서, 리다이렉트 시 "주소를 이해할 수 없습니다" 류의 오류 페이지가 뜨고 **주소창에 전체 URL이 그대로 남습니다.** 가장 확실한 방법입니다.
+
+> 참고: 시크릿 모드는 도움이 되지 않습니다. 프로토콜 핸들러 등록은 브라우저 프로필이 아니라 **OS 레벨**이기 때문입니다.
+
+### 방법 D — Safari
+
+Safari는 기본적으로 개발자 도구가 꺼져 있습니다. `설정 → 고급 → 메뉴 막대에서 개발자용 메뉴 보기`를 켠 뒤 웹 인스펙터의 네트워크 탭에서 방법 A와 동일하게 진행하거나, 더 간단한 방법 B(Firefox)를 사용하세요.
+
+### 붙여넣을 형태
+
+```
+zcode://oauth/callback?code=<authorization-code>&state=<state>
+```
+
+- **전체 URL**이 필요합니다. `code` 값만 붙여넣으면 거부됩니다.
+- `state` 값은 로그인 시도마다 새로 생성되므로, **지금 진행 중인 시도의 URL**이어야 합니다.
+
+### 문제 해결
+
+| 메시지 | 원인과 해결 |
+|---|---|
+| `GLM ZCode requires the complete zcode:// callback URL` | code 값만 붙여넣었거나 URL 형식이 아닙니다. 전체 URL을 복사하세요. |
+| `GLM ZCode callback URL is invalid` | 프로토콜·호스트·경로가 다르거나(`zcode://oauth/callback`이어야 함) 포트·해시 등 불필요한 요소가 붙었습니다. |
+| `GLM ZCode callback URL must contain exactly one non-empty code and state` | URL이 잘렸습니다. 주소 전체를 다시 복사하세요. |
+| `GLM ZCode callback state did not match` | 이전 로그인 시도의 URL입니다. `/login glm-zcode`를 다시 실행해 새 URL을 받으세요. |
+| broker 요청 실패 (`400` 등) | 앱이 code를 이미 소모했거나 만료됐습니다. 앱 열기 다이얼로그를 취소하고 처음부터 다시 시도하세요. |
+| 로그인은 됐는데 호출 시 `1113 Insufficient balance or no resource package` | 확장 문제가 아니라 **Z.AI 계정에 활성 리소스 패키지/잔액이 없는 것**입니다. Coding Plan이 활성화된 계정으로 다시 로그인하거나 Z.AI 대시보드에서 충전하세요. |
 
 ## 모델
 
