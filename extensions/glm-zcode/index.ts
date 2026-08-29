@@ -1,7 +1,13 @@
 import type { ExtensionAPI, ProviderConfig, ProviderModelConfig } from "@code-yeongyu/senpi";
 import type { RefreshModelsContext } from "@earendil-works/pi-ai";
 import type { OAuthCredentials } from "@earendil-works/pi-ai/compat";
-import { CATALOG_TTL_MS, catalogToPersistedModels, fetchCatalogModels, storedToConfig } from "./models.js";
+import {
+  CATALOG_TTL_MS,
+  catalogToPersistedModels,
+  fetchCatalogModels,
+  storedToConfig,
+  thinkingConfigFor,
+} from "./models.js";
 import { loginGlmZcode, refreshGlmZcode } from "./oauth.js";
 
 // Static fallback for offline/first-run before catalog fetch.
@@ -14,6 +20,7 @@ const MODELS = [
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 1_000_000,
     maxTokens: 131_072,
+    ...thinkingConfigFor(undefined),
   },
 ] satisfies ProviderModelConfig[];
 

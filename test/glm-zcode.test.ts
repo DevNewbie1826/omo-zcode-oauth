@@ -3,7 +3,11 @@ import type { RefreshModelsContext } from "@earendil-works/pi-ai";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import glmZcodeExtension from "../extensions/glm-zcode/index.js";
-import { fetchCatalogModels } from "../extensions/glm-zcode/models.js";
+import {
+  catalogToPersistedModels,
+  fetchCatalogModels,
+  storedToConfig,
+} from "../extensions/glm-zcode/models.js";
 import { loginGlmZcode, refreshGlmZcode } from "../extensions/glm-zcode/oauth.js";
 
 type RegisteredProvider = {
@@ -146,6 +150,8 @@ describe("glm-zcode extension", () => {
       id: "glm-5.3",
       contextWindow: 1_000_000,
       maxTokens: 131_072,
+      thinkingLevelMap: { medium: "low", xhigh: "max" },
+      compat: { supportsDisabledThinking: false },
     });
 
     expect(config.oauth).toBeDefined();
@@ -349,12 +355,14 @@ describe("dynamic model catalog", () => {
         "glm-text": {
           name: "GLM Text",
           reasoning: true,
+          reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }],
           limit: { context: 1_000_000, output: 131_072 },
           modalities: { input: ["text"] },
         },
         "glm-multimodal": {
           name: "GLM Multimodal",
           reasoning: false,
+          reasoning_options: [{ type: "toggle" }],
           limit: { context: 250_000, output: 32_768 },
           modalities: { input: ["text", "image", "video", "pdf"] },
         },
@@ -372,6 +380,15 @@ describe("dynamic model catalog", () => {
         "glm-notarecord": "not-an-object",
       },
     },
+  };
+
+  const expectedThinkingLevelMap = {
+    minimal: "low",
+    low: "low",
+    medium: "low",
+    high: "high",
+    xhigh: "max",
+    max: "max",
   };
 
   const persistedModel = {
@@ -417,6 +434,8 @@ describe("dynamic model catalog", () => {
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 1_000_000,
         maxTokens: 131_072,
+        thinkingLevelMap: expectedThinkingLevelMap,
+        compat: { supportsDisabledThinking: false },
       },
       {
         id: "glm-multimodal",
@@ -426,6 +445,7 @@ describe("dynamic model catalog", () => {
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 250_000,
         maxTokens: 32_768,
+        thinkingLevelMap: expectedThinkingLevelMap,
       },
       {
         id: "glm-noname",
@@ -435,12 +455,42 @@ describe("dynamic model catalog", () => {
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 500_000,
         maxTokens: 8_192,
+        thinkingLevelMap: expectedThinkingLevelMap,
+        compat: { supportsDisabledThinking: false },
       },
     ]);
     expect(models).toHaveLength(3);
     expect(models.find((model) => model.id === "glm-noname")?.name).toBe("glm-noname");
     expect(models.some((model) => model.id === "glm-broken")).toBe(false);
     expect(models.some((model) => model.id === "glm-notarecord")).toBe(false);
+  });
+
+  test("persists and restores thinking configuration", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => json(catalogPayload)));
+    const models = await fetchCatalogModels();
+
+    const persisted = catalogToPersistedModels(models);
+
+    expect(persisted.find((model) => model.id === "glm-text")).toMatchObject({
+      thinkingLevelMap: expectedThinkingLevelMap,
+      compat: { supportsDisabledThinking: false },
+    });
+    expect(persisted.find((model) => model.id === "glm-multimodal")).toMatchObject({
+      thinkingLevelMap: expectedThinkingLevelMap,
+    });
+    expect(persisted.find((model) => model.id === "glm-multimodal")).not.toHaveProperty("compat");
+    expect(persisted.find((model) => model.id === "glm-noname")).toMatchObject({
+      thinkingLevelMap: expectedThinkingLevelMap,
+      compat: { supportsDisabledThinking: false },
+    });
+    expect(storedToConfig({ models: persisted })).toEqual(models);
+  });
+
+  test("applies conservative thinking defaults to legacy stored models", () => {
+    expect(storedToConfig({ models: [persistedModel] })[0]).toMatchObject({
+      thinkingLevelMap: expectedThinkingLevelMap,
+      compat: { supportsDisabledThinking: false },
+    });
   });
 
   test("refreshModels fetches, publishes, and returns valid models", async () => {
@@ -500,6 +550,8 @@ describe("dynamic model catalog", () => {
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 500_000,
         maxTokens: 8_192,
+        thinkingLevelMap: expectedThinkingLevelMap,
+        compat: { supportsDisabledThinking: false },
       },
     ]);
     expect(fetch).not.toHaveBeenCalled();

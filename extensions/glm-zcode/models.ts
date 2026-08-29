@@ -7,6 +7,16 @@ export const CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 
+// Z.AI anthropic endpoint accepts only low/high/max (error 1210 otherwise).
+export const ZAI_THINKING_LEVEL_MAP = {
+  minimal: "low",
+  low: "low",
+  medium: "low",
+  high: "high",
+  xhigh: "max",
+  max: "max",
+} as const;
+
 type JsonRecord = Record<string, unknown>;
 type InputModality = ProviderModelConfig["input"][number];
 
@@ -26,6 +36,25 @@ function filteredInput(value: unknown): ProviderModelConfig["input"] | undefined
 
 function finiteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function nullableStringRecord(value: unknown): Record<string, string | null> | undefined {
+  if (!isRecord(value) || !Object.values(value).every((entry) => typeof entry === "string" || entry === null)) {
+    return undefined;
+  }
+  return { ...value } as Record<string, string | null>;
+}
+
+export function thinkingConfigFor(
+  reasoningOptions: unknown,
+): Pick<ProviderModelConfig, "thinkingLevelMap" | "compat"> {
+  const firstOption = Array.isArray(reasoningOptions) ? reasoningOptions[0] : undefined;
+  const reasoningType = isRecord(firstOption) ? firstOption.type : undefined;
+
+  return {
+    thinkingLevelMap: { ...ZAI_THINKING_LEVEL_MAP },
+    compat: reasoningType === "toggle" ? undefined : { supportsDisabledThinking: false },
+  };
 }
 
 export async function fetchCatalogModels(signal?: AbortSignal): Promise<ProviderModelConfig[]> {
@@ -55,6 +84,7 @@ export async function fetchCatalogModels(signal?: AbortSignal): Promise<Provider
       cost: { ...ZERO_COST },
       contextWindow: limit.context,
       maxTokens: finiteNumber(limit.output) ? limit.output : 131_072,
+      ...thinkingConfigFor(model.reasoning_options),
     });
   }
   return models;
@@ -77,6 +107,8 @@ export function catalogToPersistedModels(models: ProviderModelConfig[]): Record<
     },
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
+    ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),
+    ...(model.compat ? { compat: { ...model.compat } } : {}),
   }));
 }
 
@@ -88,6 +120,14 @@ export function storedToConfig(stored: { models?: unknown } | undefined): Provid
     if (!isRecord(model)) continue;
     const input = filteredInput(model.input);
     const cost = model.cost;
+    const thinkingLevelMap = nullableStringRecord(model.thinkingLevelMap) as
+      | ProviderModelConfig["thinkingLevelMap"]
+      | undefined;
+    const compat = isRecord(model.compat) ? ({ ...model.compat } as ProviderModelConfig["compat"]) : undefined;
+    const thinkingConfig =
+      thinkingLevelMap === undefined
+        ? thinkingConfigFor(undefined)
+        : { thinkingLevelMap, ...(compat ? { compat } : {}) };
     if (
       typeof model.id !== "string" ||
       model.id.length === 0 ||
@@ -121,6 +161,7 @@ export function storedToConfig(stored: { models?: unknown } | undefined): Provid
       },
       contextWindow: model.contextWindow,
       maxTokens: model.maxTokens,
+      ...thinkingConfig,
     });
   }
   return models;
