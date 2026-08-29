@@ -364,6 +364,12 @@ describe("dynamic model catalog", () => {
           limit: { output: 4_096 },
           modalities: { input: ["text"] },
         },
+        "glm-noname": {
+          reasoning: true,
+          limit: { context: 500_000, output: 8_192 },
+          modalities: { input: ["text"] },
+        },
+        "glm-notarecord": "not-an-object",
       },
     },
   };
@@ -421,8 +427,20 @@ describe("dynamic model catalog", () => {
         contextWindow: 250_000,
         maxTokens: 32_768,
       },
+      {
+        id: "glm-noname",
+        name: "glm-noname",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 500_000,
+        maxTokens: 8_192,
+      },
     ]);
+    expect(models).toHaveLength(3);
+    expect(models.find((model) => model.id === "glm-noname")?.name).toBe("glm-noname");
     expect(models.some((model) => model.id === "glm-broken")).toBe(false);
+    expect(models.some((model) => model.id === "glm-notarecord")).toBe(false);
   });
 
   test("refreshModels fetches, publishes, and returns valid models", async () => {
@@ -432,13 +450,20 @@ describe("dynamic model catalog", () => {
 
     const models = await registeredRefreshModels()(context({ publish }));
 
-    expect(models).toHaveLength(2);
-    expect(models.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal"]);
+    expect(models).toHaveLength(3);
+    expect(models.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal", "glm-noname"]);
     expect(publish).toHaveBeenCalledOnce();
     const publication = publish.mock.calls[0]?.[0];
-    expect(publication?.persist?.models).toBeInstanceOf(Array);
+    const persisted = publication?.persist?.models;
+    expect(persisted).toBeInstanceOf(Array);
+    expect(persisted).toHaveLength(3);
+    expect([...(persisted ?? [])].map((model) => model.id).sort()).toEqual([
+      "glm-multimodal",
+      "glm-noname",
+      "glm-text",
+    ]);
     expect(
-      publication?.persist?.models.every(
+      persisted?.every(
         (model) =>
           model.provider === "glm-zcode" &&
           model.api === "anthropic-messages" &&
@@ -513,7 +538,7 @@ describe("dynamic model catalog", () => {
     );
 
     expect(fetch).toHaveBeenCalledOnce();
-    expect(models?.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal"]);
+    expect(models?.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal", "glm-noname"]);
   });
 
   test("force bypasses the stored-model TTL", async () => {
@@ -525,6 +550,57 @@ describe("dynamic model catalog", () => {
     );
 
     expect(fetch).toHaveBeenCalledOnce();
-    expect(models?.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal"]);
+    expect(models?.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal", "glm-noname"]);
+  });
+
+  test("publish failure keeps existing models without throwing", async () => {
+    // pins current behavior — publish rejection discards the fresh list in favor of the stored snapshot; changing to return-fresh-on-publish-failure requires a production change (tracked in PR description).
+    const fetch = vi.fn(async () => json(catalogPayload));
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(
+      context({
+        publish: vi.fn(async () => {
+          throw new Error("disk full");
+        }),
+        stored: {
+          models: [
+            {
+              provider: "glm-zcode",
+              api: "anthropic-messages",
+              baseUrl: "https://api.z.ai/api/anthropic",
+              id: "glm-stored",
+              name: "GLM Stored",
+              reasoning: true,
+              input: ["text"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 1_000_000,
+              maxTokens: 131_072,
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(models).toHaveLength(1);
+    expect(models?.[0]?.id).toBe("glm-stored");
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  test("publish failure without stored models returns undefined without throwing", async () => {
+    const fetch = vi.fn(async () => json(catalogPayload));
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(
+      registeredRefreshModels()(
+        context({
+          publish: vi.fn(async () => {
+            throw new Error("disk full");
+          }),
+          stored: undefined,
+        }),
+      ),
+    ).resolves.toBeUndefined();
+    expect(fetch).toHaveBeenCalledOnce();
   });
 });
