@@ -1,0 +1,423 @@
+diff --git a/packages/coding-agent/src/core/extensions/builtin/AGENTS.md b/packages/coding-agent/src/core/extensions/builtin/AGENTS.md
+index 20fe085d96..dd43d0fba0 100644
+--- a/packages/coding-agent/src/core/extensions/builtin/AGENTS.md
++++ b/packages/coding-agent/src/core/extensions/builtin/AGENTS.md
+@@ -1,6 +1,6 @@
+ # packages/coding-agent/src/core/extensions/builtin
+ 
+-25 in-tree extensions. Each is the canonical answer to "can senpi do X without core changes?". Registration order matters.
++26 in-tree extensions. Each is the canonical answer to "can senpi do X without core changes?". Registration order matters.
+ 
+ ## INVENTORY (registration order from `builtin/index.ts`)
+ 
+@@ -28,9 +28,10 @@
+ | 20 | `nested-agents-md` | `nested-agents-md/` | Auto-injects nearby `AGENTS.md` + `/nested-agents`; vendored from `../pi-extensions/pi-nested-agents-md` |
+ | 21 | `rules` | `rules/` | Rule-file discovery + `/rules`/`/reload-rules`; vendored from `../pi-extensions/pi-rules` |
+ | 22 | `goal` | `goal/` | Budget-free goal tools + `/goal`; vendored from `../pi-extensions/pi-goal` |
+-| 23 | `btw` | `btw/` | `/btw` side-question command that queries in parallel without touching the main session |
+-| 24 | `config-reload` | `config-reload/` | Hash-gated watcher for trusted global/project config surfaces that defers a full session reload until idle and exposes the `config-watch:*` event protocol; registered after settings-dependent builtins so a reload rebuilds their resolved settings, and before final MCP observation |
+-| 25 | `mcp` | `mcp/` | Built-in MCP client: `mcpServers` config, stdio/http transports, `/mcp` commands, tool exposure policy — see `mcp/changes.md` |
++| 23 | `glm-zcode` | `glm-zcode/` | Unofficial ZCode OAuth login that provisions a Z.AI API key for GLM-5.2 |
++| 24 | `btw` | `btw/` | `/btw` side-question command that queries in parallel without touching the main session |
++| 25 | `config-reload` | `config-reload/` | Hash-gated watcher for trusted global/project config surfaces that defers a full session reload until idle and exposes the `config-watch:*` event protocol; registered after settings-dependent builtins so a reload rebuilds their resolved settings, and before final MCP observation |
++| 26 | `mcp` | `mcp/` | Built-in MCP client: `mcpServers` config, stdio/http transports, `/mcp` commands, tool exposure policy — see `mcp/changes.md` |
+ 
+ Plus bundled extension **codemode** (`@code-yeongyu/senpi-codemode`, resolved by resource-loader.ts) and 4 **global default extensions** (resolved fast-path): `diff`, `files`, `prompt-url-widget`, `tps` (in `globalDefaultExtensionFactories`).
+ 
+diff --git a/packages/coding-agent/src/core/extensions/builtin/glm-zcode/index.ts b/packages/coding-agent/src/core/extensions/builtin/glm-zcode/index.ts
+new file mode 100644
+index 0000000000..f0f310eeb9
+--- /dev/null
++++ b/packages/coding-agent/src/core/extensions/builtin/glm-zcode/index.ts
+@@ -0,0 +1,31 @@
++import type { ExtensionAPI, ProviderModelConfig } from "../../types.ts";
++import { loginGlmZcode, refreshGlmZcode } from "./oauth.ts";
++
++const MODELS = [
++	{
++		id: "glm-5.2",
++		name: "GLM-5.2",
++		reasoning: true,
++		input: ["text"],
++		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++		contextWindow: 1_000_000,
++		maxTokens: 131_072,
++	},
++] satisfies ProviderModelConfig[];
++
++export default function glmZcodeExtension(pi: ExtensionAPI): void {
++	pi.registerProvider("glm-zcode", {
++		name: "GLM ZCode (unofficial)",
++		baseUrl: "https://api.z.ai/api/anthropic",
++		api: "anthropic-messages",
++		authHeader: true,
++		headers: { "User-Agent": "ZCode/3.1.2", "X-ZCode-Agent": "glm", "X-ZCode-Version": "3.1.2" },
++		models: MODELS,
++		oauth: {
++			name: "GLM ZCode (unofficial)",
++			login: loginGlmZcode,
++			refreshToken: refreshGlmZcode,
++			getApiKey: (credentials) => credentials.access,
++		},
++	});
++}
+diff --git a/packages/coding-agent/src/core/extensions/builtin/glm-zcode/oauth.ts b/packages/coding-agent/src/core/extensions/builtin/glm-zcode/oauth.ts
+new file mode 100644
+index 0000000000..d30ee1eaee
+--- /dev/null
++++ b/packages/coding-agent/src/core/extensions/builtin/glm-zcode/oauth.ts
+@@ -0,0 +1,169 @@
++import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/compat";
++
++const AUTHORIZE_URL = "https://chat.z.ai/api/oauth/authorize";
++const BROKER_URL = "https://zcode.z.ai/api/v1/oauth/token";
++const ZAI_API_BASE_URL = "https://api.z.ai";
++const ZAI_LOGIN_URL = `${ZAI_API_BASE_URL}/api/auth/z/login`;
++const CLIENT_ID = "client_P8X5CMWmlaRO9gyO-KSqtg";
++const REDIRECT_URI = "zcode://oauth/callback";
++const API_KEY_NAME = "zcode-api-key";
++const REPROVISION_INTERVAL_MS = 55 * 60 * 1000;
++type JsonRecord = Record<string, unknown>;
++
++function isRecord(value: unknown): value is JsonRecord {
++	return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function data(payload: unknown): JsonRecord {
++	if (!isRecord(payload)) throw new Error("GLM ZCode response was not an object");
++	return isRecord(payload.data) ? payload.data : payload;
++}
++
++async function request(
++	url: string,
++	options: RequestInit,
++	signal: AbortSignal | undefined,
++	label: string,
++): Promise<unknown> {
++	if (signal?.aborted) throw signal.reason ?? new Error("GLM ZCode login cancelled");
++	const response = await fetch(url, { ...options, signal });
++	if (!response.ok) throw new Error(`GLM ZCode ${label} request failed: ${response.status}`);
++	return response.json();
++}
++
++async function post(
++	url: string,
++	body: JsonRecord,
++	signal: AbortSignal | undefined,
++	label: string,
++	token?: string,
++): Promise<unknown> {
++	return request(
++		url,
++		{
++			method: "POST",
++			headers: {
++				Accept: "application/json",
++				"Content-Type": "application/json",
++				...(token ? { Authorization: `Bearer ${token}` } : {}),
++			},
++			body: JSON.stringify(body),
++		},
++		signal,
++		label,
++	);
++}
++
++async function get(url: string, signal: AbortSignal | undefined, label: string, token: string): Promise<unknown> {
++	return request(url, { headers: { Accept: "application/json", Authorization: `Bearer ${token}` } }, signal, label);
++}
++
++function callbackCode(value: string, state: string): string {
++	const input = value.trim();
++	if (!input) throw new Error("GLM ZCode authorization code is required");
++	let callback: URL;
++	try {
++		callback = new URL(input);
++	} catch {
++		throw new Error("GLM ZCode requires the complete zcode:// callback URL");
++	}
++	if (
++		callback.protocol !== "zcode:" ||
++		callback.hostname !== "oauth" ||
++		callback.pathname !== "/callback" ||
++		callback.port ||
++		callback.username ||
++		callback.password ||
++		callback.hash
++	) {
++		throw new Error("GLM ZCode callback URL is invalid");
++	}
++	const codes = callback.searchParams.getAll("code");
++	const states = callback.searchParams.getAll("state");
++	if (codes.length !== 1 || states.length !== 1 || !codes[0] || !states[0]) {
++		throw new Error("GLM ZCode callback URL must contain exactly one non-empty code and state");
++	}
++	if (states[0] !== state) throw new Error("GLM ZCode callback state did not match");
++	return codes[0];
++}
++
++async function provision(upstreamToken: string, signal: AbortSignal | undefined): Promise<OAuthCredentials> {
++	const login = await post(ZAI_LOGIN_URL, { token: upstreamToken }, signal, "z/login");
++	const businessToken = data(login).access_token;
++	if (typeof businessToken !== "string" || !businessToken)
++		throw new Error("GLM ZCode z/login response missing data.access_token");
++	const customer = data(
++		await get(`${ZAI_API_BASE_URL}/api/biz/customer/getCustomerInfo`, signal, "getCustomerInfo", businessToken),
++	);
++	const organizations = Array.isArray(customer.organizations) ? customer.organizations.filter(isRecord) : [];
++	const organization = organizations.find((entry) => entry.isDefault === true) ?? organizations[0];
++	const projects = organization && Array.isArray(organization.projects) ? organization.projects.filter(isRecord) : [];
++	const project = projects.find((entry) => entry.isDefault === true) ?? projects[0];
++	const organizationId = organization?.organizationId;
++	const projectId = project?.projectId;
++	if (typeof organizationId !== "string" || typeof projectId !== "string") {
++		throw new Error("GLM ZCode getCustomerInfo response missing default organization/project");
++	}
++	const keysUrl = `${ZAI_API_BASE_URL}/api/biz/v1/organization/${organizationId}/projects/${projectId}/api_keys`;
++	const listed = data(await get(keysUrl, signal, "api_keys.list", businessToken));
++	const keys = Array.isArray(listed.data) ? listed.data.filter(isRecord) : [];
++	let key = keys.find((entry) => entry.name === API_KEY_NAME);
++	if (!key) key = data(await post(keysUrl, { name: API_KEY_NAME }, signal, "api_keys.create", businessToken));
++	const keyId = typeof key.apiKey === "string" ? key.apiKey : key.id;
++	if (typeof keyId !== "string" || !keyId) throw new Error("GLM ZCode api_keys response missing apiKey id");
++	const copied = data(
++		await get(`${keysUrl}/copy/${encodeURIComponent(keyId)}`, signal, "api_keys.copy", businessToken),
++	);
++	if (typeof copied.secretKey !== "string" || !copied.secretKey)
++		throw new Error("GLM ZCode api_keys copy response missing secretKey");
++	return {
++		access: `${keyId}.${copied.secretKey}`,
++		refresh: upstreamToken,
++		expires: Date.now() + REPROVISION_INTERVAL_MS,
++		email: typeof customer.email === "string" ? customer.email.toLowerCase() : undefined,
++		accountId: typeof customer.id === "string" || typeof customer.id === "number" ? String(customer.id) : undefined,
++	};
++}
++
++export async function loginGlmZcode(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
++	const state = crypto.randomUUID();
++	const params = new URLSearchParams({
++		redirect_uri: REDIRECT_URI,
++		response_type: "code",
++		client_id: CLIENT_ID,
++		state,
++	});
++	callbacks.onAuth({
++		url: `${AUTHORIZE_URL}?${params}`,
++		instructions:
++			"Complete Z.AI login in your browser. This is an unofficial ZCode-based login without PKCE support; keep the final zcode:// redirect URL private, then paste it here.",
++	});
++	const input = callbacks.onManualCodeInput
++		? await callbacks.onManualCodeInput()
++		: await callbacks.onPrompt({ message: "Paste the ZCode redirect URL" });
++	const broker = data(
++		await post(
++			BROKER_URL,
++			{ provider: "zai", code: callbackCode(input, state), redirect_uri: REDIRECT_URI, state },
++			callbacks.signal,
++			"broker",
++		),
++	);
++	const zai = isRecord(broker.zai) ? broker.zai : undefined;
++	if (typeof zai?.access_token !== "string" || !zai.access_token)
++		throw new Error("GLM ZCode broker response missing data.zai.access_token");
++	callbacks.onProgress?.("Provisioning Z.AI API key...");
++	return provision(zai.access_token, callbacks.signal);
++}
++
++export async function refreshGlmZcode(credentials: OAuthCredentials): Promise<OAuthCredentials> {
++	if (!credentials.refresh)
++		throw new Error("glm-zcode credentials require re-login (`/login glm-zcode`); no stored upstream Z.AI token");
++	try {
++		return await provision(credentials.refresh, undefined);
++	} catch {
++		throw new Error(
++			"glm-zcode credentials require re-login (`/login glm-zcode`); re-provisioning the Z.AI API key failed",
++		);
++	}
++}
+diff --git a/packages/coding-agent/src/core/extensions/builtin/index.ts b/packages/coding-agent/src/core/extensions/builtin/index.ts
+index dee26e6b78..5c6f01c89a 100644
+--- a/packages/coding-agent/src/core/extensions/builtin/index.ts
++++ b/packages/coding-agent/src/core/extensions/builtin/index.ts
+@@ -7,6 +7,7 @@ import compactionExtension from "./compaction/index.ts";
+ import configReloadExtension from "./config-reload/index.ts";
+ import diffExtension from "./diff.ts";
+ import filesExtension from "./files.ts";
++import glmZcodeExtension from "./glm-zcode/index.ts";
+ import goalExtension from "./goal/index.ts";
+ import gptApplyPatchExtension from "./gpt-apply-patch/index.ts";
+ import historySearchExtension from "./history-search/index.ts";
+@@ -72,6 +73,7 @@ export const builtinExtensions: BuiltinExtensionFactory[] = [
+ 	{ id: "nested-agents-md", factory: nestedAgentsMdExtension },
+ 	{ id: "rules", factory: piRulesExtension },
+ 	{ id: "goal", factory: goalExtension },
++	{ id: "glm-zcode", factory: glmZcodeExtension },
+ 	{ id: "btw", factory: btwExtension },
+ 	// Config reload follows settings-dependent builtins so reloads rebuild their resolved settings before MCP observes them.
+ 	{ id: "config-reload", factory: configReloadExtension },
+diff --git a/packages/coding-agent/test/agent-session-services-providers.test.ts b/packages/coding-agent/test/agent-session-services-providers.test.ts
+index 267e22901b..2c447ebbcd 100644
+--- a/packages/coding-agent/test/agent-session-services-providers.test.ts
++++ b/packages/coding-agent/test/agent-session-services-providers.test.ts
+@@ -77,7 +77,7 @@ describe("createAgentSessionServices provider registration order", () => {
+ 	it("flushes mixed pre-bind registrations in call order (native then legacy)", async () => {
+ 		const applied = await recordRegistrations(nativeRegistration("ord-native"), legacyRegistration("ord-legacy"));
+ 
+-		expect(applied).toEqual(["native:ord-native", "config:ord-legacy"]);
++		expect(applied).toEqual(["native:ord-native", "config:ord-legacy", "config:glm-zcode"]);
+ 	});
+ 
+ 	it("flushes mixed pre-bind registrations in call order (legacy then native)", async () => {
+@@ -87,6 +87,11 @@ describe("createAgentSessionServices provider registration order", () => {
+ 			legacyRegistration("ord-legacy-last"),
+ 		);
+ 
+-		expect(applied).toEqual(["config:ord-legacy-first", "native:ord-native", "config:ord-legacy-last"]);
++		expect(applied).toEqual([
++			"config:ord-legacy-first",
++			"native:ord-native",
++			"config:ord-legacy-last",
++			"config:glm-zcode",
++		]);
+ 	});
+ });
+diff --git a/packages/coding-agent/test/suite/glm-zcode-builtin-extension.test.ts b/packages/coding-agent/test/suite/glm-zcode-builtin-extension.test.ts
+new file mode 100644
+index 0000000000..1ce7e33c6a
+--- /dev/null
++++ b/packages/coding-agent/test/suite/glm-zcode-builtin-extension.test.ts
+@@ -0,0 +1,133 @@
++import { afterEach, describe, expect, test, vi } from "vitest";
++import { builtinExtensions } from "../../src/core/extensions/builtin/index.ts";
++import type { ExtensionAPI, ExtensionFactory, ProviderConfig } from "../../src/core/extensions/types.ts";
++
++function providerFrom(factory: ExtensionFactory): { name: string; config: ProviderConfig } {
++	let result: { name: string; config: ProviderConfig } | undefined;
++	const pi = new Proxy(
++		{},
++		{
++			get: (_target, property) =>
++				property === "registerProvider"
++					? (name: string, config: ProviderConfig) => {
++							result = { name, config };
++						}
++					: () => undefined,
++		},
++	) as unknown as ExtensionAPI;
++	factory(pi);
++	if (!result) throw new Error("GLM ZCode extension did not register a provider");
++	return result;
++}
++
++function json(data: unknown, status = 200): Response {
++	return new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json" } });
++}
++
++function fetchMock(): ReturnType<typeof vi.fn> {
++	return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
++		const url = String(input);
++		if (url === "https://zcode.z.ai/api/v1/oauth/token")
++			return json({ data: { zai: { access_token: "upstream-token" } } });
++		if (url.endsWith("/auth/z/login")) return json({ data: { access_token: "business-token" } });
++		if (url.endsWith("/getCustomerInfo"))
++			return json({
++				data: {
++					email: "User@Example.com",
++					id: 42,
++					organizations: [
++						{
++							organizationId: "organization-id",
++							isDefault: true,
++							projects: [{ projectId: "project-id", isDefault: true }],
++						},
++					],
++				},
++			});
++		if (url.endsWith("/api_keys") && init?.method !== "POST") return json({ data: [] });
++		if (url.endsWith("/api_keys") && init?.method === "POST") return json({ data: { apiKey: "key-id" } });
++		if (url.endsWith("/api_keys/copy/key-id")) return json({ data: { secretKey: "api-secret" } });
++		throw new Error(`unexpected request: ${url}`);
++	});
++}
++
++afterEach(() => {
++	vi.unstubAllGlobals();
++	vi.unstubAllEnvs();
++});
++
++describe("GLM ZCode builtin extension", () => {
++	test("provisions and refreshes a Z.AI key through the registered provider", async () => {
++		const entry = builtinExtensions.find((extension) => extension.id === "glm-zcode");
++		if (!entry) throw new Error("missing glm-zcode builtin extension");
++		const fetch = fetchMock();
++		vi.stubGlobal("fetch", fetch);
++		vi.stubEnv("ZCODE_OAUTH_BROKER_TOKEN_URL", "https://attacker.invalid/token");
++		const provider = providerFrom(entry.factory);
++		const oauth = provider.config.oauth;
++		if (!oauth) throw new Error("GLM ZCode provider did not register OAuth");
++		const startedAt = Date.now();
++		let authUrl = "";
++		const credentials = await oauth.login({
++			onAuth: ({ url }) => {
++				authUrl = url;
++			},
++			onDeviceCode: () => undefined,
++			onPrompt: async () => "",
++			onManualCodeInput: async () =>
++				`zcode://oauth/callback?code=auth-code&state=${new URL(authUrl).searchParams.get("state")}`,
++			onSelect: async () => undefined,
++		});
++		expect(provider).toMatchObject({
++			name: "glm-zcode",
++			config: {
++				api: "anthropic-messages",
++				authHeader: true,
++				baseUrl: "https://api.z.ai/api/anthropic",
++				headers: { "X-ZCode-Agent": "glm" },
++				models: [expect.objectContaining({ id: "glm-5.2", contextWindow: 1_000_000 })],
++			},
++		});
++		expect(credentials).toMatchObject({
++			access: "key-id.api-secret",
++			refresh: "upstream-token",
++			email: "user@example.com",
++		});
++		expect(credentials.expires).toBeGreaterThan(startedAt + 50 * 60 * 1000);
++		expect(fetch.mock.calls.map(([url]) => String(url))).not.toContain("https://attacker.invalid/token");
++		await expect(oauth.refreshToken(credentials)).resolves.toMatchObject({ access: "key-id.api-secret" });
++	});
++
++	test("rejects malformed callbacks before exchange and omits response secrets", async () => {
++		const entry = builtinExtensions.find((extension) => extension.id === "glm-zcode");
++		if (!entry) throw new Error("missing glm-zcode builtin extension");
++		const fetch = vi.fn(() => Promise.reject(new Error("broker must not receive malformed callbacks")));
++		vi.stubGlobal("fetch", fetch);
++		const oauth = providerFrom(entry.factory).config.oauth;
++		if (!oauth) throw new Error("GLM ZCode provider did not register OAuth");
++		let authUrl = "";
++		const login = (callback: string) =>
++			oauth.login({
++				onAuth: ({ url }) => {
++					authUrl = url;
++				},
++				onDeviceCode: () => undefined,
++				onPrompt: async () => "",
++				onManualCodeInput: async () =>
++					callback.replace("{state}", new URL(authUrl).searchParams.get("state") ?? ""),
++				onSelect: async () => undefined,
++			});
++		await expect(login("auth-code")).rejects.toThrow("callback URL");
++		await expect(login("zcode://oauth:431/callback?code=auth-code&state={state}")).rejects.toThrow(
++			"callback URL is invalid",
++		);
++		expect(fetch).not.toHaveBeenCalled();
++		vi.stubGlobal(
++			"fetch",
++			vi.fn(() => json({ access_token: "opaque:short-secret" }, 500)),
++		);
++		await expect(login("zcode://oauth/callback?code=auth-code&state={state}")).rejects.not.toThrow(
++			"opaque:short-secret",
++		);
++	});
++});
