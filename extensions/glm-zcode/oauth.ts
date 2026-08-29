@@ -74,7 +74,12 @@ async function post(
 }
 
 async function get(url: string, signal: AbortSignal | undefined, label: string, token: string): Promise<unknown> {
-  return request(url, { headers: { Accept: "application/json", Authorization: `Bearer ${token}` } }, signal, label);
+  return request(
+    url,
+    { method: "GET", headers: { Accept: "application/json", Authorization: `Bearer ${token}` } },
+    signal,
+    label,
+  );
 }
 
 function callbackCode(value: string, state: string): string {
@@ -192,12 +197,15 @@ export async function loginGlmZcode(callbacks: OAuthLoginCallbacks): Promise<OAu
   return provision(zai.access_token, callbacks.signal);
 }
 
-export async function refreshGlmZcode(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+export async function refreshGlmZcode(
+  credentials: OAuthCredentials,
+  signal?: AbortSignal,
+): Promise<OAuthCredentials> {
   if (!credentials.refresh) {
     throw new Error("GLM ZCode credentials require re-login (`/login glm-zcode`); no stored upstream Z.AI token");
   }
   try {
-    return await provision(credentials.refresh, undefined);
+    return await provision(credentials.refresh, signal);
   } catch {
     throw new Error(
       "GLM ZCode credentials require re-login (`/login glm-zcode`); re-provisioning the Z.AI API key failed",

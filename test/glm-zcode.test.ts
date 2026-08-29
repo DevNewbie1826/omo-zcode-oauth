@@ -1,29 +1,7 @@
+import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import glmZcodeExtension from "../extensions/glm-zcode/index.js";
 import { loginGlmZcode, refreshGlmZcode } from "../extensions/glm-zcode/oauth.js";
-
-// ---------------------------------------------------------------------------
-// Minimal structural types (the real ones live in packages that are only
-// type-level dependencies of the extension).
-// ---------------------------------------------------------------------------
-
-type OAuthCredentials = {
-  access: string;
-  refresh?: string;
-  expires?: number;
-  email?: string;
-  accountId?: string;
-};
-
-type LoginCallbacks = {
-  onAuth: (payload: { url: string; instructions?: string }) => void;
-  onPrompt?: (options: { message: string }) => Promise<string>;
-  onManualCodeInput?: () => Promise<string>;
-  onProgress?: (message: string) => void;
-  onDeviceCode?: () => unknown;
-  onSelect?: () => Promise<unknown>;
-  signal?: AbortSignal;
-};
 
 type RegisteredProvider = {
   name: string;
@@ -36,8 +14,8 @@ type RegisteredProvider = {
     models: Array<Record<string, unknown>>;
     oauth?: {
       name: string;
-      login: (callbacks: LoginCallbacks) => Promise<OAuthCredentials>;
-      refreshToken: (credentials: OAuthCredentials) => Promise<OAuthCredentials>;
+      login: (callbacks: OAuthLoginCallbacks) => Promise<OAuthCredentials>;
+      refreshToken: (credentials: OAuthCredentials, signal?: AbortSignal) => Promise<OAuthCredentials>;
       getApiKey: (credentials: OAuthCredentials) => string;
     };
   };
@@ -81,7 +59,7 @@ const BROKER_URL = "https://zcode.z.ai/api/v1/oauth/token";
 const KEYS_URL = "https://api.z.ai/api/biz/v1/organization/org-id/projects/proj-id/api_keys";
 
 /** Canned responses for every endpoint of the provisioning chain. */
-function fetchMock(): ReturnType<typeof vi.fn> {
+function fetchMock(existingKeyId?: string): ReturnType<typeof vi.fn> {
   return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     if (url === BROKER_URL) return json({ data: { zai: { access_token: UPSTREAM_TOKEN } } });
@@ -100,9 +78,13 @@ function fetchMock(): ReturnType<typeof vi.fn> {
           ],
         },
       });
-    if (url.endsWith("/api_keys") && init?.method !== "POST") return json({ data: [] });
+    if (url.endsWith("/api_keys") && init?.method === "GET") {
+      return json({ data: existingKeyId ? [{ apiKey: existingKeyId, name: "zcode-api-key" }] : [] });
+    }
     if (url.endsWith("/api_keys") && init?.method === "POST") return json({ data: { apiKey: "key-id" } });
-    if (url.endsWith("/api_keys/copy/key-id")) return json({ data: { secretKey: "api-secret" } });
+    if (url.endsWith(`/api_keys/copy/${existingKeyId ?? "key-id"}`)) {
+      return json({ data: { secretKey: "api-secret" } });
+    }
     throw new Error(`unexpected request: ${url}`);
   });
 }
@@ -169,7 +151,9 @@ describe("glm-zcode extension", () => {
     // The factory must wire up the exact oauth functions from oauth.js.
     expect(config.oauth!.login).toBe(loginGlmZcode);
     expect(config.oauth!.refreshToken).toBe(refreshGlmZcode);
-    expect(config.oauth!.getApiKey({ access: "key-id.api-secret" })).toBe("key-id.api-secret");
+    expect(config.oauth!.getApiKey({ access: "key-id.api-secret", refresh: "refresh", expires: 1 })).toBe(
+      "key-id.api-secret",
+    );
   });
 
   test("completes the full OAuth flow: broker exchange, z/login, customer lookup, key create + copy", async () => {
@@ -208,6 +192,13 @@ describe("glm-zcode extension", () => {
     // z/login exchanges the upstream token for the business token.
     const loginBody = JSON.parse(String(fetch.mock.calls[1][1]?.body)) as Record<string, unknown>;
     expect(loginBody).toEqual({ token: UPSTREAM_TOKEN });
+
+    expect(fetch.mock.calls.map((call) => call[1]?.method)).toEqual(["POST", "POST", "GET", "GET", "POST", "GET"]);
+    for (const call of fetch.mock.calls.slice(2)) {
+      expect(new Headers(call[1]?.headers).get("Authorization")).toBe(`Bearer ${BUSINESS_TOKEN}`);
+    }
+    const createBody = JSON.parse(String(fetch.mock.calls[4][1]?.body)) as Record<string, unknown>;
+    expect(createBody).toEqual({ name: "zcode-api-key" });
 
     // Provisioned credentials.
     expect(credentials).toMatchObject({
@@ -275,10 +266,32 @@ describe("glm-zcode extension", () => {
       expect(fetch.mock.calls.map((call) => String(call[0]))).not.toContain(BROKER_URL);
     });
 
+    test("reuses the named existing key without creating another one", async () => {
+      const fetch = fetchMock("existing-id");
+      vi.stubGlobal("fetch", fetch);
+
+      const refreshed = await refreshGlmZcode(staleCredentials);
+
+      expect(refreshed.access).toBe("existing-id.api-secret");
+      const calls = fetch.mock.calls.map((call) => ({ url: String(call[0]), method: call[1]?.method }));
+      expect(calls).not.toContainEqual({ url: KEYS_URL, method: "POST" });
+      expect(calls).toContainEqual({ url: `${KEYS_URL}/copy/existing-id`, method: "GET" });
+    });
+
+    test("passes host cancellation to refresh provisioning", async () => {
+      const fetch = vi.fn(() => Promise.reject(new Error("network must not be touched")));
+      vi.stubGlobal("fetch", fetch);
+      const controller = new AbortController();
+      controller.abort();
+
+      await expect(refreshGlmZcode(staleCredentials, controller.signal)).rejects.toThrow("re-login");
+      expect(fetch).not.toHaveBeenCalled();
+    });
+
     test("without a stored upstream token it demands re-login", async () => {
       const fetch = vi.fn(() => Promise.reject(new Error("network must not be touched")));
       vi.stubGlobal("fetch", fetch);
-      const rejection = refreshGlmZcode({ access: "key-id.api-secret", expires: 0 });
+      const rejection = refreshGlmZcode({ access: "key-id.api-secret", refresh: "", expires: 0 });
       await expect(rejection).rejects.toThrow("re-login");
       await expect(rejection).rejects.toThrow("/login glm-zcode");
       expect(fetch).not.toHaveBeenCalled();
@@ -294,6 +307,20 @@ describe("glm-zcode extension", () => {
       await expect(rejection).rejects.toThrow("/login glm-zcode");
       await expect(rejection).rejects.toThrow("re-provisioning");
     });
+  });
+
+  test("error messages never echo response bodies containing secrets", async () => {
+    const secret = "sk-live-secret-abc123";
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url === BROKER_URL) return json({ error: "invalid_grant", secret }, 400);
+      throw new Error(`unexpected request: ${url}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    const rejection = loginWithCallback(validCallback);
+    await expect(rejection).rejects.toThrow(/400/);
+    await expect(rejection).rejects.not.toThrow(secret);
   });
 
   test("security: a broker URL smuggled in via env is ignored, endpoints are hardcoded", async () => {
