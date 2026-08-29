@@ -1,0 +1,23 @@
+{
+  "name": "omo-zcode-oauth",
+  "version": "0.1.0",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./extensions"]
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@code-yeongyu/senpi": "2026.8.29",
+    "@earendil-works/pi-ai": "npm:@code-yeongyu/senpi-ai@2026.8.29",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  },
+  "vitest": {
+    "resolve": {
+      "extensions": [".ts", ".js"]
+    }
+  }
+}
