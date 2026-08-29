@@ -1,5 +1,6 @@
 import type { ProviderConfig } from "@code-yeongyu/senpi";
-import type { RefreshModelsContext } from "@earendil-works/pi-ai";
+import type { Model, RefreshModelsContext, ThinkingLevel } from "@earendil-works/pi-ai";
+import { streamSimple } from "@earendil-works/pi-ai/api/anthropic-messages";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import glmZcodeExtension from "../extensions/glm-zcode/index.js";
@@ -7,6 +8,7 @@ import {
   catalogToPersistedModels,
   fetchCatalogModels,
   storedToConfig,
+  thinkingConfigFor,
 } from "../extensions/glm-zcode/models.js";
 import { loginGlmZcode, refreshGlmZcode } from "../extensions/glm-zcode/oauth.js";
 
@@ -59,6 +61,42 @@ function captureProvider(): RegisteredProvider {
 
 function json(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), { status, headers: { "Content-Type": "application/json" } });
+}
+
+function registeredModel(): Model<"anthropic-messages"> {
+  const { config } = captureProvider();
+  return {
+    provider: "glm-zcode",
+    api: "anthropic-messages",
+    baseUrl: config.baseUrl,
+    headers: config.headers,
+    ...config.models[0],
+  } as unknown as Model<"anthropic-messages">;
+}
+
+async function captureAnthropicWireBody(
+  model: Model<"anthropic-messages">,
+  reasoning?: ThinkingLevel,
+): Promise<Record<string, unknown>> {
+  let captured: Record<string, unknown> | undefined;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const rawBody = init?.body ?? (input instanceof Request ? await input.clone().text() : undefined);
+      if (typeof rawBody !== "string") throw new Error("anthropic request had no JSON body");
+      captured = JSON.parse(rawBody) as Record<string, unknown>;
+      return json({ type: "error", error: { type: "invalid_request_error", message: "wire capture" } }, 400);
+    }),
+  );
+
+  await streamSimple(
+    model,
+    { messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+    { apiKey: "test-key", reasoning, maxRetries: 0 },
+  ).result();
+
+  if (!captured) throw new Error("anthropic serializer did not issue a request");
+  return captured;
 }
 
 const UPSTREAM_TOKEN = "upstream-token";
@@ -151,7 +189,7 @@ describe("glm-zcode extension", () => {
       contextWindow: 1_000_000,
       maxTokens: 131_072,
       thinkingLevelMap: { medium: "low", xhigh: "max" },
-      compat: { supportsDisabledThinking: false },
+      compat: { supportsDisabledThinking: false, forceAdaptiveThinking: true },
     });
 
     expect(config.oauth).toBeDefined();
@@ -348,6 +386,39 @@ describe("glm-zcode extension", () => {
   });
 });
 
+describe("glm-zcode anthropic wire payloads", () => {
+  test("medium uses adaptive thinking with the mapped low effort", async () => {
+    const body = await captureAnthropicWireBody(registeredModel(), "medium");
+
+    expect(body.thinking).toMatchObject({ type: "adaptive" });
+    expect(body.output_config).toEqual({ effort: "low" });
+    console.log(`glm-zcode medium wire body: ${JSON.stringify(body)}`);
+  });
+
+  test("off omits thinking and keeps the cheapest valid adaptive effort", async () => {
+    const body = await captureAnthropicWireBody(registeredModel());
+
+    expect(body).not.toHaveProperty("thinking");
+    expect(body.output_config).toEqual({ effort: "low" });
+    console.log(`glm-zcode off wire body: ${JSON.stringify(body)}`);
+  });
+
+  test("toggle-model off does not force adaptive effort", async () => {
+    const toggleThinkingConfig = thinkingConfigFor([{ type: "toggle" }]);
+    const toggleModel: Model<"anthropic-messages"> = {
+      ...registeredModel(),
+      id: "glm-toggle",
+      thinkingLevelMap: toggleThinkingConfig.thinkingLevelMap,
+      compat: toggleThinkingConfig.compat as Model<"anthropic-messages">["compat"],
+    };
+    const body = await captureAnthropicWireBody(toggleModel);
+
+    expect(body).not.toHaveProperty("output_config");
+    expect(body.thinking).toEqual({ type: "disabled" });
+    console.log(`glm-zcode toggle off wire body: ${JSON.stringify(body)}`);
+  });
+});
+
 describe("dynamic model catalog", () => {
   const catalogPayload = {
     "zai-coding-plan": {
@@ -435,7 +506,7 @@ describe("dynamic model catalog", () => {
         contextWindow: 1_000_000,
         maxTokens: 131_072,
         thinkingLevelMap: expectedThinkingLevelMap,
-        compat: { supportsDisabledThinking: false },
+        compat: { supportsDisabledThinking: false, forceAdaptiveThinking: true },
       },
       {
         id: "glm-multimodal",
@@ -456,7 +527,7 @@ describe("dynamic model catalog", () => {
         contextWindow: 500_000,
         maxTokens: 8_192,
         thinkingLevelMap: expectedThinkingLevelMap,
-        compat: { supportsDisabledThinking: false },
+        compat: { supportsDisabledThinking: false, forceAdaptiveThinking: true },
       },
     ]);
     expect(models).toHaveLength(3);
@@ -473,7 +544,7 @@ describe("dynamic model catalog", () => {
 
     expect(persisted.find((model) => model.id === "glm-text")).toMatchObject({
       thinkingLevelMap: expectedThinkingLevelMap,
-      compat: { supportsDisabledThinking: false },
+      compat: { supportsDisabledThinking: false, forceAdaptiveThinking: true },
     });
     expect(persisted.find((model) => model.id === "glm-multimodal")).toMatchObject({
       thinkingLevelMap: expectedThinkingLevelMap,
@@ -481,7 +552,7 @@ describe("dynamic model catalog", () => {
     expect(persisted.find((model) => model.id === "glm-multimodal")).not.toHaveProperty("compat");
     expect(persisted.find((model) => model.id === "glm-noname")).toMatchObject({
       thinkingLevelMap: expectedThinkingLevelMap,
-      compat: { supportsDisabledThinking: false },
+      compat: { supportsDisabledThinking: false, forceAdaptiveThinking: true },
     });
     expect(storedToConfig({ models: persisted })).toEqual(models);
   });
@@ -489,7 +560,7 @@ describe("dynamic model catalog", () => {
   test("applies conservative thinking defaults to legacy stored models", () => {
     expect(storedToConfig({ models: [persistedModel] })[0]).toMatchObject({
       thinkingLevelMap: expectedThinkingLevelMap,
-      compat: { supportsDisabledThinking: false },
+      compat: { supportsDisabledThinking: false, forceAdaptiveThinking: true },
     });
   });
 
@@ -551,7 +622,7 @@ describe("dynamic model catalog", () => {
         contextWindow: 500_000,
         maxTokens: 8_192,
         thinkingLevelMap: expectedThinkingLevelMap,
-        compat: { supportsDisabledThinking: false },
+        compat: { supportsDisabledThinking: false, forceAdaptiveThinking: true },
       },
     ]);
     expect(fetch).not.toHaveBeenCalled();

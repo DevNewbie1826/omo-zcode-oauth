@@ -53,7 +53,10 @@ export function thinkingConfigFor(
 
   return {
     thinkingLevelMap: { ...ZAI_THINKING_LEVEL_MAP },
-    compat: reasoningType === "toggle" ? undefined : { supportsDisabledThinking: false },
+    compat:
+      reasoningType === "toggle"
+        ? undefined
+        : { supportsDisabledThinking: false, forceAdaptiveThinking: true },
   };
 }
 
