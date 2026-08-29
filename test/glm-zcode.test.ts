@@ -1,6 +1,9 @@
+import type { ProviderConfig } from "@code-yeongyu/senpi";
+import type { RefreshModelsContext } from "@earendil-works/pi-ai";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import glmZcodeExtension from "../extensions/glm-zcode/index.js";
+import { fetchCatalogModels } from "../extensions/glm-zcode/models.js";
 import { loginGlmZcode, refreshGlmZcode } from "../extensions/glm-zcode/oauth.js";
 
 type RegisteredProvider = {
@@ -12,6 +15,7 @@ type RegisteredProvider = {
     authHeader: boolean;
     headers: Record<string, string>;
     models: Array<Record<string, unknown>>;
+    refreshModels?: NonNullable<ProviderConfig["refreshModels"]>;
     oauth?: {
       name: string;
       login: (callbacks: OAuthLoginCallbacks) => Promise<OAuthCredentials>;
@@ -139,7 +143,7 @@ describe("glm-zcode extension", () => {
     });
 
     expect(config.models[0]).toMatchObject({
-      id: "glm-5.2",
+      id: "glm-5.3",
       contextWindow: 1_000_000,
       maxTokens: 131_072,
     });
@@ -335,5 +339,192 @@ describe("glm-zcode extension", () => {
     expect(urls.some((url) => url.includes("attacker.invalid"))).toBe(false);
     // The real hardcoded broker was used instead.
     expect(urls).toContain(BROKER_URL);
+  });
+});
+
+describe("dynamic model catalog", () => {
+  const catalogPayload = {
+    "zai-coding-plan": {
+      models: {
+        "glm-text": {
+          name: "GLM Text",
+          reasoning: true,
+          limit: { context: 1_000_000, output: 131_072 },
+          modalities: { input: ["text"] },
+        },
+        "glm-multimodal": {
+          name: "GLM Multimodal",
+          reasoning: false,
+          limit: { context: 250_000, output: 32_768 },
+          modalities: { input: ["text", "image", "video", "pdf"] },
+        },
+        "glm-broken": {
+          name: "GLM Broken",
+          reasoning: true,
+          limit: { output: 4_096 },
+          modalities: { input: ["text"] },
+        },
+      },
+    },
+  };
+
+  const persistedModel = {
+    provider: "glm-zcode",
+    api: "anthropic-messages" as const,
+    baseUrl: "https://api.z.ai/api/anthropic",
+    id: "glm-9",
+    name: "GLM 9",
+    reasoning: false,
+    input: ["text" as const],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 500_000,
+    maxTokens: 8_192,
+  };
+
+  function context(overrides: Partial<RefreshModelsContext> = {}): RefreshModelsContext {
+    return {
+      allowNetwork: true,
+      stored: undefined,
+      signal: new AbortController().signal,
+      publish: vi.fn(async () => true),
+      ...overrides,
+    };
+  }
+
+  function registeredRefreshModels(): NonNullable<ProviderConfig["refreshModels"]> {
+    const refreshModels = captureProvider().config.refreshModels;
+    if (!refreshModels) throw new Error("glm-zcode provider did not register refreshModels");
+    return refreshModels;
+  }
+
+  test("maps valid catalog models and skips malformed entries", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => json(catalogPayload)));
+
+    const models = await fetchCatalogModels();
+
+    expect(models).toEqual([
+      {
+        id: "glm-text",
+        name: "GLM Text",
+        reasoning: true,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 1_000_000,
+        maxTokens: 131_072,
+      },
+      {
+        id: "glm-multimodal",
+        name: "GLM Multimodal",
+        reasoning: false,
+        input: ["text", "image", "video"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 250_000,
+        maxTokens: 32_768,
+      },
+    ]);
+    expect(models.some((model) => model.id === "glm-broken")).toBe(false);
+  });
+
+  test("refreshModels fetches, publishes, and returns valid models", async () => {
+    const fetch = vi.fn(async () => json(catalogPayload));
+    const publish = vi.fn<RefreshModelsContext["publish"]>(async () => true);
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(context({ publish }));
+
+    expect(models).toHaveLength(2);
+    expect(models.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal"]);
+    expect(publish).toHaveBeenCalledOnce();
+    const publication = publish.mock.calls[0]?.[0];
+    expect(publication?.persist?.models).toBeInstanceOf(Array);
+    expect(
+      publication?.persist?.models.every(
+        (model) =>
+          model.provider === "glm-zcode" &&
+          model.api === "anthropic-messages" &&
+          model.baseUrl === "https://api.z.ai/api/anthropic",
+      ),
+    ).toBe(true);
+    expect(publication?.persist?.checkedAt).toEqual(expect.any(Number));
+  });
+
+  test("offline without stored models returns undefined without fetching", async () => {
+    const fetch = vi.fn(async () => json(catalogPayload));
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(context({ allowNetwork: false, stored: undefined }));
+
+    expect(models).toBeUndefined();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("offline with stored models restores them without fetching", async () => {
+    const fetch = vi.fn(async () => json(catalogPayload));
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(
+      context({ allowNetwork: false, stored: { models: [persistedModel], checkedAt: 123 } }),
+    );
+
+    expect(models).toEqual([
+      {
+        id: "glm-9",
+        name: "GLM 9",
+        reasoning: false,
+        input: ["text"],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 500_000,
+        maxTokens: 8_192,
+      },
+    ]);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("fetch failure returns undefined without throwing when no store exists", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => Promise.reject(new Error("catalog unavailable"))));
+
+    await expect(registeredRefreshModels()(context())).resolves.toBeUndefined();
+  });
+
+  test("malformed api.json without zai-coding-plan returns undefined", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => json({ anotherProvider: { models: {} } })));
+
+    await expect(registeredRefreshModels()(context())).resolves.toBeUndefined();
+  });
+
+  test("fresh stored models skip the catalog fetch", async () => {
+    const fetch = vi.fn(async () => json(catalogPayload));
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(
+      context({ stored: { models: [persistedModel], checkedAt: Date.now() } }),
+    );
+
+    expect(models?.map((model) => model.id)).toEqual(["glm-9"]);
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("expired stored models trigger a catalog re-fetch", async () => {
+    const fetch = vi.fn(async () => json(catalogPayload));
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(
+      context({ stored: { models: [persistedModel], checkedAt: Date.now() - 25 * 60 * 60 * 1_000 } }),
+    );
+
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(models?.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal"]);
+  });
+
+  test("force bypasses the stored-model TTL", async () => {
+    const fetch = vi.fn(async () => json(catalogPayload));
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(
+      context({ force: true, stored: { models: [persistedModel], checkedAt: Date.now() } }),
+    );
+
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(models?.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal"]);
   });
 });

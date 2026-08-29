@@ -41,9 +41,16 @@ omo install ./local/path
 
 ## 모델
 
-로그인 후 다음 모델을 사용할 수 있습니다:
+로그인 후 Z.AI Coding Plan의 전체 모델 목록을 사용할 수 있습니다 (`glm-zcode/glm-5.3`, `glm-zcode/glm-5.3-flash`, `glm-zcode/glm-5.2`, `glm-zcode/glm-4.7` 등). 목록은 models.dev 카탈로그(`zai-coding-plan`)에서 동적으로 가져오므로 새 모델이 나오면 자동으로 반영됩니다.
 
-- `glm-zcode/glm-5.2`
+## 모델 카탈로그
+
+모델 목록은 하드코딩되어 있지 않고 다음과 같이 관리됩니다.
+
+- **동적 조회**: `/login glm-zcode` 직후 첫 전체 갱신이 실행되고, 이후 models.dev의 `zai-coding-plan` 카탈로그에서 최신 목록을 가져옵니다.
+- **로컬 캐시**: 가져온 목록은 `models-store.json`에 24시간 TTL로 캐시됩니다. 오프라인 상태로 재시작해도 마지막으로 가져온 목록을 그대로 사용합니다.
+- **정적 폴백**: 카탈로그를 아직 가져오기 전(설치 직후 로그인 전 등)이거나 카탈로그에 연결할 수 없을 때는 정적 `glm-5.3` 폴백을 노출해 모델이 0개가 되는 일이 없습니다.
+- **강제 갱신**: `omo update --models`를 실행하면 TTL과 무관하게 카탈로그를 다시 가져옵니다.
 
 ## 동작 원리
 
