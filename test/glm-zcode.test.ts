@@ -255,9 +255,9 @@ describe("glm-zcode extension", () => {
       email: "user@example.com",
       accountId: "42",
     });
-    // Re-provision interval is 55 minutes; allow a generous lower bound.
-    expect(credentials.expires).toBeGreaterThan(startedAt + 50 * 60 * 1000);
-    expect(credentials.expires).toBeLessThanOrEqual(Date.now() + 55 * 60 * 1000 + 5_000);
+    // API key TTL is 10 years (long-lived); allow a generous lower bound.
+    expect(credentials.expires).toBeGreaterThan(startedAt + 10 * 365 * 24 * 60 * 60 * 1000 - 10_000);
+    expect(credentials.expires).toBeLessThanOrEqual(Date.now() + 10 * 365 * 24 * 60 * 60 * 1000 + 5_000);
   });
 
   describe("malformed callbacks are rejected before any request", () => {
@@ -308,7 +308,7 @@ describe("glm-zcode extension", () => {
         email: "user@example.com",
         accountId: "42",
       });
-      expect(refreshed.expires).toBeGreaterThan(startedAt + 50 * 60 * 1000);
+      expect(refreshed.expires).toBeGreaterThan(startedAt + 10 * 365 * 24 * 60 * 60 * 1000 - 10_000);
       // Refresh starts directly at z/login; the broker is never involved.
       expect(String(fetch.mock.calls[0][0])).toContain("/auth/z/login");
       expect(fetch.mock.calls.map((call) => String(call[0]))).not.toContain(BROKER_URL);
@@ -354,6 +354,26 @@ describe("glm-zcode extension", () => {
       await expect(rejection).rejects.toThrow("re-login");
       await expect(rejection).rejects.toThrow("/login glm-zcode");
       await expect(rejection).rejects.toThrow("re-provisioning");
+      await expect(rejection).rejects.toThrow(/\(.+\)/);
+    });
+
+    test("refresh failure redacts secrets in error detail", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () =>
+          json(
+            {
+              error: "invalid_token",
+              token:
+                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+            },
+            401,
+          ),
+        ),
+      );
+      const rejection = refreshGlmZcode(staleCredentials);
+      await expect(rejection).rejects.toThrow("[redacted-jwt]");
+      await expect(rejection).rejects.not.toThrow("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9");
     });
   });
 

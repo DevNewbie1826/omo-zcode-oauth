@@ -7,10 +7,17 @@ const ZAI_LOGIN_URL = `${ZAI_API_BASE_URL}/api/auth/z/login`;
 const CLIENT_ID = "client_P8X5CMWmlaRO9gyO-KSqtg";
 const REDIRECT_URI = "zcode://oauth/callback";
 const API_KEY_NAME = "zcode-api-key";
-const REPROVISION_INTERVAL_MS = 55 * 60 * 1000;
+/** Provisioned API keys are long-lived; pin expiry far out so AuthStorage never force-refreshes. */
+const GLM_ZCODE_API_KEY_TTL_MS = 10 * 365 * 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 30_000;
 
 type JsonRecord = Record<string, unknown>;
+
+function redactSecrets(text: string): string {
+  return text
+    .replace(/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted-jwt]")
+    .replace(/[A-Za-z0-9_-]{40,}/g, "[redacted]");
+}
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -42,7 +49,12 @@ async function request(
     throw new Error(`GLM ZCode ${label} request failed due to a network error`);
   }
 
-  if (!response.ok) throw new Error(`GLM ZCode ${label} request failed: ${response.status}`);
+  if (!response.ok) {
+    const body = await response.text();
+    const redacted = redactSecrets(body);
+    const detail = redacted !== body ? ` ${redacted}` : "";
+    throw new Error(`GLM ZCode ${label} request failed: ${response.status}${detail}`);
+  }
   try {
     return await response.json();
   } catch {
@@ -157,7 +169,7 @@ async function provision(upstreamToken: string, signal: AbortSignal | undefined)
   return {
     access: `${keyId}.${copied.secretKey}`,
     refresh: upstreamToken,
-    expires: Date.now() + REPROVISION_INTERVAL_MS,
+    expires: Date.now() + GLM_ZCODE_API_KEY_TTL_MS,
     email: typeof customer.email === "string" ? customer.email.toLowerCase() : undefined,
     accountId: typeof customer.id === "string" || typeof customer.id === "number" ? String(customer.id) : undefined,
   };
@@ -206,9 +218,9 @@ export async function refreshGlmZcode(
   }
   try {
     return await provision(credentials.refresh, signal);
-  } catch {
+  } catch (error) {
     throw new Error(
-      "GLM ZCode credentials require re-login (`/login glm-zcode`); re-provisioning the Z.AI API key failed",
+      `GLM ZCode credentials require re-login (\`/login glm-zcode\`); re-provisioning the Z.AI API key failed (${redactSecrets(String(error))})`,
     );
   }
 }
