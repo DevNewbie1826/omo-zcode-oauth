@@ -255,9 +255,9 @@ describe("glm-zcode extension", () => {
       email: "user@example.com",
       accountId: "42",
     });
-    // Re-provision interval is 55 minutes; allow a generous lower bound.
-    expect(credentials.expires).toBeGreaterThan(startedAt + 50 * 60 * 1000);
-    expect(credentials.expires).toBeLessThanOrEqual(Date.now() + 55 * 60 * 1000 + 5_000);
+    // API key TTL is 10 years (long-lived); allow a generous lower bound.
+    expect(credentials.expires).toBeGreaterThan(startedAt + 10 * 365 * 24 * 60 * 60 * 1000 - 10_000);
+    expect(credentials.expires).toBeLessThanOrEqual(Date.now() + 10 * 365 * 24 * 60 * 60 * 1000 + 5_000);
   });
 
   describe("malformed callbacks are rejected before any request", () => {
@@ -308,7 +308,7 @@ describe("glm-zcode extension", () => {
         email: "user@example.com",
         accountId: "42",
       });
-      expect(refreshed.expires).toBeGreaterThan(startedAt + 50 * 60 * 1000);
+      expect(refreshed.expires).toBeGreaterThan(startedAt + 10 * 365 * 24 * 60 * 60 * 1000 - 10_000);
       // Refresh starts directly at z/login; the broker is never involved.
       expect(String(fetch.mock.calls[0][0])).toContain("/auth/z/login");
       expect(fetch.mock.calls.map((call) => String(call[0]))).not.toContain(BROKER_URL);
@@ -354,6 +354,52 @@ describe("glm-zcode extension", () => {
       await expect(rejection).rejects.toThrow("re-login");
       await expect(rejection).rejects.toThrow("/login glm-zcode");
       await expect(rejection).rejects.toThrow("re-provisioning");
+      await expect(rejection).rejects.toThrow("z/login request failed: 500");
+    });
+
+    test("refresh failure redacts secrets in error detail", async () => {
+      const jwt =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          throw new Error(`fetch failed: connect to https://api.z.ai ${jwt}`);
+        }),
+      );
+      const rejection = refreshGlmZcode(staleCredentials);
+      await expect(rejection).rejects.toThrow("network error");
+      await expect(rejection).rejects.toThrow("[redacted-jwt]");
+      await expect(rejection).rejects.not.toThrow(jwt);
+    });
+
+    test("HTTP failure never echoes mixed recognized and unrecognized secrets", async () => {
+      const jwt =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+      const apiKey = "sk-live-secret-abc123";
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => json({ error: "invalid_token", token: jwt, api_key: apiKey }, 401)),
+      );
+
+      const rejection = refreshGlmZcode(staleCredentials);
+      await expect(rejection).rejects.toThrow("401");
+      await expect(rejection).rejects.not.toThrow(jwt);
+      await expect(rejection).rejects.not.toThrow(apiKey);
+      await expect(rejection).rejects.not.toThrow("invalid_token");
+    });
+
+    test("refresh failure redacts 40-plus-character secrets in network errors", async () => {
+      const apiKey = "a".repeat(48);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          throw new Error(`socket hang up, apiKey=${apiKey}`);
+        }),
+      );
+
+      const rejection = refreshGlmZcode(staleCredentials);
+      await expect(rejection).rejects.toThrow("[redacted]");
+      await expect(rejection).rejects.not.toThrow(apiKey);
     });
   });
 
