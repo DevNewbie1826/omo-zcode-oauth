@@ -354,26 +354,52 @@ describe("glm-zcode extension", () => {
       await expect(rejection).rejects.toThrow("re-login");
       await expect(rejection).rejects.toThrow("/login glm-zcode");
       await expect(rejection).rejects.toThrow("re-provisioning");
-      await expect(rejection).rejects.toThrow(/\(.+\)/);
+      await expect(rejection).rejects.toThrow("z/login request failed: 500");
     });
 
     test("refresh failure redacts secrets in error detail", async () => {
+      const jwt =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
       vi.stubGlobal(
         "fetch",
-        vi.fn(async () =>
-          json(
-            {
-              error: "invalid_token",
-              token:
-                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
-            },
-            401,
-          ),
-        ),
+        vi.fn(async () => {
+          throw new Error(`fetch failed: connect to https://api.z.ai ${jwt}`);
+        }),
       );
       const rejection = refreshGlmZcode(staleCredentials);
+      await expect(rejection).rejects.toThrow("network error");
       await expect(rejection).rejects.toThrow("[redacted-jwt]");
-      await expect(rejection).rejects.not.toThrow("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9");
+      await expect(rejection).rejects.not.toThrow(jwt);
+    });
+
+    test("HTTP failure never echoes mixed recognized and unrecognized secrets", async () => {
+      const jwt =
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+      const apiKey = "sk-live-secret-abc123";
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => json({ error: "invalid_token", token: jwt, api_key: apiKey }, 401)),
+      );
+
+      const rejection = refreshGlmZcode(staleCredentials);
+      await expect(rejection).rejects.toThrow("401");
+      await expect(rejection).rejects.not.toThrow(jwt);
+      await expect(rejection).rejects.not.toThrow(apiKey);
+      await expect(rejection).rejects.not.toThrow("invalid_token");
+    });
+
+    test("refresh failure redacts 40-plus-character secrets in network errors", async () => {
+      const apiKey = "a".repeat(48);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          throw new Error(`socket hang up, apiKey=${apiKey}`);
+        }),
+      );
+
+      const rejection = refreshGlmZcode(staleCredentials);
+      await expect(rejection).rejects.toThrow("[redacted]");
+      await expect(rejection).rejects.not.toThrow(apiKey);
     });
   });
 

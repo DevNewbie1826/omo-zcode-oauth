@@ -41,20 +41,17 @@ async function request(
   let response: Response;
   try {
     response = await fetch(url, { ...options, signal: requestSignal });
-  } catch {
+  } catch (error) {
     if (signal?.aborted) throw new Error(`GLM ZCode ${label} request cancelled`);
     if (timeoutSignal.aborted) {
       throw new Error(`GLM ZCode ${label} request timed out after ${REQUEST_TIMEOUT_MS}ms`);
     }
-    throw new Error(`GLM ZCode ${label} request failed due to a network error`);
+    throw new Error(
+      `GLM ZCode ${label} request failed due to a network error (${redactSecrets(String(error))})`,
+    );
   }
 
-  if (!response.ok) {
-    const body = await response.text();
-    const redacted = redactSecrets(body);
-    const detail = redacted !== body ? ` ${redacted}` : "";
-    throw new Error(`GLM ZCode ${label} request failed: ${response.status}${detail}`);
-  }
+  if (!response.ok) throw new Error(`GLM ZCode ${label} request failed: ${response.status}`);
   try {
     return await response.json();
   } catch {
