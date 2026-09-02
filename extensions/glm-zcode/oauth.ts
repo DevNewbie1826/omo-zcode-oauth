@@ -340,7 +340,8 @@ export async function loginGlmZcode(callbacks: OAuthLoginCallbacks): Promise<OAu
   let init: CliDeviceFlowInit;
   try {
     init = await initCliDeviceFlow(callbacks.signal);
-  } catch {
+  } catch (error) {
+    if (callbacks.signal?.aborted) throw error;
     // Device-flow handoff unavailable (offline, endpoint gone, unexpected shape):
     // degrade to the classic paste flow verbatim.
     return loginViaManualPaste(callbacks);

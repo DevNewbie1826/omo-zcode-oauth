@@ -35,14 +35,14 @@ omo install ./local/path
 
 1. omo를 실행하고 `/login glm-zcode`를 입력합니다.
 2. 브라우저에서 Z.AI 로그인 페이지가 열립니다. 로그인을 완료합니다.
-3. 로그인이 끝나면 브라우저가 `zcode://oauth/callback?code=...&state=...` 주소로 리다이렉트됩니다. **이 전체 URL을 복사해 터미널에 붙여넣습니다.** 복사 방법은 아래 [콜백 URL 가져오기](#콜백-url-가져오기)를 참고하세요.
-4. 끝. 자동으로 토큰 교환과 API 키 프로비저닝이 진행되고 로그인이 완료됩니다.
+3. 로그인 결과는 폴링으로 자동 감지되며, 이어서 토큰 교환과 API 키 프로비저닝이 진행됩니다.
+4. 끝. 터미널에 코드를 붙여넣을 필요 없이 로그인이 완료됩니다.
 
 프로비저닝된 Z.AI API 키는 만료 없이 장기 유효하게 사용됩니다. PR #5 이전 버전에서 업그레이드한 경우에는 `/login glm-zcode`로 1회 재로그인해야 합니다.
 
-## 콜백 URL 가져오기
+## 콜백 URL 가져오기 (폴백)
 
-리다이렉트 주소가 `https://`가 아니라 `zcode://` 커스텀 프로토콜이라, **ZCode 데스크톱 앱이 설치되어 있으면 OS가 그 주소를 앱으로 넘겨버립니다.** 그래서 주소창에 URL이 남지 않고 ZCode 앱만 열리는 현상이 생깁니다. 아래 방법으로 URL을 가로채 복사하세요.
+기본 device flow 엔드포인트에 연결할 수 없으면 기존 `zcode://` URL 붙여넣기 방식으로 자동 전환됩니다. 이 폴백에서 리다이렉트 주소가 `https://`가 아니라 `zcode://` 커스텀 프로토콜이라, **ZCode 데스크톱 앱이 설치되어 있으면 OS가 그 주소를 앱으로 넘겨버립니다.** 그래서 주소창에 URL이 남지 않고 ZCode 앱만 열리는 현상이 생깁니다. 아래 방법으로 URL을 가로채 복사하세요.
 
 > **가장 중요**
 >
@@ -113,8 +113,8 @@ zcode://oauth/callback?code=<authorization-code>&state=<state>
 
 ZCode 앱의 로그인 플로우를 재현합니다. 최종적으로 Z.AI 대시보드 API 키(`{id}.{secret}`)를 발급받아 `https://api.z.ai/api/anthropic` 엔드포인트에 Bearer 인증으로 사용합니다.
 
-1. **Authorize**: `chat.z.ai/api/oauth/authorize`로 로그인합니다. 리다이렉트가 `zcode://` 커스텀 프로토콜이라 사용자가 최종 URL을 직접 붙여넣습니다.
-2. **Broker 교환**: `zcode.z.ai/api/v1/oauth/token`에서 authorization code를 upstream Z.AI 토큰으로 교환합니다.
+1. **Device flow**: CLI init으로 브라우저 로그인 URL과 폴링 정보를 받고, 로그인 완료 후 authorization code를 자동으로 가져옵니다.
+2. **폴백**: device flow 엔드포인트에 연결할 수 없으면 `chat.z.ai/api/oauth/authorize`의 최종 `zcode://` URL을 사용자가 직접 붙여넣고, `zcode.z.ai/api/v1/oauth/token`에서 upstream Z.AI 토큰으로 교환합니다.
 3. **Provision**: Z.AI business 로그인 후 대시보드 API 키를 조회하거나 생성해 최종 키를 얻습니다.
 
 ## 기존 zai provider와의 공존
