@@ -221,8 +221,11 @@ describe("glm-zcode extension", () => {
     expect(authorize.searchParams.get("state")).toBeTruthy();
 
     // The full endpoint chain is hit in order; the empty key list triggers a create.
+    // The device-flow init attempt comes first and fails against this mock (unknown URL),
+    // so login degrades to the classic paste flow.
     const urls = fetch.mock.calls.map((call) => String(call[0]));
     expect(urls).toEqual([
+      "https://zcode.z.ai/api/v1/oauth/cli/init",
       BROKER_URL,
       "https://api.z.ai/api/auth/z/login",
       "https://api.z.ai/api/biz/customer/getCustomerInfo",
@@ -232,19 +235,27 @@ describe("glm-zcode extension", () => {
     ]);
 
     // Broker exchange carries the pasted code and the state from the authorize URL.
-    const brokerBody = JSON.parse(String(fetch.mock.calls[0][1]?.body)) as Record<string, unknown>;
+    const brokerBody = JSON.parse(String(fetch.mock.calls[1][1]?.body)) as Record<string, unknown>;
     expect(brokerBody).toMatchObject({ provider: "zai", code: "auth-code", redirect_uri: "zcode://oauth/callback" });
     expect(brokerBody.state).toBe(authorize.searchParams.get("state"));
 
     // z/login exchanges the upstream token for the business token.
-    const loginBody = JSON.parse(String(fetch.mock.calls[1][1]?.body)) as Record<string, unknown>;
+    const loginBody = JSON.parse(String(fetch.mock.calls[2][1]?.body)) as Record<string, unknown>;
     expect(loginBody).toEqual({ token: UPSTREAM_TOKEN });
 
-    expect(fetch.mock.calls.map((call) => call[1]?.method)).toEqual(["POST", "POST", "GET", "GET", "POST", "GET"]);
-    for (const call of fetch.mock.calls.slice(2)) {
+    expect(fetch.mock.calls.map((call) => call[1]?.method)).toEqual([
+      "POST", // cli/init attempt (mock rejects → paste fallback)
+      "POST", // broker
+      "POST", // z/login
+      "GET", // getCustomerInfo
+      "GET", // api_keys list
+      "POST", // api_keys create
+      "GET", // copy
+    ]);
+    for (const call of fetch.mock.calls.slice(3)) {
       expect(new Headers(call[1]?.headers).get("Authorization")).toBe(`Bearer ${BUSINESS_TOKEN}`);
     }
-    const createBody = JSON.parse(String(fetch.mock.calls[4][1]?.body)) as Record<string, unknown>;
+    const createBody = JSON.parse(String(fetch.mock.calls[5][1]?.body)) as Record<string, unknown>;
     expect(createBody).toEqual({ name: "zcode-api-key" });
 
     // Provisioned credentials.
@@ -259,37 +270,41 @@ describe("glm-zcode extension", () => {
     expect(credentials.expires).toBeLessThanOrEqual(Date.now() + 10 * 365 * 24 * 60 * 60 * 1000 + 5_000);
   });
 
-  describe("malformed callbacks are rejected before any request", () => {
+  describe("malformed callbacks are rejected after only the device-flow init attempt", () => {
     test("rejects a bare auth code that is not a URL", async () => {
-      const fetch = vi.fn(() => Promise.reject(new Error("network must not be touched")));
+      const fetch = vi.fn((_input: unknown) => Promise.reject(new Error("fetch rejected")));
       vi.stubGlobal("fetch", fetch);
       await expect(loginWithCallback("auth-code")).rejects.toThrow("complete zcode:// callback URL");
-      expect(fetch).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(String(fetch.mock.calls[0][0])).toContain("/api/v1/oauth/cli/init");
     });
 
     test("rejects a callback with the wrong port", async () => {
-      const fetch = vi.fn(() => Promise.reject(new Error("network must not be touched")));
+      const fetch = vi.fn((_input: unknown) => Promise.reject(new Error("fetch rejected")));
       vi.stubGlobal("fetch", fetch);
       await expect(loginWithCallback("zcode://oauth:431/callback?code=x&state=y")).rejects.toThrow(
         "callback URL is invalid",
       );
-      expect(fetch).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(String(fetch.mock.calls[0][0])).toContain("/api/v1/oauth/cli/init");
     });
 
     test("rejects a callback missing the state parameter", async () => {
-      const fetch = vi.fn(() => Promise.reject(new Error("network must not be touched")));
+      const fetch = vi.fn((_input: unknown) => Promise.reject(new Error("fetch rejected")));
       vi.stubGlobal("fetch", fetch);
       await expect(loginWithCallback("zcode://oauth/callback?code=x")).rejects.toThrow("exactly one");
-      expect(fetch).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(String(fetch.mock.calls[0][0])).toContain("/api/v1/oauth/cli/init");
     });
 
     test("rejects a callback whose state does not match", async () => {
-      const fetch = vi.fn(() => Promise.reject(new Error("network must not be touched")));
+      const fetch = vi.fn((_input: unknown) => Promise.reject(new Error("fetch rejected")));
       vi.stubGlobal("fetch", fetch);
       await expect(loginWithCallback("zcode://oauth/callback?code=x&state=wrong")).rejects.toThrow(
         "state did not match",
       );
-      expect(fetch).not.toHaveBeenCalled();
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(String(fetch.mock.calls[0][0])).toContain("/api/v1/oauth/cli/init");
     });
   });
 
