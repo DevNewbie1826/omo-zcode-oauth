@@ -1,3 +1,4 @@
+import os from "node:os";
 import type { ExtensionAPI, ProviderConfig, ProviderModelConfig } from "@code-yeongyu/senpi";
 import type { RefreshModelsContext } from "@earendil-works/pi-ai";
 import type { OAuthCredentials } from "@earendil-works/pi-ai/compat";
@@ -24,13 +25,47 @@ const MODELS = [
   },
 ] satisfies ProviderModelConfig[];
 
+function printableAscii(value: string): string {
+  return value.replace(/[^\x20-\x7E]/g, "");
+}
+
+export function osCategory(platform: string): "macos" | "windows" | "linux" {
+  if (platform === "darwin") return "macos";
+  if (platform === "win32") return "windows";
+  return "linux";
+}
+
+export function buildZCodeSourceHeaders(): Record<string, string> {
+  const version = printableAscii(process.env.ZCODE_APP_VERSION || "3.10.2");
+  const channel = printableAscii(process.env.ZCODE_RELEASE_CHANNEL || "production");
+  const raw: Record<string, string> = {
+    "User-Agent": `ZCode/${version}`,
+    "HTTP-Referer": "https://zcode.z.ai",
+    "X-Title": "Z Code@electron",
+    "X-ZCode-App-Version": version,
+    "X-Release-Channel": channel,
+    "X-Platform": `${process.platform}-${process.arch}`,
+    "X-Os-Category": osCategory(process.platform),
+    "X-Os-Version": os.version(),
+    "X-Client-Language": Intl.DateTimeFormat().resolvedOptions().locale,
+    "X-Client-Timezone": Intl.DateTimeFormat().resolvedOptions().timeZone,
+    "X-ZCode-Agent": "glm",
+  };
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const normalized = printableAscii(value);
+    if (normalized !== "") headers[key] = normalized;
+  }
+  return headers;
+}
+
 export default function glmZcodeExtension(pi: ExtensionAPI): void {
   pi.registerProvider("glm-zcode", {
     name: "GLM ZCode (unofficial)",
     baseUrl: "https://api.z.ai/api/anthropic",
     api: "anthropic-messages",
     authHeader: true,
-    headers: { "User-Agent": "ZCode/3.1.2", "X-ZCode-Agent": "glm", "X-ZCode-Version": "3.1.2" },
+    headers: buildZCodeSourceHeaders(),
     models: MODELS,
     refreshModels: (async (context: RefreshModelsContext): Promise<ProviderModelConfig[] | undefined> => {
       // Offline or first-run-without-store: keep static fallback
