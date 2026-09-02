@@ -3,7 +3,7 @@ import type { Model, RefreshModelsContext, ThinkingLevel } from "@earendil-works
 import { streamSimple } from "@earendil-works/pi-ai/api/anthropic-messages";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/compat";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import glmZcodeExtension from "../extensions/glm-zcode/index.js";
+import glmZcodeExtension, { buildZCodeSourceHeaders } from "../extensions/glm-zcode/index.js";
 import {
   catalogToPersistedModels,
   fetchCatalogModels,
@@ -178,11 +178,10 @@ describe("glm-zcode extension", () => {
     expect(config.baseUrl).toBe("https://api.z.ai/api/anthropic");
     expect(config.api).toBe("anthropic-messages");
     expect(config.authHeader).toBe(true);
-    expect(config.headers).toMatchObject({
-      "User-Agent": "ZCode/3.1.2",
-      "X-ZCode-Agent": "glm",
-      "X-ZCode-Version": "3.1.2",
-    });
+    expect(config.headers).toEqual(buildZCodeSourceHeaders());
+    expect(config.headers["X-ZCode-Version"]).toBeUndefined();
+    expect(config.headers["X-ZCode-Agent"]).toBe("glm");
+    expect(config.headers["User-Agent"]).toMatch(/^ZCode\//);
 
     expect(config.models[0]).toMatchObject({
       id: "glm-5.3",
