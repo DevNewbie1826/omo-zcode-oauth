@@ -1,3 +1,4 @@
+import os from "node:os";
 import type { ProviderModelConfig } from "@code-yeongyu/senpi";
 
 export const MODELS_DEV_API_URL = "https://models.dev/api.json";
@@ -168,4 +169,43 @@ export function storedToConfig(stored: { models?: unknown } | undefined): Provid
     });
   }
   return models;
+}
+
+// ---------------------------------------------------------------------------
+// ZCode source headers (hoisted here so live-catalog.ts can use them without
+// a circular import through index.ts, which re-exports them for consumers).
+// ---------------------------------------------------------------------------
+
+function printableAscii(value: string): string {
+  return value.replace(/[^\x20-\x7E]/g, "");
+}
+
+export function osCategory(platform: string): "macos" | "windows" | "linux" {
+  if (platform === "darwin") return "macos";
+  if (platform === "win32") return "windows";
+  return "linux";
+}
+
+export function buildZCodeSourceHeaders(): Record<string, string> {
+  const version = printableAscii(process.env.ZCODE_APP_VERSION || "3.10.2");
+  const channel = printableAscii(process.env.ZCODE_RELEASE_CHANNEL || "production");
+  const raw: Record<string, string> = {
+    "User-Agent": `ZCode/${version}`,
+    "HTTP-Referer": "https://zcode.z.ai",
+    "X-Title": "Z Code@electron",
+    "X-ZCode-App-Version": version,
+    "X-Release-Channel": channel,
+    "X-Platform": `${process.platform}-${process.arch}`,
+    "X-Os-Category": osCategory(process.platform),
+    "X-Os-Version": os.version(),
+    "X-Client-Language": Intl.DateTimeFormat().resolvedOptions().locale,
+    "X-Client-Timezone": Intl.DateTimeFormat().resolvedOptions().timeZone,
+    "X-ZCode-Agent": "glm",
+  };
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const normalized = printableAscii(value);
+    if (normalized !== "") headers[key] = normalized;
+  }
+  return headers;
 }

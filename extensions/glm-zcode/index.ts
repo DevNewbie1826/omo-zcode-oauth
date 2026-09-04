@@ -1,15 +1,19 @@
-import os from "node:os";
 import type { ExtensionAPI, ProviderConfig, ProviderModelConfig } from "@code-yeongyu/senpi";
 import type { RefreshModelsContext } from "@earendil-works/pi-ai";
 import type { OAuthCredentials } from "@earendil-works/pi-ai/compat";
 import {
   CATALOG_TTL_MS,
+  buildZCodeSourceHeaders,
   catalogToPersistedModels,
   fetchCatalogModels,
   storedToConfig,
   thinkingConfigFor,
 } from "./models.js";
+import { fetchLiveModels } from "./live-catalog.js";
 import { loginGlmZcode, refreshGlmZcode } from "./oauth.js";
+
+// Existing consumers (and tests) import these from the extension entry point.
+export { buildZCodeSourceHeaders, osCategory } from "./models.js";
 
 // Static fallback for offline/first-run before catalog fetch.
 const MODELS = [
@@ -25,38 +29,88 @@ const MODELS = [
   },
 ] satisfies ProviderModelConfig[];
 
-function printableAscii(value: string): string {
-  return value.replace(/[^\x20-\x7E]/g, "");
-}
-
-export function osCategory(platform: string): "macos" | "windows" | "linux" {
-  if (platform === "darwin") return "macos";
-  if (platform === "win32") return "windows";
-  return "linux";
-}
-
-export function buildZCodeSourceHeaders(): Record<string, string> {
-  const version = printableAscii(process.env.ZCODE_APP_VERSION || "3.10.2");
-  const channel = printableAscii(process.env.ZCODE_RELEASE_CHANNEL || "production");
-  const raw: Record<string, string> = {
-    "User-Agent": `ZCode/${version}`,
-    "HTTP-Referer": "https://zcode.z.ai",
-    "X-Title": "Z Code@electron",
-    "X-ZCode-App-Version": version,
-    "X-Release-Channel": channel,
-    "X-Platform": `${process.platform}-${process.arch}`,
-    "X-Os-Category": osCategory(process.platform),
-    "X-Os-Version": os.version(),
-    "X-Client-Language": Intl.DateTimeFormat().resolvedOptions().locale,
-    "X-Client-Timezone": Intl.DateTimeFormat().resolvedOptions().timeZone,
-    "X-ZCode-Agent": "glm",
-  };
-  const headers: Record<string, string> = {};
-  for (const [key, value] of Object.entries(raw)) {
-    const normalized = printableAscii(value);
-    if (normalized !== "") headers[key] = normalized;
+/** Resolves the effective API key from the type-tagged credential union; missing/empty means none. */
+function credentialApiKey(credential: RefreshModelsContext["credential"]): string | undefined {
+  switch (credential?.type) {
+    case "oauth":
+      return credential.access || undefined;
+    case "api_key":
+      return credential.key || undefined;
+    case undefined:
+      return undefined;
+    default: {
+      const unhandled: never = credential;
+      throw new Error(`unsupported credential type: ${String(unhandled)}`);
+    }
   }
-  return headers;
+}
+
+/** Whether the stored snapshot is fresh enough to skip both catalogs (force always bypasses). */
+function hasFreshSnapshot(context: RefreshModelsContext): boolean {
+  const checkedAt = context.stored?.checkedAt;
+  return !context.force && typeof checkedAt === "number" && Date.now() - checkedAt < CATALOG_TTL_MS;
+}
+
+function restoreStored(context: RefreshModelsContext): ProviderModelConfig[] | undefined {
+  const restored = storedToConfig(context.stored);
+  return restored.length > 0 ? restored : undefined;
+}
+
+/** The pre-existing models.dev path: TTL/stored/static behavior, unchanged. */
+async function refreshCatalogDev(context: RefreshModelsContext): Promise<ProviderModelConfig[] | undefined> {
+  // Offline or first-run-without-store: keep static fallback
+  if (!context.allowNetwork || context.signal.aborted) return restoreStored(context);
+  // TTL: skip network when the snapshot is fresh (unless forced)
+  if (hasFreshSnapshot(context)) return restoreStored(context);
+  try {
+    const models = await fetchCatalogModels(context.signal);
+    if (models.length === 0) return restoreStored(context);
+    await context.publish({
+      persist: {
+        models: catalogToPersistedModels(models) as unknown as NonNullable<RefreshModelsContext["stored"]>["models"],
+        checkedAt: Date.now(),
+      },
+    });
+    return models;
+  } catch {
+    // Never throw from refreshModels: graceful degradation to stored/static
+    return restoreStored(context);
+  }
+}
+
+/**
+ * Hybrid catalog: with a credential and network access, prefer the authenticated live
+ * /v1/models endpoint; any live failure (network, non-2xx, bad shape, empty) degrades to
+ * the models.dev path verbatim. Without a credential only models.dev runs.
+ *
+ * Cache note: ModelsStoreEntry has no typed credential-fingerprint slot, so the live path
+ * honors the shared 24h TTL and only context.force bypasses it. A re-login under a
+ * different account may therefore serve a stale live snapshot for up to the TTL.
+ */
+async function refreshModels(context: RefreshModelsContext): Promise<ProviderModelConfig[] | undefined> {
+  const apiKey = credentialApiKey(context.credential);
+  if (context.allowNetwork && !context.signal.aborted && apiKey !== undefined && !hasFreshSnapshot(context)) {
+    try {
+      const live = await fetchLiveModels(apiKey, context.signal);
+      if (live.length > 0) {
+        await context.publish({
+          persist: {
+            models:
+              catalogToPersistedModels(live) as unknown as NonNullable<RefreshModelsContext["stored"]>["models"],
+            checkedAt: Date.now(),
+          },
+        });
+        return live;
+      }
+    } catch (error) {
+      console.debug(
+        `glm-zcode: live catalog unavailable, falling back to models.dev (${
+          error instanceof Error ? error.message : String(error)
+        })`,
+      );
+    }
+  }
+  return refreshCatalogDev(context);
 }
 
 export default function glmZcodeExtension(pi: ExtensionAPI): void {
@@ -67,37 +121,7 @@ export default function glmZcodeExtension(pi: ExtensionAPI): void {
     authHeader: true,
     headers: buildZCodeSourceHeaders(),
     models: MODELS,
-    refreshModels: (async (context: RefreshModelsContext): Promise<ProviderModelConfig[] | undefined> => {
-      // Offline or first-run-without-store: keep static fallback
-      if (!context.allowNetwork || context.signal.aborted) {
-        const restored = storedToConfig(context.stored);
-        return restored.length > 0 ? restored : undefined;
-      }
-      // TTL: skip network when the snapshot is fresh (unless forced)
-      const checkedAt = context.stored?.checkedAt;
-      if (!context.force && typeof checkedAt === "number" && Date.now() - checkedAt < CATALOG_TTL_MS) {
-        const restored = storedToConfig(context.stored);
-        return restored.length > 0 ? restored : undefined;
-      }
-      try {
-        const models = await fetchCatalogModels(context.signal);
-        if (models.length === 0) {
-          const restored = storedToConfig(context.stored);
-          return restored.length > 0 ? restored : undefined;
-        }
-        await context.publish({
-          persist: {
-            models: catalogToPersistedModels(models) as unknown as NonNullable<RefreshModelsContext["stored"]>["models"],
-            checkedAt: Date.now(),
-          },
-        });
-        return models;
-      } catch {
-        // Never throw from refreshModels: graceful degradation to stored/static
-        const restored = storedToConfig(context.stored);
-        return restored.length > 0 ? restored : undefined;
-      }
-    }) as NonNullable<ProviderConfig["refreshModels"]>,
+    refreshModels: refreshModels as NonNullable<ProviderConfig["refreshModels"]>,
     oauth: {
       name: "GLM ZCode (unofficial)",
       login: loginGlmZcode,

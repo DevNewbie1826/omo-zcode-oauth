@@ -5,6 +5,7 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-a
 import { afterEach, describe, expect, test, vi } from "vitest";
 import glmZcodeExtension, { buildZCodeSourceHeaders } from "../extensions/glm-zcode/index.js";
 import {
+  MODELS_DEV_API_URL,
   catalogToPersistedModels,
   fetchCatalogModels,
   storedToConfig,
@@ -785,5 +786,245 @@ describe("dynamic model catalog", () => {
       ),
     ).resolves.toBeUndefined();
     expect(fetch).toHaveBeenCalledOnce();
+  });
+});
+
+describe("hybrid live model catalog", () => {
+  const LIVE_MODELS_URL = "https://api.z.ai/api/anthropic/v1/models";
+
+  const liveEnvelope = {
+    data: [
+      { id: "glm-live-a", display_name: "GLM Live A" },
+      { id: "glm-live-b" },
+    ],
+  };
+
+  const modelsDevPayload = {
+    "zai-coding-plan": {
+      models: {
+        "glm-dev": {
+          name: "GLM Dev",
+          reasoning: true,
+          limit: { context: 200_000, output: 8_192 },
+          modalities: { input: ["text"] },
+        },
+      },
+    },
+  };
+
+  const storedModel = {
+    provider: "glm-zcode",
+    api: "anthropic-messages" as const,
+    baseUrl: "https://api.z.ai/api/anthropic",
+    id: "glm-stored",
+    name: "GLM Stored",
+    reasoning: true,
+    input: ["text" as const],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1_000_000,
+    maxTokens: 131_072,
+  };
+
+  function hybridContext(overrides: Partial<RefreshModelsContext> = {}): RefreshModelsContext {
+    return {
+      allowNetwork: true,
+      stored: undefined,
+      signal: new AbortController().signal,
+      publish: vi.fn<RefreshModelsContext["publish"]>(async () => true),
+      credential: { type: "oauth", access: "key-id.secret", refresh: "refresh-token", expires: 1 },
+      ...overrides,
+    };
+  }
+
+  function registeredRefreshModels(): NonNullable<ProviderConfig["refreshModels"]> {
+    const refreshModels = captureProvider().config.refreshModels;
+    if (!refreshModels) throw new Error("glm-zcode provider did not register refreshModels");
+    return refreshModels;
+  }
+
+  /** Serves the live catalog from `live` and the models.dev catalog from `modelsDevPayload`. */
+  function bothCatalogsFetch(live: () => Promise<Response>) {
+    return vi.fn(async (input: string | URL | Request, _init?: RequestInit): Promise<Response> => {
+      const url = String(input);
+      if (url === LIVE_MODELS_URL) return live();
+      if (url === MODELS_DEV_API_URL) return json(modelsDevPayload);
+      throw new Error(`unexpected request: ${url}`);
+    });
+  }
+
+  test("Given a credential and network access, when refreshing, then the live catalog is served with Bearer auth and ZCode source headers and models.dev is never called", async () => {
+    const fetch = bothCatalogsFetch(async () => json(liveEnvelope));
+    vi.stubGlobal("fetch", fetch);
+    const publish = vi.fn<RefreshModelsContext["publish"]>(async () => true);
+
+    const models = await registeredRefreshModels()(hybridContext({ publish }));
+
+    expect(models?.map((model) => model.id)).toEqual(["glm-live-a", "glm-live-b"]);
+    expect(models?.[0]).toMatchObject({
+      name: "GLM Live A",
+      reasoning: true,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 1_000_000,
+      maxTokens: 131_072,
+    });
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(String(fetch.mock.calls[0]?.[0])).toBe(LIVE_MODELS_URL);
+    const headers = fetch.mock.calls[0]?.[1]?.headers;
+    expect(new Headers(headers).get("Authorization")).toBe("Bearer key-id.secret");
+    expect(new Headers(headers).get("Accept")).toBe("application/json");
+    expect(Object.keys(headers ?? {}).some((key) => key.startsWith("X-ZCode-"))).toBe(true);
+    expect(fetch.mock.calls.map((call) => String(call[0]))).not.toContain(MODELS_DEV_API_URL);
+
+    expect(publish).toHaveBeenCalledOnce();
+    const publication = publish.mock.calls[0]?.[0];
+    const persisted = publication?.persist?.models;
+    expect([...(persisted ?? [])].map((model) => model.id)).toEqual(["glm-live-a", "glm-live-b"]);
+    expect(
+      persisted?.every(
+        (model) =>
+          model.provider === "glm-zcode" &&
+          model.api === "anthropic-messages" &&
+          model.baseUrl === "https://api.z.ai/api/anthropic",
+      ),
+    ).toBe(true);
+    expect(publication?.persist?.checkedAt).toEqual(expect.any(Number));
+  });
+
+  test("Given the live endpoint rejects, when refreshing, then it falls back to the models.dev catalog", async () => {
+    const fetch = bothCatalogsFetch(async () => Promise.reject(new Error("live down")));
+    vi.stubGlobal("fetch", fetch);
+    const publish = vi.fn<RefreshModelsContext["publish"]>(async () => true);
+
+    const models = await registeredRefreshModels()(hybridContext({ publish }));
+
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
+    expect(models?.map((model) => model.id)).toEqual(["glm-dev"]);
+    const persisted = publish.mock.calls[0]?.[0]?.persist?.models;
+    expect([...(persisted ?? [])].map((model) => model.id)).toEqual(["glm-dev"]);
+  });
+
+  test("Given the live endpoint answers non-2xx, when refreshing, then it falls back to the models.dev catalog", async () => {
+    const fetch = bothCatalogsFetch(async () => json({ error: "upstream down" }, 503));
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(hybridContext());
+
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
+    expect(models?.map((model) => model.id)).toEqual(["glm-dev"]);
+  });
+
+  test("Given the live catalog has zero usable models, when refreshing, then it falls back to the models.dev catalog", async () => {
+    const fetch = bothCatalogsFetch(async () => json({ data: ["junk", { id: "   " }, { display_name: "no id" }] }));
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(hybridContext());
+
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
+    expect(models?.map((model) => model.id)).toEqual(["glm-dev"]);
+  });
+
+  test("Given an oversize live response, when refreshing, then it falls back to the models.dev catalog", async () => {
+    const fetch = bothCatalogsFetch(async () => json({ data: [{ id: "y".repeat(1_100_000) }] }));
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(hybridContext());
+
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
+    expect(models?.map((model) => model.id)).toEqual(["glm-dev"]);
+  });
+
+  test("Given no credential, when refreshing, then the live endpoint is not called and models.dev serves the catalog", async () => {
+    const fetch = bothCatalogsFetch(async () => json(liveEnvelope));
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(hybridContext({ credential: undefined }));
+
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([MODELS_DEV_API_URL]);
+    expect(models?.map((model) => model.id)).toEqual(["glm-dev"]);
+  });
+
+  test("Given the network is disabled, when refreshing, then neither catalog is fetched and stored models are served", async () => {
+    const fetch = vi.fn(async () => json(liveEnvelope));
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(
+      hybridContext({ allowNetwork: false, stored: { models: [storedModel], checkedAt: 123 } }),
+    );
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(models?.map((model) => model.id)).toEqual(["glm-stored"]);
+  });
+
+  test("Given the network is disabled without stored models, when refreshing, then it returns undefined without fetching", async () => {
+    const fetch = vi.fn(async () => json(liveEnvelope));
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(hybridContext({ allowNetwork: false }));
+
+    expect(models).toBeUndefined();
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  test("Given an already-aborted signal, when refreshing with a credential, then neither catalog is fetched and stored models are served", async () => {
+    const fetch = vi.fn(async () => json(liveEnvelope));
+    vi.stubGlobal("fetch", fetch);
+    const controller = new AbortController();
+    controller.abort();
+
+    const models = await registeredRefreshModels()(
+      hybridContext({ signal: controller.signal, stored: { models: [storedModel], checkedAt: 123 } }),
+    );
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(models?.map((model) => model.id)).toEqual(["glm-stored"]);
+  });
+
+  test("Given an api_key credential, when refreshing, then the live request authorizes with its key", async () => {
+    const fetch = bothCatalogsFetch(async () => json(liveEnvelope));
+    vi.stubGlobal("fetch", fetch);
+
+    await registeredRefreshModels()(hybridContext({ credential: { type: "api_key", key: "sk-zcode-key" } }));
+
+    expect(String(fetch.mock.calls[0]?.[0])).toBe(LIVE_MODELS_URL);
+    expect(new Headers(fetch.mock.calls[0]?.[1]?.headers).get("Authorization")).toBe("Bearer sk-zcode-key");
+  });
+
+  test("Given an api_key credential with a missing or empty key, when refreshing, then it is treated as no credential and models.dev serves the catalog", async () => {
+    for (const credential of [{ type: "api_key" as const }, { type: "api_key" as const, key: "" }]) {
+      const fetch = bothCatalogsFetch(async () => json(liveEnvelope));
+      vi.stubGlobal("fetch", fetch);
+
+      const models = await registeredRefreshModels()(hybridContext({ credential }));
+
+      expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([MODELS_DEV_API_URL]);
+      expect(models?.map((model) => model.id)).toEqual(["glm-dev"]);
+    }
+  });
+
+  test("Given force is set with a fresh stored snapshot, when refreshing, then the live catalog bypasses the TTL", async () => {
+    const fetch = bothCatalogsFetch(async () => json(liveEnvelope));
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(
+      hybridContext({ force: true, stored: { models: [storedModel], checkedAt: Date.now() } }),
+    );
+
+    expect(String(fetch.mock.calls[0]?.[0])).toBe(LIVE_MODELS_URL);
+    expect(models?.map((model) => model.id)).toEqual(["glm-live-a", "glm-live-b"]);
+  });
+
+  test("Given a fresh stored snapshot without force, when refreshing with a credential, then neither catalog is fetched and stored models are served", async () => {
+    const fetch = bothCatalogsFetch(async () => json(liveEnvelope));
+    vi.stubGlobal("fetch", fetch);
+    const publish = vi.fn<RefreshModelsContext["publish"]>(async () => true);
+
+    const models = await registeredRefreshModels()(
+      hybridContext({ stored: { models: [storedModel], checkedAt: Date.now() }, publish }),
+    );
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
+    expect(models?.map((model) => model.id)).toEqual(["glm-stored"]);
   });
 });
