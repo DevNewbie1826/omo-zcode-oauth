@@ -1,4 +1,6 @@
+import os from "node:os";
 import type { ProviderModelConfig } from "@code-yeongyu/senpi";
+import type { Model, ModelsStoreEntry } from "@earendil-works/pi-ai";
 
 export const MODELS_DEV_API_URL = "https://models.dev/api.json";
 export const CATALOG_PROVIDER = "zai-coding-plan";
@@ -19,6 +21,22 @@ export const ZAI_THINKING_LEVEL_MAP = {
 
 type JsonRecord = Record<string, unknown>;
 type InputModality = ProviderModelConfig["input"][number];
+/** Persist only the Model fields this catalog actually writes; assignable to ModelsStoreEntry.models. */
+type ZCodePersistedModel = Pick<
+  Model<"anthropic-messages">,
+  | "provider"
+  | "api"
+  | "baseUrl"
+  | "id"
+  | "name"
+  | "reasoning"
+  | "input"
+  | "cost"
+  | "contextWindow"
+  | "maxTokens"
+  | "thinkingLevelMap"
+  | "compat"
+>;
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -38,11 +56,35 @@ function finiteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-function nullableStringRecord(value: unknown): Record<string, string | null> | undefined {
-  if (!isRecord(value) || !Object.values(value).every((entry) => typeof entry === "string" || entry === null)) {
-    return undefined;
+const ANTHROPIC_COMPAT_FLAGS = [
+  "supportsEagerToolInputStreaming",
+  "supportsLongCacheRetention",
+  "sendSessionAffinityHeaders",
+  "supportsCacheControlOnTools",
+  "supportsDisabledThinking",
+  "supportsTemperature",
+  "supportsToolChoice",
+  "supportsForcedToolChoice",
+  "forceAdaptiveThinking",
+  "allowEmptySignature",
+  "supportsStrictTools",
+  "supportsToolReferences",
+  "supportsWebSearch",
+] as const satisfies readonly (keyof NonNullable<Model<"anthropic-messages">["compat"]>)[];
+
+function anthropicMessagesCompat(value: object): NonNullable<Model<"anthropic-messages">["compat"]> {
+  if (!isRecord(value)) return {};
+  const compat: NonNullable<Model<"anthropic-messages">["compat"]> = {};
+  for (const key of ANTHROPIC_COMPAT_FLAGS) {
+    const entry = value[key];
+    if (typeof entry === "boolean") {
+      compat[key] = entry;
+    }
   }
-  return { ...value } as Record<string, string | null>;
+  if (value.unsignedThinkingReplay === "text" || value.unsignedThinkingReplay === "empty-signature") {
+    compat.unsignedThinkingReplay = value.unsignedThinkingReplay;
+  }
+  return compat;
 }
 
 export function thinkingConfigFor(
@@ -93,8 +135,12 @@ export async function fetchCatalogModels(signal?: AbortSignal): Promise<Provider
   return models;
 }
 
-export function catalogToPersistedModels(models: ProviderModelConfig[]): Record<string, unknown>[] {
-  return models.map((model) => ({
+export function catalogToPersistedModels(models: readonly ProviderModelConfig[]): ModelsStoreEntry["models"] {
+  return models.map(toPersistedModel);
+}
+
+function toPersistedModel(model: ProviderModelConfig): ZCodePersistedModel {
+  return {
     provider: "glm-zcode",
     api: "anthropic-messages",
     baseUrl: "https://api.z.ai/api/anthropic",
@@ -111,11 +157,11 @@ export function catalogToPersistedModels(models: ProviderModelConfig[]): Record<
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
     ...(model.thinkingLevelMap ? { thinkingLevelMap: { ...model.thinkingLevelMap } } : {}),
-    ...(model.compat ? { compat: { ...model.compat } } : {}),
-  }));
+    ...(model.compat ? { compat: anthropicMessagesCompat(model.compat) } : {}),
+  };
 }
 
-export function storedToConfig(stored: { models?: unknown } | undefined): ProviderModelConfig[] {
+export function storedToConfig(stored: Readonly<ModelsStoreEntry> | undefined): ProviderModelConfig[] {
   if (!Array.isArray(stored?.models)) return [];
 
   const models: ProviderModelConfig[] = [];
@@ -123,10 +169,9 @@ export function storedToConfig(stored: { models?: unknown } | undefined): Provid
     if (!isRecord(model)) continue;
     const input = filteredInput(model.input);
     const cost = model.cost;
-    const thinkingLevelMap = nullableStringRecord(model.thinkingLevelMap) as
-      | ProviderModelConfig["thinkingLevelMap"]
-      | undefined;
-    const compat = isRecord(model.compat) ? ({ ...model.compat } as ProviderModelConfig["compat"]) : undefined;
+    const thinkingLevelMap =
+      model.thinkingLevelMap === undefined ? undefined : { ...model.thinkingLevelMap };
+    const compat = isRecord(model.compat) ? anthropicMessagesCompat(model.compat) : undefined;
     const thinkingConfig =
       thinkingLevelMap === undefined
         ? thinkingConfigFor(undefined)
@@ -168,4 +213,43 @@ export function storedToConfig(stored: { models?: unknown } | undefined): Provid
     });
   }
   return models;
+}
+
+// ---------------------------------------------------------------------------
+// ZCode source headers (hoisted here so live-catalog.ts can use them without
+// a circular import through index.ts, which re-exports them for consumers).
+// ---------------------------------------------------------------------------
+
+function printableAscii(value: string): string {
+  return value.replace(/[^\x20-\x7E]/g, "");
+}
+
+export function osCategory(platform: string): "macos" | "windows" | "linux" {
+  if (platform === "darwin") return "macos";
+  if (platform === "win32") return "windows";
+  return "linux";
+}
+
+export function buildZCodeSourceHeaders(): Record<string, string> {
+  const version = printableAscii(process.env.ZCODE_APP_VERSION || "3.10.2");
+  const channel = printableAscii(process.env.ZCODE_RELEASE_CHANNEL || "production");
+  const raw: Record<string, string> = {
+    "User-Agent": `ZCode/${version}`,
+    "HTTP-Referer": "https://zcode.z.ai",
+    "X-Title": "Z Code@electron",
+    "X-ZCode-App-Version": version,
+    "X-Release-Channel": channel,
+    "X-Platform": `${process.platform}-${process.arch}`,
+    "X-Os-Category": osCategory(process.platform),
+    "X-Os-Version": os.version(),
+    "X-Client-Language": Intl.DateTimeFormat().resolvedOptions().locale,
+    "X-Client-Timezone": Intl.DateTimeFormat().resolvedOptions().timeZone,
+    "X-ZCode-Agent": "glm",
+  };
+  const headers: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const normalized = printableAscii(value);
+    if (normalized !== "") headers[key] = normalized;
+  }
+  return headers;
 }
