@@ -914,6 +914,29 @@ describe("hybrid live model catalog", () => {
     expect(models?.map((model) => model.id)).toEqual(["glm-dev"]);
   });
 
+  test("Given both catalogs fail with a stored snapshot, when refreshing, then stored models are restored without publishing new models", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => Promise.reject(new Error("catalog unavailable")));
+    vi.stubGlobal("fetch", fetch);
+    const publish = vi.fn<RefreshModelsContext["publish"]>(async () => true);
+    const stored = { models: [storedModel], checkedAt: 123 };
+
+    const models = await registeredRefreshModels()(hybridContext({ publish, stored }));
+
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
+    expect(models).toEqual(storedToConfig(stored));
+    expect(publish).not.toHaveBeenCalled();
+  });
+
+  test("Given both catalogs fail without a stored snapshot, when refreshing, then no catalog is returned and the registered static list is retained", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>(async () => Promise.reject(new Error("catalog unavailable")));
+    vi.stubGlobal("fetch", fetch);
+
+    const models = await registeredRefreshModels()(hybridContext({ stored: undefined }));
+
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
+    expect(models).toBeUndefined();
+  });
+
   test("Given the live catalog has zero usable models, when refreshing, then it falls back to the models.dev catalog", async () => {
     const fetch = bothCatalogsFetch(async () => json({ data: ["junk", { id: "   " }, { display_name: "no id" }] }));
     vi.stubGlobal("fetch", fetch);

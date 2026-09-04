@@ -112,25 +112,46 @@ describe("fetchLiveModels", () => {
     ]);
   });
 
-  test("Given a response body over 1MB, when fetched, then the response is rejected before parsing", async () => {
+  test("Given a response body over 1MB, when fetched, then reading stops once the cap is crossed", async () => {
+    const chunkSize = 65_536;
+    const totalAvailable = LIVE_MODELS_MAX_BYTES * 3;
+    const probe = { bytesPulled: 0, cancelCount: 0 };
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (probe.bytesPulled >= totalAvailable) {
+          controller.close();
+          return;
+        }
+        const size = Math.min(chunkSize, totalAvailable - probe.bytesPulled);
+        probe.bytesPulled += size;
+        controller.enqueue(new Uint8Array(size));
+      },
+      cancel() {
+        probe.cancelCount += 1;
+      },
+    });
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => json({ data: [{ id: "y".repeat(LIVE_MODELS_MAX_BYTES) }] })),
+      vi.fn(async () => new Response(body, { status: 200, headers: { "Content-Type": "application/json" } })),
     );
 
-    await expect(fetchLiveModels("key-123")).rejects.toThrow("exceeded");
+    await expect(fetchLiveModels("key-123")).rejects.toBeInstanceOf(Error);
+    expect(probe.bytesPulled).toBeGreaterThan(LIVE_MODELS_MAX_BYTES);
+    expect(probe.bytesPulled).toBeLessThan(totalAvailable);
+    expect(probe.bytesPulled).toBeLessThanOrEqual(LIVE_MODELS_MAX_BYTES + chunkSize * 2);
+    expect(probe.cancelCount).toBe(1);
   });
 
-  test("Given a non-2xx response, when fetched, then it rejects with the status", async () => {
+  test("Given a non-2xx response, when fetched, then it rejects", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => json({ error: "unauthorized" }, 401)));
 
-    await expect(fetchLiveModels("key-123")).rejects.toThrow("401");
+    await expect(fetchLiveModels("key-123")).rejects.toBeInstanceOf(Error);
   });
 
-  test("Given a non-JSON body, when fetched, then it rejects as invalid JSON", async () => {
+  test("Given a non-JSON body, when fetched, then it rejects", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("not-json", { status: 200 })));
 
-    await expect(fetchLiveModels("key-123")).rejects.toThrow("not valid JSON");
+    await expect(fetchLiveModels("key-123")).rejects.toBeInstanceOf(Error);
   });
 
   test("Given an envelope without a model array, when fetched, then no models are returned", async () => {

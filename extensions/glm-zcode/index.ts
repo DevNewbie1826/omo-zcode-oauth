@@ -12,6 +12,8 @@ import {
 import { fetchLiveModels } from "./live-catalog.js";
 import { loginGlmZcode, refreshGlmZcode } from "./oauth.js";
 
+type RefreshModels = NonNullable<ProviderConfig["refreshModels"]>;
+
 // Existing consumers (and tests) import these from the extension entry point.
 export { buildZCodeSourceHeaders, osCategory } from "./models.js";
 
@@ -67,7 +69,7 @@ async function refreshCatalogDev(context: RefreshModelsContext): Promise<Provide
     if (models.length === 0) return restoreStored(context);
     await context.publish({
       persist: {
-        models: catalogToPersistedModels(models) as unknown as NonNullable<RefreshModelsContext["stored"]>["models"],
+        models: catalogToPersistedModels(models),
         checkedAt: Date.now(),
       },
     });
@@ -87,6 +89,7 @@ async function refreshCatalogDev(context: RefreshModelsContext): Promise<Provide
  * honors the shared 24h TTL and only context.force bypasses it. A re-login under a
  * different account may therefore serve a stale live snapshot for up to the TTL.
  */
+async function refreshModels(context: Parameters<RefreshModels>[0]): ReturnType<RefreshModels>;
 async function refreshModels(context: RefreshModelsContext): Promise<ProviderModelConfig[] | undefined> {
   const apiKey = credentialApiKey(context.credential);
   if (context.allowNetwork && !context.signal.aborted && apiKey !== undefined && !hasFreshSnapshot(context)) {
@@ -95,8 +98,7 @@ async function refreshModels(context: RefreshModelsContext): Promise<ProviderMod
       if (live.length > 0) {
         await context.publish({
           persist: {
-            models:
-              catalogToPersistedModels(live) as unknown as NonNullable<RefreshModelsContext["stored"]>["models"],
+            models: catalogToPersistedModels(live),
             checkedAt: Date.now(),
           },
         });
@@ -121,7 +123,7 @@ export default function glmZcodeExtension(pi: ExtensionAPI): void {
     authHeader: true,
     headers: buildZCodeSourceHeaders(),
     models: MODELS,
-    refreshModels: refreshModels as NonNullable<ProviderConfig["refreshModels"]>,
+    refreshModels,
     oauth: {
       name: "GLM ZCode (unofficial)",
       login: loginGlmZcode,

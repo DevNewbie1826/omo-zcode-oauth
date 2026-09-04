@@ -28,6 +28,37 @@ function usableEntry(entry: JsonRecord): { id: string; name: string } | undefine
 }
 
 /**
+ * Reads the response body incrementally and stops as soon as `maxBytes` is crossed.
+ * The overflowing chunk is not retained; the reader is cancelled so the producer stops.
+ */
+async function readCappedUtf8(stream: ReadableStream<Uint8Array> | null, maxBytes: number): Promise<string> {
+  if (stream === null) return "";
+
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let releaseLock = true;
+  try {
+    for (;;) {
+      const result = await reader.read();
+      if (result.done) break;
+      const chunk = result.value;
+      if (chunk === undefined) continue;
+      total += chunk.byteLength;
+      if (total > maxBytes) {
+        releaseLock = false;
+        await reader.cancel();
+        throw new Error(`live models response exceeded ${maxBytes} bytes`);
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    if (releaseLock) reader.releaseLock();
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/**
  * Fetches the authenticated live /v1/models catalog. The OpenAI-shaped envelope is parsed
  * tolerantly ({data:[...]} or a bare array); entries without a usable id are dropped silently.
  * The live catalog supplies ids/names only, so metadata defaults mirror the static MODELS
@@ -46,11 +77,7 @@ export async function fetchLiveModels(apiKey: string, signal?: AbortSignal): Pro
   });
   if (!response.ok) throw new Error(`live models request failed: ${response.status}`);
 
-  // Guard before JSON.parse: bodies above the cap are rejected without parsing.
-  const text = await response.text();
-  if (Buffer.byteLength(text, "utf8") > LIVE_MODELS_MAX_BYTES) {
-    throw new Error(`live models response exceeded ${LIVE_MODELS_MAX_BYTES} bytes`);
-  }
+  const text = await readCappedUtf8(response.body, LIVE_MODELS_MAX_BYTES);
 
   let payload: unknown;
   try {
