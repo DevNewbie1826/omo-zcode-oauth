@@ -267,6 +267,7 @@ describe("off-peak wire routing (real signer, composer-shaped models)", () => {
   });
 
   test("transport ready with availability and ticket: refreshModels routes flash off-peak", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakClockForTests(IN_WINDOW);
     const { config } = captureProvider();
     vi.stubGlobal(
@@ -298,6 +299,7 @@ describe("off-peak wire routing (real signer, composer-shaped models)", () => {
     const plain = refreshed?.find((model) => !model.id.includes("flash"));
     expect(flash?.baseUrl).toBe("https://zcode.z.ai/api/v1/off-peak/anthropic");
     expect(plain?.baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
+    vi.unstubAllEnvs();
   });
 });
 
@@ -335,6 +337,7 @@ describe("pending ticket lifecycle (retry and reacquisition)", () => {
   });
 
   test("a refresh warm-up does not bypass ticket expiry (refresh-first flow)", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakClockForTests(IN_WINDOW);
     let takes = 0;
     vi.stubGlobal(
@@ -393,6 +396,7 @@ describe("pending ticket lifecycle (retry and reacquisition)", () => {
     expect(wire).toEqual([OFFPEAK_MESSAGES, OFFPEAK_MESSAGES]);
     expect(usedTickets[0]).not.toBe(usedTickets[1]);
     expect(usedTickets[1]).toBe("t-warm-2");
+    vi.unstubAllEnvs();
   });
 
   test("a fulfilled pending promise does not outlive the ticket TTL", async () => {
@@ -417,5 +421,64 @@ describe("pending ticket lifecycle (retry and reacquisition)", () => {
     await run(config, IN_WINDOW); // must re-take, not reuse the fulfilled promise
 
     expect(takes).toBe(2);
+  });
+});
+
+describe("device identity metadata (PR10)", () => {
+  const captured = (handlers: Record<string, unknown>) => {
+    let config: ProviderConfig | undefined;
+    const pi = new Proxy({}, { get: (_t: any, p: any) => (p === "registerProvider" ? (_n: string, c: ProviderConfig) => { config = c; } : (p === "on" ? (e: string, h: any) => { handlers[e] = h; } : () => undefined)) });
+    glmZcodeExtension(pi as Parameters<typeof glmZcodeExtension>[0]);
+    if (!config) throw new Error("not registered");
+    return config;
+  };
+
+  test("before_provider_request injects metadata.user_id with the machine device id", async () => {
+    vi.stubEnv("ZCODE_DEVICE_ID", "test-device-1234");
+    const handlers: Record<string, unknown> = {};
+    captured(handlers);
+    const hook = handlers["before_provider_request"] as (e: any) => unknown;
+    const payload: Record<string, unknown> = { model: "glm-5.3-flash", messages: [] };
+    const model = { provider: "glm-zcode" };
+    const result = hook({ payload, model });
+    const meta = JSON.parse((payload.metadata as { user_id: string }).user_id);
+    expect(meta.device_id).toBe("test-device-1234");
+    expect(meta.account_uuid).toBe("");
+    expect(typeof meta.session_id).toBe("string");
+    expect(result).toBe(payload);
+    vi.unstubAllEnvs();
+  });
+
+  test("foreign providers and pre-existing metadata are untouched", async () => {
+    const handlers: Record<string, unknown> = {};
+    captured(handlers);
+    const hook = handlers["before_provider_request"] as (e: any) => unknown;
+    const foreign: Record<string, unknown> = { model: "x", messages: [] };
+    hook({ payload: foreign, model: { provider: "openai" } });
+    expect(foreign.metadata).toBeUndefined();
+    const own: Record<string, unknown> = { model: "x", metadata: { user_id: "keep" } };
+    hook({ payload: own, model: { provider: "glm-zcode" } });
+    expect((own.metadata as { user_id: string }).user_id).toBe("keep");
+  });
+
+  test("off-peak routing requires ZCODE_OFFPEAK_ENABLE=1", async () => {
+    setOffPeakClockForTests(IN_WINDOW);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url === "https://api.z.ai/api/anthropic/v1/models") return json({ data: [{ id: "glm-5.3-flash" }] });
+        throw new Error(`unexpected ${url}`);
+      }),
+    );
+    const { config } = captureProvider();
+    const refreshed = await config.refreshModels!({
+      allowNetwork: true,
+      signal: new AbortController().signal,
+      credential: { type: "oauth", access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT },
+      publish: async () => {},
+      force: true,
+    } as never);
+    expect(refreshed?.[0].baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
   });
 });

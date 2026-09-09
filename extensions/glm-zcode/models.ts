@@ -251,7 +251,7 @@ export function buildZCodeSourceHeaders(): Record<string, string> {
   const version = zcodeAppVersion();
   const channel = printableAscii(process.env.ZCODE_RELEASE_CHANNEL || "production");
   const raw: Record<string, string> = {
-    "User-Agent": `ZCode/${version}`,
+    "User-Agent": `ZCode/${version} ai-sdk/provider-utils/4.0.27 runtime/node.js/${process.versions.node}`,
     "HTTP-Referer": "https://zcode.z.ai",
     "X-Title": "Z Code@electron",
     "X-ZCode-App-Version": version,

@@ -4,6 +4,9 @@ import type { OAuthCredentials } from "@earendil-works/pi-ai/compat";
 import { CATALOG_TTL_MS, buildZCodeSourceHeaders, catalogToPersistedModels, fetchCatalogModels, resolveZCodeAnthropicBaseUrl, storedToConfig, thinkingConfigFor } from "./models.js";
 import { fetchLiveModels } from "./live-catalog.js";
 import { loginGlmZcode, refreshGlmZcode } from "./oauth.js";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { readFileSync } from "node:fs";
 import { resolveZCodeSigningHeaders } from "./signing.js";
 
 let anthropicStreamSimple: typeof import("@earendil-works/pi-ai/api/anthropic-messages").streamSimple | undefined;
@@ -127,6 +130,7 @@ function offPeakTransportReady(): boolean {
 
 /** The per-model off-peak route decision: transport + window + entitlement + a usable JWT. */
 async function offPeakActiveFor(context: RefreshModelsContext): Promise<boolean> {
+  if (process.env.ZCODE_OFFPEAK_ENABLE !== "1") return false;
   if (!offPeakTransportReady()) return false;
   if (!isOffPeakWindow(offPeakTestClock ?? new Date()) || !context.allowNetwork || context.signal.aborted) return false;
   if (context.credential?.type !== "oauth") return false;
@@ -263,11 +267,60 @@ export function setOffPeakTransportForTests(ready: boolean | undefined): void {
   offPeakTransportOverride = ready;
 }
 
+let defaultDeviceId: string | undefined;
+
+function printableAsciiEnv(name: string): string | undefined {
+  const value = process.env[name]?.trim() ?? "";
+  return value && /^[\x20-\x7e]+$/.test(value) ? value : undefined;
+}
+
+function readDeviceMid(): string | undefined {
+  try {
+    const state = JSON.parse(readFileSync(join(homedir(), ".zcode/v2/telemetry-state.json"), "utf8")) as { deviceMid?: string };
+    const mid = state.deviceMid?.trim();
+    return mid && /^[\x20-\x7e]+$/.test(mid) ? mid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Device-identity metadata for glm-zcode request bodies. The real app
+ * (captured 2026-09-10) sends metadata.user_id = JSON({device_id,
+ * account_uuid, session_id}); without it the identical signed ultra request
+ * is billed at par, with it the campaign zero-quota classification applies.
+ */
+function deviceIdentityMetadata(): { user_id: string } | undefined {
+  const deviceId = printableAsciiEnv("ZCODE_DEVICE_ID") ?? defaultDeviceId;
+  if (!deviceId) return undefined;
+  return { user_id: JSON.stringify({ device_id: deviceId, account_uuid: "", session_id: currentOffPeakTaskId() }) };
+}
+
 export default function glmZcodeExtension(pi: ExtensionAPI): void {
+  defaultDeviceId ??= readDeviceMid();
+  pi.on("before_provider_request", (event) => {
+    if (event.model?.provider !== "glm-zcode" || event.payload == null || typeof event.payload !== "object") return event.payload;
+    const payload = event.payload as { metadata?: { user_id?: unknown } & Record<string, unknown> };
+    if (payload.metadata?.user_id !== undefined) return event.payload;
+    const metadata = deviceIdentityMetadata();
+    if (!metadata) return event.payload;
+    payload.metadata = { ...(payload.metadata as Record<string, unknown> | undefined), ...metadata };
+    return payload;
+  });
   pi.on("before_provider_headers", async (event) => {
     Object.assign(event.headers, await resolveZCodeSigningHeaders(event.headers));
   });
-  pi.registerProvider("glm-zcode", {
+    defaultDeviceId ??= readDeviceMid();
+  pi.on("before_provider_request", (event) => {
+    if (event.model?.provider !== "glm-zcode" || event.payload == null || typeof event.payload !== "object") return event.payload;
+    const payload = event.payload as { metadata?: { user_id?: unknown } & Record<string, unknown> };
+    if (payload.metadata?.user_id !== undefined) return event.payload;
+    const metadata = deviceIdentityMetadata();
+    if (!metadata) return event.payload;
+    payload.metadata = { ...payload.metadata, ...metadata };
+    return payload;
+  });
+pi.registerProvider("glm-zcode", {
     name: "GLM ZCode (unofficial)",
     api: "anthropic-messages",
     authHeader: true,
@@ -290,3 +343,4 @@ export default function glmZcodeExtension(pi: ExtensionAPI): void {
     },
   });
 }
+
