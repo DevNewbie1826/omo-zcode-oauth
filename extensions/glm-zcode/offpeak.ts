@@ -21,8 +21,10 @@ import { buildZCodeSourceHeaders, resolveZCodeAnthropicBaseUrl } from "./models.
 export const OFFPEAK_BASE_URL = "https://zcode.z.ai/api/v1/off-peak/anthropic";
 const TICKET_BASE_URL = "https://zcode.z.ai/api/v1/off-peak/ticket";
 const REQUEST_TIMEOUT_MS = 15_000;
-const STATUS_POLLS = 4;
-const STATUS_POLL_INTERVAL_MS = 600;
+const READY_WAIT_MS = 120_000;
+const MIN_POLL_INTERVAL_MS = 2_000;
+const MAX_POLL_INTERVAL_MS = 30_000;
+const DEFAULT_POLL_INTERVAL_MS = 10_000;
 
 /** Campaign window: KST [00:00, 10:00). */
 export function isOffPeakWindow(now: Date = new Date()): boolean {
@@ -102,11 +104,13 @@ export async function ensureOffPeakTicket(
   if (typeof ticketId !== "string" || !ticketId) return undefined;
 
   let state = ticket?.state;
-  for (let poll = 0; poll <= STATUS_POLLS; poll += 1) {
+  let pollIntervalMs = clampPollIntervalMs(ticket?.next_poll_after);
+  const deadline = Date.now() + READY_WAIT_MS;
+  for (;;) {
     if (state === "ready" || state === "active") return ticketId;
     if (state !== "queued") return undefined;
-    if (poll === STATUS_POLLS) return undefined;
-    await sleep(STATUS_POLL_INTERVAL_MS);
+    if (Date.now() + pollIntervalMs > deadline) return undefined;
+    await sleep(pollIntervalMs);
     const status = await ticketFetch(`${TICKET_BASE_URL}/status`, {
       method: "POST",
       headers: { ...ticketHeaders(jwt, apiKey), "Content-Type": "application/json" },
@@ -123,8 +127,15 @@ export async function ensureOffPeakTicket(
     const entry = tickets.find((item): item is Record<string, unknown> => isRecord(item) && item.ticket_id === ticketId);
     if (!isRecord(entry)) return undefined;
     state = entry.state ?? "queued";
+    pollIntervalMs = clampPollIntervalMs(entry.next_poll_after ?? pollIntervalMs / 1000);
   }
   return undefined;
+}
+
+/** The server dictates the poll cadence (next_poll_after seconds); clamped for sanity. */
+function clampPollIntervalMs(seconds: unknown): number {
+  const value = typeof seconds === "number" && Number.isFinite(seconds) ? seconds * 1000 : DEFAULT_POLL_INTERVAL_MS;
+  return Math.min(Math.max(value, MIN_POLL_INTERVAL_MS), MAX_POLL_INTERVAL_MS);
 }
 
 /**

@@ -105,21 +105,29 @@ describe("ensureOffPeakTicket", () => {
     expect(await ensureOffPeakTicket("jwt", "key", "task-1")).toBe("t-1");
   });
 
-  test("queued tickets are polled to ready, then returned; failures return undefined", async () => {
-    let statusCalls = 0;
-    const fetch = vi.fn(async (input: string | URL | Request) => {
-      const url = String(input);
-      if (url.endsWith("/ticket")) return json({ ticket_id: "t-2", state: "queued", next_poll_after: 0.05 });
-      if (url.endsWith("/ticket/status")) {
-        statusCalls += 1;
-        return json({ tickets: [{ ticket_id: "t-2", state: statusCalls >= 2 ? "ready" : "queued" }] });
-      }
-      throw new Error(`unexpected ${url}`);
-    });
-    vi.stubGlobal("fetch", fetch);
+  test("queued tickets are polled at the server cadence until ready; failures return undefined", async () => {
+    vi.useFakeTimers();
+    try {
+      let statusCalls = 0;
+      const fetch = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/ticket")) return json({ ticket_id: "t-2", state: "queued", next_poll_after: 2 });
+        if (url.endsWith("/ticket/status")) {
+          statusCalls += 1;
+          return json({ tickets: [{ ticket_id: "t-2", state: statusCalls >= 2 ? "ready" : "queued" }] });
+        }
+        throw new Error(`unexpected ${url}`);
+      });
+      vi.stubGlobal("fetch", fetch);
 
-    expect(await ensureOffPeakTicket("jwt", "key", "task-2")).toBe("t-2");
-    expect(statusCalls).toBe(2);
+      const pending = ensureOffPeakTicket("jwt", "key", "task-2");
+      const advance = (async () => { for (let i = 0; i < 3; i++) await vi.advanceTimersByTimeAsync(2_000); })();
+      const [ticket] = await Promise.all([pending, advance]);
+      expect(ticket).toBe("t-2");
+      expect(statusCalls).toBe(2);
+    } finally {
+      vi.useRealTimers();
+    }
 
     vi.stubGlobal("fetch", vi.fn(async () => json({ code: 3103, msg: "free tier limit reached" }, 429)));
     expect(await ensureOffPeakTicket("jwt", "key", "task-3")).toBeUndefined();
@@ -175,7 +183,7 @@ describe("ensureOffPeakTicket final-poll semantics", () => {
       let statusCalls = 0;
       const fetch = vi.fn(async (input: string | URL | Request) => {
         const url = String(input);
-        if (url.endsWith("/ticket")) return json({ ticket_id: "t-late", state: "queued" });
+        if (url.endsWith("/ticket")) return json({ ticket_id: "t-late", state: "queued", next_poll_after: 10 });
         if (url.endsWith("/ticket/status")) {
           statusCalls += 1;
           return json({ tickets: [{ ticket_id: "t-late", state: statusCalls >= 4 ? "ready" : "queued" }] });
@@ -184,7 +192,7 @@ describe("ensureOffPeakTicket final-poll semantics", () => {
       });
       vi.stubGlobal("fetch", fetch);
       const pending = ensureOffPeakTicket("jwt", "key", "task-late");
-      const advance = (async () => { for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(600); })();
+      const advance = (async () => { for (let i = 0; i < 6; i++) await vi.advanceTimersByTimeAsync(10_000); })();
       const [ticket] = await Promise.all([pending, advance]);
       expect(ticket).toBe("t-late");
       expect(statusCalls).toBe(4);
@@ -198,13 +206,13 @@ describe("ensureOffPeakTicket final-poll semantics", () => {
     try {
       const fetch = vi.fn(async (input: string | URL | Request) => {
         const url = String(input);
-        if (url.endsWith("/ticket")) return json({ ticket_id: "t-stuck", state: "queued" });
+        if (url.endsWith("/ticket")) return json({ ticket_id: "t-stuck", state: "queued", next_poll_after: 10 });
         if (url.endsWith("/ticket/status")) return json({ tickets: [{ ticket_id: "t-stuck", state: "queued" }] });
         throw new Error(`unexpected ${url}`);
       });
       vi.stubGlobal("fetch", fetch);
       const pending = ensureOffPeakTicket("jwt", "key", "task-stuck");
-      const advance = (async () => { for (let i = 0; i < 6; i++) await vi.advanceTimersByTimeAsync(600); })();
+      const advance = (async () => { for (let i = 0; i < 14; i++) await vi.advanceTimersByTimeAsync(10_000); })();
       const [ticket] = await Promise.all([pending, advance]);
       expect(ticket).toBeUndefined();
     } finally {
