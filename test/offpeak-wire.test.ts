@@ -458,8 +458,10 @@ describe("device identity metadata (PR10)", () => {
   });
 
   test("foreign providers and pre-existing metadata are untouched", async () => {
+    vi.stubEnv("ZCODE_DEVICE_ID", "test-device-1234");
     const handlers: Record<string, unknown[]> = {};
     captured(handlers);
+    expect(handlers["before_provider_request"]).toHaveLength(1);
     const hook = handlers["before_provider_request"][0] as (e: any) => unknown;
     const foreign: Record<string, unknown> = { model: "x", messages: [] };
     hook({ payload: foreign, model: { provider: "openai" } });
