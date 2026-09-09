@@ -443,6 +443,8 @@ describe("device identity metadata (PR10)", () => {
     vi.stubEnv("ZCODE_DEVICE_ID", "test-device-1234");
     const handlers: Record<string, unknown[]> = {};
     captured(handlers);
+    expect(handlers["before_provider_request"]).toHaveLength(1);
+    expect(handlers["before_provider_headers"]).toHaveLength(1);
     const hook = handlers["before_provider_request"][0] as (e: any) => unknown;
     const payload: Record<string, unknown> = { model: "glm-5.3-flash", messages: [] };
     const model = { provider: "glm-zcode" };
@@ -548,5 +550,50 @@ describe("off-peak flag gates cached tickets too", () => {
     await run(); // must ignore the warm cache and fall back to signed ultra
     expect(wire[1]).toBe(ULTRA_MESSAGES);
     expect(takes).toBe(1); // no new acquisition either
+  });
+});
+
+describe("flag drops mid-acquisition", () => {
+  test("deferred ticket settlement after the flag is unset routes to signed ultra", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakClockForTests(IN_WINDOW);
+    const cipher = await cipherFixture();
+    const { config } = captureProvider();
+    config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
+    const wire: WireEntry[] = [];
+    let releaseTake: (() => void) | undefined;
+    let takeStarted: (() => void) | undefined;
+    const takeStartedPromise = new Promise<void>((resolve) => { takeStarted = resolve; });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/off-peak/ticket")) {
+          takeStarted?.();
+          await new Promise<void>((resolve) => { releaseTake = resolve; });
+          return json({ ticket_id: "t-midflight", state: "ready" });
+        }
+        if (url.endsWith("/agent/configs")) return json({ code: 0, data: { codingPlanSignature: { enable: true } } });
+        if (url.endsWith("/api/paas/c1f3a7e2/v2/client")) return json({ code: 200, data: { privateCipher: cipher } });
+        wire.push({ url, headers: Object.fromEntries(new Headers(init?.headers).entries()) });
+        return sseResponse();
+      }),
+    );
+
+    const pending = config.streamSimple!(composedOffPeakModel(), wireContext, {
+      apiKey: KEY,
+      headers: { Authorization: `Bearer ${KEY}`, "X-ZCode-Agent": "glm" },
+    } as never).result();
+    await Promise.race([takeStartedPromise, new Promise((_, reject) => setTimeout(() => reject(new Error("take never started")), 2_000))]);
+    vi.unstubAllEnvs(); // flag unset while the take is in flight
+    releaseTake?.();
+    const message = await pending;
+
+    expect(message.content).toEqual([{ type: "text", text: "OK" }]);
+    const model = wire.find((entry) => entry.url.includes("/v1/messages"))!;
+    expect(model.url).toBe(ULTRA_MESSAGES);
+    expect(model.headers.authorization).toBe(`Bearer ${KEY}`);
+    expect(model.headers["x-off-peak-ticket-id"]).toBeUndefined();
+    expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
   });
 });

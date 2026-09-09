@@ -211,7 +211,7 @@ const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["stre
       .then((ticketId) => {
         const stillInWindow = isOffPeakWindow(offPeakTestClock ?? new Date());
         const fallbackModel = { ...model, baseUrl: resolveZCodeAnthropicBaseUrl() };
-        if (ticketId && credential && stillInWindow && offPeakEnabled) {
+        if (ticketId && credential && stillInWindow && process.env.ZCODE_OFFPEAK_ENABLE === "1") {
           const stripped: Record<string, string | null> = { ...(options?.headers as Record<string, string | null> ?? {}) };
           for (const header of SIGNATURE_HEADERS) delete stripped[header];
           return anthropicStreamSimple!(
@@ -348,7 +348,7 @@ export default function glmZcodeExtension(pi: ExtensionAPI): void {
     Object.assign(event.headers, await resolveZCodeSigningHeaders(event.headers));
   });
     defaultDeviceId ??= getOrCreateDeviceMid();
- 
+
 pi.registerProvider("glm-zcode", {
     name: "GLM ZCode (unofficial)",
     api: "anthropic-messages",
