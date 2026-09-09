@@ -520,3 +520,33 @@ describe("stale off-peak routing guard", () => {
     expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
   });
 });
+
+describe("off-peak flag gates cached tickets too", () => {
+  test("warm cache is bypassed when ZCODE_OFFPEAK_ENABLE is unset mid-flight", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakClockForTests(IN_WINDOW);
+    let takes = 0;
+    const wire: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/off-peak/ticket")) { takes += 1; return json({ ticket_id: "t-c", state: "ready" }); }
+        if (url.endsWith("/agent/configs")) return json({ code: 0, data: { codingPlanSignature: { enable: true } } });
+        if (url.endsWith("/api/paas/c1f3a7e2/v2/client")) return json({ code: 200, data: { privateCipher: await cipherFixture() } });
+        if (url.includes("/v1/messages")) { wire.push(url); return sseResponse(); }
+        throw new Error(`unexpected ${url}`);
+      }),
+    );
+    const { config } = captureProvider();
+    config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
+    const run = () => config.streamSimple!(composedOffPeakModel(), wireContext, { apiKey: KEY, headers: { Authorization: `Bearer ${KEY}`, "X-ZCode-Agent": "glm" } } as never).result();
+    await run(); // warms the ticket cache (off-peak)
+    expect(wire[0]).toBe(OFFPEAK_MESSAGES);
+
+    vi.unstubAllEnvs(); // flag OFF mid-flight, cache still warm
+    await run(); // must ignore the warm cache and fall back to signed ultra
+    expect(wire[1]).toBe(ULTRA_MESSAGES);
+    expect(takes).toBe(1); // no new acquisition either
+  });
+});

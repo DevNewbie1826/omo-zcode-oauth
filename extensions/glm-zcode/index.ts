@@ -193,9 +193,10 @@ const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["stre
     const credential = cachedCredential && cachedCredential.apiKey === apiKey ? cachedCredential : undefined;
     const waitFresh = (promise: Promise<string | undefined>) =>
       Promise.race([promise, new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), TICKET_REQUEST_WAIT_MS))]);
-    const acquire = isTicketFresh(preTakenTicket, now, apiKey, credential?.jwt ?? "")
+    const offPeakEnabled = process.env.ZCODE_OFFPEAK_ENABLE === "1";
+    const acquire = offPeakEnabled && isTicketFresh(preTakenTicket, now, apiKey, credential?.jwt ?? "")
       ? Promise.resolve(preTakenTicket!.ticketId)
-      : credential && process.env.ZCODE_OFFPEAK_ENABLE === "1" && isOffPeakWindow(now)
+      : offPeakEnabled && credential && isOffPeakWindow(now)
         ? waitFresh(
             (pendingTicket && pendingTicket.apiKey === apiKey && pendingTicket.jwt === credential.jwt
               ? pendingTicket.promise
@@ -210,7 +211,7 @@ const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["stre
       .then((ticketId) => {
         const stillInWindow = isOffPeakWindow(offPeakTestClock ?? new Date());
         const fallbackModel = { ...model, baseUrl: resolveZCodeAnthropicBaseUrl() };
-        if (ticketId && credential && stillInWindow) {
+        if (ticketId && credential && stillInWindow && offPeakEnabled) {
           const stripped: Record<string, string | null> = { ...(options?.headers as Record<string, string | null> ?? {}) };
           for (const header of SIGNATURE_HEADERS) delete stripped[header];
           return anthropicStreamSimple!(
@@ -288,19 +289,34 @@ function deviceMidPath(): string {
  * app install adopts the SAME id instead of forking the device identity.
  */
 function getOrCreateDeviceMid(): string | undefined {
+  const path = deviceMidPath();
+  let existing: string | undefined;
   try {
-    const state = JSON.parse(readFileSync(deviceMidPath(), "utf8")) as { deviceMid?: string };
+    const raw = readFileSync(path, "utf8");
+    const state = JSON.parse(raw) as { deviceMid?: string };
     const mid = state.deviceMid?.trim();
     if (mid && /^[\x20-\x7e]+$/.test(mid)) return mid;
-  } catch {
-    // missing or unreadable: (re)create below
+    // Malformed or mid-less but present: NEVER overwrite app-owned state.
+    existing = undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined; // unreadable: leave untouched
   }
   try {
+    mkdirSync(dirname(path), { recursive: true });
     const fresh = randomUUID();
-    mkdirSync(dirname(deviceMidPath()), { recursive: true });
-    writeFileSync(deviceMidPath(), JSON.stringify({ deviceMid: fresh }, null, 2));
+    writeFileSync(path, JSON.stringify({ deviceMid: fresh }, null, 2), { flag: "wx" }); // exclusive
     return fresh;
-  } catch {
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      // A concurrent creator won: adopt its id.
+      try {
+        const state = JSON.parse(readFileSync(path, "utf8")) as { deviceMid?: string };
+        const mid = state.deviceMid?.trim();
+        return mid && /^[\x20-\x7e]+$/.test(mid) ? mid : undefined;
+      } catch {
+        return undefined;
+      }
+    }
     return undefined;
   }
 }
@@ -332,7 +348,7 @@ export default function glmZcodeExtension(pi: ExtensionAPI): void {
     Object.assign(event.headers, await resolveZCodeSigningHeaders(event.headers));
   });
     defaultDeviceId ??= getOrCreateDeviceMid();
-  
+ 
 pi.registerProvider("glm-zcode", {
     name: "GLM ZCode (unofficial)",
     api: "anthropic-messages",
