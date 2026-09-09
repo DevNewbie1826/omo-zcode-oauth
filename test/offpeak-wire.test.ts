@@ -358,6 +358,9 @@ describe("pending ticket lifecycle (retry and reacquisition)", () => {
       "fetch",
       vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
         const url = String(input);
+        if (url === "https://api.z.ai/api/anthropic/v1/models") {
+          return json({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
+        }
         if (url.endsWith("/off-peak/ticket")) {
           takes += 1;
           return json({ ticket_id: `t-warm-${takes}`, state: "ready" });
@@ -373,13 +376,15 @@ describe("pending ticket lifecycle (retry and reacquisition)", () => {
         throw new Error(`unexpected ${url}`);
       }),
     );
-    await config.refreshModels!({
+    const refreshed = await config.refreshModels!({
       allowNetwork: true,
       signal: new AbortController().signal,
       credential: { type: "oauth", access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT },
       publish: async () => {},
       force: true,
     } as never);
+    expect(refreshed?.find((model) => model.id.includes("flash"))?.baseUrl).toBe("https://zcode.z.ai/api/v1/off-peak/anthropic");
+    expect(takes).toBe(1); // the refresh warm-up itself took the ticket
     await run(config, IN_WINDOW); // uses the warm ticket
     setOffPeakClockForTests(new Date(IN_WINDOW.getTime() + 11 * 60_000)); // TTL expiry
     await run(config, IN_WINDOW); // must re-take with a NEW ticket id
