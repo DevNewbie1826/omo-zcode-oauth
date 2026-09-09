@@ -194,18 +194,19 @@ describe("off-peak wire routing (real signer, composer-shaped models)", () => {
     const { config } = captureProvider();
     config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
     const wire: WireEntry[] = [];
-    let releaseTake: ((value: Response) => void) | undefined;
+    let releaseTake: (() => void) | undefined;
+    let takeStarted: (() => void) | undefined;
+    const takeStartedPromise = new Promise<void>((resolve) => {
+      takeStarted = resolve;
+    });
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
         const url = String(input);
         if (url.endsWith("/off-peak/ticket")) {
-          // resolve only after the test has moved the clock out of the window
+          takeStarted?.();
           await new Promise<void>((resolve) => {
-            releaseTake = (value) => {
-              resolve();
-              return value;
-            };
+            releaseTake = resolve;
           });
           return json({ ticket_id: "t-late", state: "ready" });
         }
@@ -221,9 +222,9 @@ describe("off-peak wire routing (real signer, composer-shaped models)", () => {
       headers: { Authorization: `Bearer ${KEY}`, "X-ZCode-Agent": "glm" },
     } as never);
     const pending = stream.result();
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await Promise.race([takeStartedPromise, new Promise((_, reject) => setTimeout(() => reject(new Error("take never started")), 2_000))]);
     setOffPeakClockForTests(new Date("2026-09-09T01:00:01Z")); // window closed mid-acquisition
-    releaseTake?.(new Response());
+    releaseTake?.();
     const message = await pending;
 
     expect(message.content).toEqual([{ type: "text", text: "OK" }]);
@@ -231,12 +232,60 @@ describe("off-peak wire routing (real signer, composer-shaped models)", () => {
     expect(model.url).toBe(ULTRA_MESSAGES);
     expect(model.headers.authorization).toBe(`Bearer ${KEY}`);
     expect(model.headers["x-off-peak-ticket-id"]).toBeUndefined();
+    expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
   });
 
-  test("transport failure: refreshModels never routes flash off-peak", async () => {
+  test("transport failure: refreshModels never routes flash off-peak despite a valid window", async () => {
     setOffPeakTransportForTests(false);
     setOffPeakClockForTests(IN_WINDOW);
     const { config } = captureProvider();
+    const requests: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        requests.push(url);
+        if (url === "https://api.z.ai/api/anthropic/v1/models") {
+          return json({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
+        }
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    );
+
+    const refreshed = await config.refreshModels!({
+      allowNetwork: true,
+      signal: new AbortController().signal,
+      credential: { type: "oauth", access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT },
+      publish: async () => {},
+      force: true,
+    } as never);
+
+    expect(refreshed?.map((model) => model.id).sort()).toEqual(["glm-5.3", "glm-5.3-flash"]);
+    const flash = refreshed?.find((model) => model.id.includes("flash"));
+    expect(flash?.baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
+    expect(requests).toEqual(["https://api.z.ai/api/anthropic/v1/models"]);
+  });
+
+  test("transport ready with availability and ticket: refreshModels routes flash off-peak", async () => {
+    setOffPeakClockForTests(IN_WINDOW);
+    const { config } = captureProvider();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url === "https://api.z.ai/api/anthropic/v1/models") {
+          return json({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
+        }
+        if (url === "https://zcode.z.ai/api/v1/off-peak/ticket/availability") {
+          return json({ code: 0, data: { can_take_number: true } });
+        }
+        if (url === "https://zcode.z.ai/api/v1/off-peak/ticket") {
+          return json({ ticket_id: "t-refresh", state: "ready" });
+        }
+        throw new Error(`unexpected request: ${url}`);
+      }),
+    );
+
     const refreshed = await config.refreshModels!({
       allowNetwork: true,
       signal: new AbortController().signal,
@@ -246,6 +295,8 @@ describe("off-peak wire routing (real signer, composer-shaped models)", () => {
     } as never);
 
     const flash = refreshed?.find((model) => model.id.includes("flash"));
-    expect(flash?.baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
+    const plain = refreshed?.find((model) => !model.id.includes("flash"));
+    expect(flash?.baseUrl).toBe("https://zcode.z.ai/api/v1/off-peak/anthropic");
+    expect(plain?.baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
   });
 });
