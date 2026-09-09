@@ -12,6 +12,7 @@ import {
   thinkingConfigFor,
 } from "../extensions/glm-zcode/models.js";
 import { loginGlmZcode, refreshGlmZcode } from "../extensions/glm-zcode/oauth.js";
+import { applyOffPeakRouting } from "../extensions/glm-zcode/offpeak.js";
 import { resolveZCodeSigningHeaders } from "../extensions/glm-zcode/signing.js";
 
 vi.mock("../extensions/glm-zcode/signing.js", () => ({
@@ -181,7 +182,8 @@ describe("glm-zcode extension", () => {
     const { name, config } = captureProvider();
 
     expect(name).toBe("glm-zcode");
-    expect(config.baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
+    expect(config.baseUrl).toBeUndefined();
+    expect(config.models[0].baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
     expect(config.api).toBe("anthropic-messages");
     expect(config.authHeader).toBe(true);
     expect(config.headers).toEqual(buildZCodeSourceHeaders());
@@ -250,7 +252,7 @@ describe("glm-zcode extension", () => {
   test("honors ZCODE_ANTHROPIC_BASE_URL to revert to the direct endpoint", () => {
     vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", "https://api.z.ai/api/anthropic");
     try {
-      expect(captureProvider().config.baseUrl).toBe("https://api.z.ai/api/anthropic");
+      expect(captureProvider().config.models[0].baseUrl).toBe("https://api.z.ai/api/anthropic");
     } finally {
       vi.unstubAllEnvs();
     }
@@ -734,6 +736,7 @@ describe("dynamic model catalog", () => {
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 500_000,
         maxTokens: 8_192,
+        baseUrl: "https://zcode.z.ai/api/v1/ultra-zai/anthropic",
         thinkingLevelMap: expectedThinkingLevelMap,
         compat: { supportsDisabledThinking: false, forceAdaptiveThinking: true },
       },
@@ -975,7 +978,7 @@ describe("hybrid live model catalog", () => {
     const models = await registeredRefreshModels()(hybridContext({ publish, stored }));
 
     expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
-    expect(models).toEqual(storedToConfig(stored));
+    expect(models).toEqual(applyOffPeakRouting(storedToConfig(stored), false));
     expect(publish).not.toHaveBeenCalled();
   });
 

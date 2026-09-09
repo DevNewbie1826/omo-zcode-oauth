@@ -5,6 +5,23 @@ import { CATALOG_TTL_MS, buildZCodeSourceHeaders, catalogToPersistedModels, fetc
 import { fetchLiveModels } from "./live-catalog.js";
 import { loginGlmZcode, refreshGlmZcode } from "./oauth.js";
 import { resolveZCodeSigningHeaders } from "./signing.js";
+import {
+  OFFPEAK_ROUTE_MARKER,
+  applyOffPeakRouting,
+  ensureOffPeakTicket,
+  fetchOffPeakAvailability,
+  isOffPeakWindow,
+  offPeakRequestHeaders,
+} from "./offpeak.js";
+
+/** Side-channel for hooks that never see credentials: the JWT cached at auth resolution. */
+let cachedZcodeJwtToken: string | undefined;
+let offPeakTaskId: string | undefined;
+
+function currentOffPeakTaskId(): string {
+  offPeakTaskId ??= `omo-offpeak-${crypto.randomUUID()}`;
+  return offPeakTaskId;
+}
 
 type RefreshModels = NonNullable<ProviderConfig["refreshModels"]>;
 
@@ -21,6 +38,7 @@ const MODELS = [
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 1_000_000,
     maxTokens: 131_072,
+    baseUrl: resolveZCodeAnthropicBaseUrl(),
     ...thinkingConfigFor(undefined),
   },
 ] satisfies ProviderModelConfig[];
@@ -83,6 +101,20 @@ async function refreshCatalogDev(context: RefreshModelsContext): Promise<Provide
  * honors the shared 24h TTL and only context.force bypasses it. A re-login under a
  * different account may therefore serve a stale live snapshot for up to the TTL.
  */
+/** The per-model off-peak route decision: window + entitlement + a usable JWT. */
+async function offPeakActiveFor(context: RefreshModelsContext): Promise<boolean> {
+  if (!isOffPeakWindow() || !context.allowNetwork || context.signal.aborted) return false;
+  const credentialJwt =
+    context.credential?.type === "oauth" && typeof context.credential.zcodeJwtToken === "string"
+      ? context.credential.zcodeJwtToken
+      : undefined;
+  const jwt = credentialJwt ?? cachedZcodeJwtToken;
+  if (!jwt) return false;
+  const apiKey = credentialApiKey(context.credential);
+  if (!apiKey) return false;
+  return fetchOffPeakAvailability(jwt, apiKey);
+}
+
 async function refreshModels(context: Parameters<RefreshModels>[0]): ReturnType<RefreshModels>;
 async function refreshModels(context: RefreshModelsContext): Promise<ProviderModelConfig[] | undefined> {
   const apiKey = credentialApiKey(context.credential);
@@ -90,13 +122,14 @@ async function refreshModels(context: RefreshModelsContext): Promise<ProviderMod
     try {
       const live = await fetchLiveModels(apiKey, context.signal);
       if (live.length > 0) {
+        const routed = applyOffPeakRouting(live, await offPeakActiveFor(context));
         await context.publish({
           persist: {
-            models: catalogToPersistedModels(live),
+            models: catalogToPersistedModels(routed),
             checkedAt: Date.now(),
           },
         });
-        return live;
+        return routed;
       }
     } catch (error) {
       console.debug(
@@ -106,26 +139,46 @@ async function refreshModels(context: RefreshModelsContext): Promise<ProviderMod
       );
     }
   }
-  return refreshCatalogDev(context);
+  const fromDev = await refreshCatalogDev(context);
+  return fromDev === undefined ? undefined : applyOffPeakRouting(fromDev, await offPeakActiveFor(context));
+}
+
+/** Replaces Bearer API-key auth with the off-peak JWT + ticket when the model is off-peak routed. */
+async function applyOffPeakHeaders(headers: Record<string, string | null>): Promise<boolean> {
+  if (headers["X-ZCode-Route"] !== "off-peak" || !cachedZcodeJwtToken) return false;
+  const authorization = typeof headers.Authorization === "string" ? headers.Authorization : "";
+  const apiKey = /^Bearer\s+(\S+)$/i.exec(authorization.trim())?.[1];
+  if (!apiKey) return false;
+  const ticketId = await ensureOffPeakTicket(cachedZcodeJwtToken, apiKey, currentOffPeakTaskId());
+  if (!ticketId) return false;
+  delete headers["X-ZCode-Route"];
+  Object.assign(headers, offPeakRequestHeaders(cachedZcodeJwtToken, apiKey, ticketId));
+  return true;
 }
 
 export default function glmZcodeExtension(pi: ExtensionAPI): void {
   pi.on("before_provider_headers", async (event) => {
+    if (await applyOffPeakHeaders(event.headers)) return;
     Object.assign(event.headers, await resolveZCodeSigningHeaders(event.headers));
   });
   pi.registerProvider("glm-zcode", {
     name: "GLM ZCode (unofficial)",
-    baseUrl: resolveZCodeAnthropicBaseUrl(),
     api: "anthropic-messages",
     authHeader: true,
     headers: buildZCodeSourceHeaders(),
-    models: MODELS,
+    models: MODELS.map((model) => ({ ...model, baseUrl: resolveZCodeAnthropicBaseUrl() })),
     refreshModels,
     oauth: {
       name: "GLM ZCode (unofficial)",
       login: loginGlmZcode,
       refreshToken: refreshGlmZcode,
-      getApiKey: (credentials: OAuthCredentials) => credentials.access,
+      getApiKey: (credentials: OAuthCredentials) => {
+        cachedZcodeJwtToken =
+          typeof credentials.zcodeJwtToken === "string" && credentials.zcodeJwtToken
+            ? credentials.zcodeJwtToken
+            : undefined;
+        return credentials.access;
+      },
     },
   });
 }
