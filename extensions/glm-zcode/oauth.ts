@@ -246,12 +246,15 @@ async function initCliDeviceFlow(signal: AbortSignal | undefined): Promise<CliDe
   return { flowId, pollToken, authorizeUrl, expiresAtSec, pollIntervalSec };
 }
 
-/** Returns the upstream token once present, or undefined to keep polling. */
+/** Token pair harvested from a completed login: the upstream token plus the ZCode JWT (data.token). */
+type LoginTokens = { upstreamToken: string; zcodeJwtToken?: string };
+
+/** Returns the login tokens once present, or undefined to keep polling. */
 async function pollCliDeviceFlowOnce(
   flowId: string,
   pollToken: string,
   signal: AbortSignal | undefined,
-): Promise<string | undefined> {
+): Promise<LoginTokens | undefined> {
   if (signal?.aborted) throw cancelledError("cli poll");
 
   const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
@@ -282,20 +285,31 @@ async function pollCliDeviceFlowOnce(
   if (!isRecord(payload)) return undefined;
   const record = isRecord(payload.data) ? payload.data : payload;
   const zai = isRecord(record.zai) ? record.zai : undefined;
-  if (typeof zai?.access_token === "string" && zai.access_token) return zai.access_token;
-  if (typeof record.access_token === "string" && record.access_token) return record.access_token;
-  return undefined; // login still pending
+  const upstreamToken =
+    typeof zai?.access_token === "string" && zai.access_token
+      ? zai.access_token
+      : typeof record.access_token === "string" && record.access_token
+        ? record.access_token
+        : undefined;
+  if (!upstreamToken) return undefined; // login still pending
+  const jwtToken = record.token;
+  return { upstreamToken, ...(typeof jwtToken === "string" && jwtToken ? { zcodeJwtToken: jwtToken } : {}) };
 }
 
-async function pollCliDeviceFlow(init: CliDeviceFlowInit, callbacks: OAuthLoginCallbacks): Promise<string> {
+async function pollCliDeviceFlow(init: CliDeviceFlowInit, callbacks: OAuthLoginCallbacks): Promise<LoginTokens> {
   for (;;) {
     if (Date.now() / 1000 >= init.expiresAtSec) {
       throw new Error("GLM ZCode login flow expired before completion");
     }
-    const upstreamToken = await pollCliDeviceFlowOnce(init.flowId, init.pollToken, callbacks.signal);
-    if (upstreamToken) return upstreamToken;
+    const tokens = await pollCliDeviceFlowOnce(init.flowId, init.pollToken, callbacks.signal);
+    if (tokens) return tokens;
     await sleep(init.pollIntervalSec * 1000, callbacks.signal, "cli poll");
   }
+}
+
+/** Attaches the ZCode JWT (broker `data.token`) to provisioned credentials; dropped when absent. */
+function withZcodeJwtToken(credentials: OAuthCredentials, zcodeJwtToken: string | undefined): OAuthCredentials {
+  return zcodeJwtToken ? { ...credentials, zcodeJwtToken } : credentials;
 }
 
 async function loginViaManualPaste(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
@@ -327,9 +341,13 @@ async function loginViaManualPaste(callbacks: OAuthLoginCallbacks): Promise<OAut
   if (typeof zai?.access_token !== "string" || !zai.access_token) {
     throw new Error("GLM ZCode broker response missing data.zai.access_token");
   }
+  const jwtToken = broker.token;
 
   callbacks.onProgress?.("Provisioning Z.AI API key...");
-  return provision(zai.access_token, callbacks.signal);
+  return withZcodeJwtToken(
+    await provision(zai.access_token, callbacks.signal),
+    typeof jwtToken === "string" && jwtToken ? jwtToken : undefined,
+  );
 }
 
 const DEVICE_FLOW_INSTRUCTIONS =
@@ -350,10 +368,10 @@ export async function loginGlmZcode(callbacks: OAuthLoginCallbacks): Promise<OAu
   callbacks.onAuth({ url: init.authorizeUrl, instructions: DEVICE_FLOW_INSTRUCTIONS });
   callbacks.onProgress?.("Waiting for Z.AI login to complete...");
 
-  const upstreamToken = await pollCliDeviceFlow(init, callbacks);
+  const tokens = await pollCliDeviceFlow(init, callbacks);
 
   callbacks.onProgress?.("Provisioning Z.AI API key...");
-  return provision(upstreamToken, callbacks.signal);
+  return withZcodeJwtToken(await provision(tokens.upstreamToken, callbacks.signal), tokens.zcodeJwtToken);
 }
 
 export async function refreshGlmZcode(
@@ -364,7 +382,12 @@ export async function refreshGlmZcode(
     throw new Error("GLM ZCode credentials require re-login (`/login glm-zcode`); no stored upstream Z.AI token");
   }
   try {
-    return await provision(credentials.refresh, signal);
+    return withZcodeJwtToken(
+      await provision(credentials.refresh, signal),
+      typeof credentials.zcodeJwtToken === "string" && credentials.zcodeJwtToken
+        ? credentials.zcodeJwtToken
+        : undefined,
+    );
   } catch (error) {
     throw new Error(
       `GLM ZCode credentials require re-login (\`/login glm-zcode\`); re-provisioning the Z.AI API key failed (${redactSecrets(String(error))})`,
