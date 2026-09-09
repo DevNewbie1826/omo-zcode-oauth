@@ -136,6 +136,59 @@ afterEach(() => {
 // Tests
 // ---------------------------------------------------------------------------
 
+describe("zcodeJwtToken capture (broker data.token)", () => {
+  test("device flow: poll response data.token is persisted as zcodeJwtToken", async () => {
+    const fetch = router((url, init) => {
+      if (url === CLI_INIT_URL) return json(initPayload());
+      if (url === `${CLI_POLL_URL}/${FLOW_ID}`) {
+        return json({
+          code: 0,
+          msg: "",
+          data: { token: "zcode-jwt-token", zai: { access_token: UPSTREAM_TOKEN } },
+        });
+      }
+      return provisionRoutes(url, init);
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    const credentials = await loginGlmZcode(callbacks());
+
+    expect(credentials).toMatchObject({ access: "key-id.api-secret", refresh: UPSTREAM_TOKEN });
+    expect(credentials.zcodeJwtToken).toBe("zcode-jwt-token");
+  });
+
+  test("device flow: poll response without data.token omits zcodeJwtToken", async () => {
+    const fetch = router((url, init) => {
+      if (url === CLI_INIT_URL) return json(initPayload());
+      if (url === `${CLI_POLL_URL}/${FLOW_ID}`) {
+        return json({ code: 0, msg: "", data: { zai: { access_token: UPSTREAM_TOKEN } } });
+      }
+      return provisionRoutes(url, init);
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    const credentials = await loginGlmZcode(callbacks());
+
+    expect(credentials.zcodeJwtToken).toBeUndefined();
+  });
+
+  test("manual paste: broker response data.token is persisted as zcodeJwtToken", async () => {
+    const fetch = router((url, init) => {
+      if (url === CLI_INIT_URL) return undefined;
+      if (url === BROKER_URL) {
+        return json({ data: { token: "zcode-jwt-token", zai: { access_token: UPSTREAM_TOKEN } } });
+      }
+      return provisionRoutes(url, init);
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    const credentials = await loginGlmZcode(withPaste(callbacks()));
+
+    expect(credentials).toMatchObject({ access: "key-id.api-secret", refresh: UPSTREAM_TOKEN });
+    expect(credentials.zcodeJwtToken).toBe("zcode-jwt-token");
+  });
+});
+
 describe("glm-zcode CLI device-flow login", () => {
   test("happy path: init, browser auth, poll picks up the token, provisions without any paste prompt", async () => {
     vi.useFakeTimers();
