@@ -334,6 +334,62 @@ describe("pending ticket lifecycle (retry and reacquisition)", () => {
     expect(wire).toEqual([ULTRA_MESSAGES, OFFPEAK_MESSAGES]);
   });
 
+  test("a refresh warm-up does not bypass ticket expiry (refresh-first flow)", async () => {
+    setOffPeakClockForTests(IN_WINDOW);
+    let takes = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/off-peak/ticket")) {
+          takes += 1;
+          return json({ ticket_id: `t-warm-${takes}`, state: "ready" });
+        }
+        if (url.endsWith("/off-peak/ticket/availability")) return json({ code: 0, data: { can_take_number: true } });
+        throw new Error(`unexpected ${url}`);
+      }),
+    );
+
+    const wire: string[] = [];
+    const usedTickets: string[] = [];
+    const { config } = captureProvider();
+    config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/off-peak/ticket")) {
+          takes += 1;
+          return json({ ticket_id: `t-warm-${takes}`, state: "ready" });
+        }
+        if (url.endsWith("/off-peak/ticket/availability")) return json({ code: 0, data: { can_take_number: true } });
+        if (url.endsWith("/agent/configs")) return json({ code: 0, data: { codingPlanSignature: { enable: true } } });
+        if (url.endsWith("/api/paas/c1f3a7e2/v2/client")) return json({ code: 200, data: { privateCipher: await cipherFixture() } });
+        if (url.includes("/v1/messages")) {
+          wire.push(url);
+          usedTickets.push(new Headers(init?.headers).get("x-off-peak-ticket-id") ?? "?");
+          return sseResponse();
+        }
+        throw new Error(`unexpected ${url}`);
+      }),
+    );
+    await config.refreshModels!({
+      allowNetwork: true,
+      signal: new AbortController().signal,
+      credential: { type: "oauth", access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT },
+      publish: async () => {},
+      force: true,
+    } as never);
+    await run(config, IN_WINDOW); // uses the warm ticket
+    setOffPeakClockForTests(new Date(IN_WINDOW.getTime() + 11 * 60_000)); // TTL expiry
+    await run(config, IN_WINDOW); // must re-take with a NEW ticket id
+
+    expect(takes).toBe(2); // warm take + one reacquisition after TTL
+    expect(wire).toEqual([OFFPEAK_MESSAGES, OFFPEAK_MESSAGES]);
+    expect(usedTickets[0]).not.toBe(usedTickets[1]);
+    expect(usedTickets[1]).toBe("t-warm-2");
+  });
+
   test("a fulfilled pending promise does not outlive the ticket TTL", async () => {
     setOffPeakClockForTests(IN_WINDOW);
     let takes = 0;

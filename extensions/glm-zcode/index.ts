@@ -135,14 +135,9 @@ async function offPeakActiveFor(context: RefreshModelsContext): Promise<boolean>
   if (!jwt || !apiKey) return false;
   if (!(await fetchOffPeakAvailability(jwt, apiKey))) return false;
   preTakenTicket = undefined;
-  const warm = ensureOffPeakTicket(jwt, apiKey, currentOffPeakTaskId());
-  pendingTicket = { apiKey, jwt, promise: warm };
-  warm.then((ticketId) => {
+  startPendingTicket(jwt, apiKey).then((ticketId) => {
     if (ticketId) preTakenTicket = takeTicketState(jwt, apiKey, ticketId, offPeakTestClock ?? new Date());
-    else if (pendingTicket?.promise === warm) pendingTicket = undefined;
-  }).catch(() => {
-    if (pendingTicket?.promise === warm) pendingTicket = undefined;
-  });
+  }).catch(() => {});
   // Routing only requires the entitlement; the ticket warms up in the background.
   return true;
 }
