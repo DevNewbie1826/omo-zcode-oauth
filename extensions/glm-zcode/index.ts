@@ -1,24 +1,36 @@
 import type { ExtensionAPI, ProviderConfig, ProviderModelConfig } from "@code-yeongyu/senpi";
-import type { RefreshModelsContext } from "@earendil-works/pi-ai";
+import type { RefreshModelsContext, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import type { OAuthCredentials } from "@earendil-works/pi-ai/compat";
 import { CATALOG_TTL_MS, buildZCodeSourceHeaders, catalogToPersistedModels, fetchCatalogModels, resolveZCodeAnthropicBaseUrl, storedToConfig, thinkingConfigFor } from "./models.js";
 import { fetchLiveModels } from "./live-catalog.js";
 import { loginGlmZcode, refreshGlmZcode } from "./oauth.js";
 import { resolveZCodeSigningHeaders } from "./signing.js";
+
+let anthropicStreamSimple: typeof import("@earendil-works/pi-ai/api/anthropic-messages").streamSimple | undefined;
+let createEventStream: typeof import("@earendil-works/pi-ai/utils/event-stream").createAssistantMessageEventStream | undefined;
+try {
+  ({ streamSimple: anthropicStreamSimple } = await import("@earendil-works/pi-ai/api/anthropic-messages"));
+  ({ createAssistantMessageEventStream: createEventStream } = await import("@earendil-works/pi-ai/utils/event-stream"));
+} catch {
+  anthropicStreamSimple = undefined;
+}
 import {
+  OFFPEAK_BASE_URL,
   OFFPEAK_ROUTE_MARKER,
-  installOffPeakAuth,
+  isOffPeakWindow,
+  isTicketFresh,
+  takeTicketState,
   applyOffPeakRouting,
   ensureOffPeakTicket,
   fetchOffPeakAvailability,
-  isOffPeakWindow,
   offPeakRequestHeaders,
 } from "./offpeak.js";
 
 /** Side-channel for hooks that never see credentials: the JWT cached at auth resolution, bound to its API key so concurrent credential swaps cannot mix accounts. */
 let cachedCredential: { apiKey: string; jwt: string } | undefined;
 let offPeakTaskId: string | undefined;
-let preTakenTicket: { apiKey: string; jwt: string; ticketId: string } | undefined;
+let preTakenTicket: import("./offpeak.js").OffPeakTicketState | undefined;
+let offPeakTestClock: Date | undefined;
 
 function currentOffPeakTaskId(): string {
   offPeakTaskId ??= `omo-offpeak-${crypto.randomUUID()}`;
@@ -113,7 +125,7 @@ async function offPeakActiveFor(context: RefreshModelsContext): Promise<boolean>
   if (!(await fetchOffPeakAvailability(jwt, apiKey))) return false;
   preTakenTicket = undefined;
   const ticketId = await ensureOffPeakTicket(jwt, apiKey, currentOffPeakTaskId());
-  if (ticketId) preTakenTicket = { apiKey, jwt, ticketId };
+  if (ticketId) preTakenTicket = takeTicketState(jwt, apiKey, ticketId, offPeakTestClock ?? new Date());
   return ticketId !== undefined;
 }
 
@@ -145,21 +157,81 @@ async function refreshModels(context: RefreshModelsContext): Promise<ProviderMod
   return fromDev === undefined ? undefined : applyOffPeakRouting(fromDev, await offPeakActiveFor(context));
 }
 
-/** Thin state wrapper: binds the request's API key to its cached JWT and the pre-taken ticket. */
-async function applyOffPeakHeaders(headers: Record<string, string | null>): Promise<boolean> {
-  const credential = cachedCredential;
-  return installOffPeakAuth(headers, {
-    credential: credential ? { ...credential } : undefined,
-    ensureTicket: async (jwt, apiKey) => {
-      if (preTakenTicket && preTakenTicket.apiKey === apiKey && preTakenTicket.jwt === jwt) return preTakenTicket.ticketId;
-      return ensureOffPeakTicket(jwt, apiKey, currentOffPeakTaskId());
-    },
-  });
+/**
+ * Request-time endpoint selection. The headers hook can only strip the
+ * marker (and skip signing); this streamSimple override is the one layer
+ * that controls the actual destination: a fresh ticket inside the window
+ * sends the request to the off-peak gateway with JWT auth, anything else
+ * falls back to the signed ultra gateway with the normal API key.
+ */
+const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["streamSimple"]>>[0], context: Parameters<NonNullable<ProviderConfig["streamSimple"]>>[1], options?: SimpleStreamOptions) => {
+  const outer = createEventStream!() as unknown as ReturnType<NonNullable<ProviderConfig["streamSimple"]>>;
+  if (model.headers?.["X-ZCode-Route"] === "off-peak") {
+    const now = offPeakTestClock ?? new Date();
+    const apiKey = options?.apiKey ?? "";
+    const credential = cachedCredential && cachedCredential.apiKey === apiKey ? cachedCredential : undefined;
+    const acquire = isTicketFresh(preTakenTicket, now, apiKey, credential?.jwt ?? "")
+      ? Promise.resolve(preTakenTicket!.ticketId)
+      : credential && isOffPeakWindow(now)
+        ? ensureOffPeakTicket(credential.jwt, apiKey, currentOffPeakTaskId()).then((ticketId) => {
+            if (ticketId) preTakenTicket = takeTicketState(credential.jwt, apiKey, ticketId, now);
+            return ticketId;
+          })
+        : Promise.resolve(undefined);
+    acquire
+      .then((ticketId) => {
+        const { "X-ZCode-Route": _marker, ...modelHeaders } = model.headers ?? {};
+        const fallbackModel = { ...model, baseUrl: resolveZCodeAnthropicBaseUrl(), headers: modelHeaders };
+        if (ticketId && credential) {
+          return anthropicStreamSimple!(
+            { ...fallbackModel, baseUrl: OFFPEAK_BASE_URL } as Parameters<NonNullable<typeof anthropicStreamSimple>>[0],
+            context,
+            {
+              ...options,
+              headers: {
+                ...(options?.headers ?? {}),
+                ...offPeakRequestHeaders(credential.jwt, apiKey, ticketId),
+              },
+            },
+          );
+        }
+        return resolveZCodeSigningHeaders({ Authorization: `Bearer ${apiKey}` }).then((signed) =>
+          anthropicStreamSimple!(fallbackModel as Parameters<NonNullable<typeof anthropicStreamSimple>>[0], context, {
+            ...options,
+            headers: { ...(options?.headers ?? {}), ...signed },
+          }),
+        );
+      })
+      .then((inner) => {
+        (async () => {
+          for await (const event of inner) outer.push(event);
+          outer.end(await inner.result());
+        })().catch((error) => outer.fail(error));
+      })
+      .catch((error) => outer.fail(error));
+    return outer;
+  }
+  return anthropicStreamSimple!(model as Parameters<NonNullable<typeof anthropicStreamSimple>>[0], context, options);
+}) as unknown as NonNullable<ProviderConfig["streamSimple"]>;
+
+/** Test hook: deterministic clock for window-boundary coverage. */
+export function setOffPeakClockForTests(clock: Date | undefined): void {
+  offPeakTestClock = clock;
+}
+
+/** Test hook: clear credential/ticket caches between cases. */
+export function resetOffPeakStateForTests(): void {
+  cachedCredential = undefined;
+  preTakenTicket = undefined;
+  offPeakTaskId = undefined;
 }
 
 export default function glmZcodeExtension(pi: ExtensionAPI): void {
   pi.on("before_provider_headers", async (event) => {
-    if (await applyOffPeakHeaders(event.headers)) return;
+    if (event.headers["X-ZCode-Route"] === "off-peak") {
+      delete event.headers["X-ZCode-Route"];
+      return;
+    }
     Object.assign(event.headers, await resolveZCodeSigningHeaders(event.headers));
   });
   pi.registerProvider("glm-zcode", {
@@ -168,6 +240,7 @@ export default function glmZcodeExtension(pi: ExtensionAPI): void {
     authHeader: true,
     headers: buildZCodeSourceHeaders(),
     models: MODELS.map((model) => ({ ...model, baseUrl: resolveZCodeAnthropicBaseUrl() })),
+    ...(anthropicStreamSimple && createEventStream ? { streamSimple: offPeakStreamSimple } : {}),
     refreshModels,
     oauth: {
       name: "GLM ZCode (unofficial)",
@@ -176,7 +249,9 @@ export default function glmZcodeExtension(pi: ExtensionAPI): void {
       getApiKey: (credentials: OAuthCredentials) => {
         const jwt = typeof credentials.zcodeJwtToken === "string" && credentials.zcodeJwtToken ? credentials.zcodeJwtToken : undefined;
         cachedCredential = jwt ? { apiKey: credentials.access, jwt } : undefined;
-        preTakenTicket = preTakenTicket?.apiKey === credentials.access ? preTakenTicket : undefined;
+        if (preTakenTicket && (preTakenTicket.apiKey !== credentials.access || preTakenTicket.jwt !== (jwt ?? ""))) {
+          preTakenTicket = undefined;
+        }
         return credentials.access;
       },
     },

@@ -153,6 +153,33 @@ export async function installOffPeakAuth(
   return true;
 }
 
+const TICKET_FRESH_MS = 10 * 60 * 1000;
+
+/** KST calendar day bucket: tickets never outlive their campaign window. */
+function kstWindowEpoch(now: Date): number {
+  return Math.floor((now.getTime() - 9 * 3600_000) / 86_400_000);
+}
+
+export type OffPeakTicketState = { apiKey: string; jwt: string; ticketId: string; takenAt: number; windowEpoch: number };
+
+/** A cached ticket stays reusable only inside its window and freshness window. */
+export function isTicketFresh(ticket: OffPeakTicketState | undefined, now: Date, apiKey: string, jwt: string): boolean {
+  return (
+    ticket !== undefined &&
+    ticket.apiKey === apiKey &&
+    ticket.jwt === jwt &&
+    ticket.windowEpoch === kstWindowEpoch(now) &&
+    now.getTime() - ticket.takenAt < TICKET_FRESH_MS &&
+    isOffPeakWindow(now)
+  );
+}
+
+export function takeTicketState(jwt: string, apiKey: string, ticketId: string, now: Date): OffPeakTicketState {
+  return { apiKey, jwt, ticketId, takenAt: now.getTime(), windowEpoch: kstWindowEpoch(now) };
+}
+
+export { kstWindowEpoch };
+
 /** Auth headers an off-peak inference request must carry. */
 export function offPeakRequestHeaders(jwt: string, apiKey: string, ticketId: string): Record<string, string> {
   return {
@@ -199,6 +226,7 @@ export function applyOffPeakRouting(
     }
     const headers = withoutRouteMarker(model.headers);
     const base = !model.baseUrl || model.baseUrl === OFFPEAK_BASE_URL ? fallbackBase : (override ?? model.baseUrl);
-    return headers === undefined ? { ...model, baseUrl: base } : { ...model, baseUrl: base, headers };
+    const { headers: _original, ...rest } = model;
+    return headers === undefined ? { ...rest, baseUrl: base } : { ...rest, baseUrl: base, headers };
   });
 }
