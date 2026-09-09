@@ -189,12 +189,25 @@ export function offPeakRequestHeaders(jwt: string, apiKey: string, ticketId: str
   };
 }
 
-/** Static marker placed on models routed to the off-peak gateway. */
-export const OFFPEAK_ROUTE_MARKER = { "X-ZCode-Route": "off-peak" } as const;
-
-export function isOffPeakRouted(model: { baseUrl?: string; headers?: Record<string, string> }): boolean {
-  return model.baseUrl === OFFPEAK_BASE_URL && model.headers?.["X-ZCode-Route"] === "off-peak";
+/**
+ * Routed-model detector. The provider composer clears model.headers when it
+ * projects extension models, so baseUrl — which it preserves — is the only
+ * reliable routing signal at request time.
+ */
+export function isOffPeakRouted(model: { baseUrl?: string }): boolean {
+  return model.baseUrl === OFFPEAK_BASE_URL;
 }
+
+/** Client-signature headers that must not ride along on off-peak requests. */
+export const SIGNATURE_HEADERS = [
+  "X-Client-Ts",
+  "X-Client-Version",
+  "X-Client-Sig",
+  "X-Client-Nonce",
+  "X-Client-Pow",
+  "X-App-Id",
+  "X-Client-Sign-Verified",
+] as const;
 
 /**
  * Assigns per-model base URLs: flash models go to the off-peak gateway with
@@ -222,10 +235,10 @@ export function applyOffPeakRouting(
   const fallbackBase = override ?? ultra;
   return models.map((model) => {
     if (routeOffPeak && isFlashModelId(model.id)) {
-      return { ...model, baseUrl: OFFPEAK_BASE_URL, headers: { ...model.headers, ...OFFPEAK_ROUTE_MARKER } };
+      return { ...model, baseUrl: OFFPEAK_BASE_URL };
     }
-    const headers = withoutRouteMarker(model.headers);
     const base = !model.baseUrl || model.baseUrl === OFFPEAK_BASE_URL ? fallbackBase : (override ?? model.baseUrl);
+    const headers = withoutRouteMarker(model.headers);
     const { headers: _original, ...rest } = model;
     return headers === undefined ? { ...rest, baseUrl: base } : { ...rest, baseUrl: base, headers };
   });

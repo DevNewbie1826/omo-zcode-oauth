@@ -16,7 +16,8 @@ try {
 }
 import {
   OFFPEAK_BASE_URL,
-  OFFPEAK_ROUTE_MARKER,
+  SIGNATURE_HEADERS,
+  isOffPeakRouted,
   isOffPeakWindow,
   isTicketFresh,
   takeTicketState,
@@ -115,8 +116,16 @@ async function refreshCatalogDev(context: RefreshModelsContext): Promise<Provide
  * honors the shared 24h TTL and only context.force bypasses it. A re-login under a
  * different account may therefore serve a stale live snapshot for up to the TTL.
  */
-/** The per-model off-peak route decision: window + entitlement + a usable JWT. */
+let offPeakTransportOverride: boolean | undefined;
+
+/** Transport readiness: without the wrapped streamSimple, off-peak models could never reroute on failure. */
+function offPeakTransportReady(): boolean {
+  return offPeakTransportOverride ?? (anthropicStreamSimple !== undefined && createEventStream !== undefined);
+}
+
+/** The per-model off-peak route decision: transport + window + entitlement + a usable JWT. */
 async function offPeakActiveFor(context: RefreshModelsContext): Promise<boolean> {
+  if (!offPeakTransportReady()) return false;
   if (!isOffPeakWindow() || !context.allowNetwork || context.signal.aborted) return false;
   if (context.credential?.type !== "oauth") return false;
   const jwt = typeof context.credential.zcodeJwtToken === "string" ? context.credential.zcodeJwtToken : undefined;
@@ -166,7 +175,7 @@ async function refreshModels(context: RefreshModelsContext): Promise<ProviderMod
  */
 const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["streamSimple"]>>[0], context: Parameters<NonNullable<ProviderConfig["streamSimple"]>>[1], options?: SimpleStreamOptions) => {
   const outer = createEventStream!() as unknown as ReturnType<NonNullable<ProviderConfig["streamSimple"]>>;
-  if (model.headers?.["X-ZCode-Route"] === "off-peak") {
+  if (isOffPeakRouted(model)) {
     const now = offPeakTestClock ?? new Date();
     const apiKey = options?.apiKey ?? "";
     const credential = cachedCredential && cachedCredential.apiKey === apiKey ? cachedCredential : undefined;
@@ -180,22 +189,22 @@ const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["stre
         : Promise.resolve(undefined);
     acquire
       .then((ticketId) => {
-        const { "X-ZCode-Route": _marker, ...modelHeaders } = model.headers ?? {};
-        const fallbackModel = { ...model, baseUrl: resolveZCodeAnthropicBaseUrl(), headers: modelHeaders };
-        if (ticketId && credential) {
+        const stillInWindow = isOffPeakWindow(offPeakTestClock ?? new Date());
+        const fallbackModel = { ...model, baseUrl: resolveZCodeAnthropicBaseUrl() };
+        if (ticketId && credential && stillInWindow) {
+          const stripped: Record<string, string | null> = { ...(options?.headers as Record<string, string | null> ?? {}) };
+          for (const header of SIGNATURE_HEADERS) delete stripped[header];
           return anthropicStreamSimple!(
             { ...fallbackModel, baseUrl: OFFPEAK_BASE_URL } as Parameters<NonNullable<typeof anthropicStreamSimple>>[0],
             context,
             {
               ...options,
-              headers: {
-                ...(options?.headers ?? {}),
-                ...offPeakRequestHeaders(credential.jwt, apiKey, ticketId),
-              },
+              headers: { ...stripped, ...offPeakRequestHeaders(credential.jwt, apiKey, ticketId) },
             },
           );
         }
-        return resolveZCodeSigningHeaders({ Authorization: `Bearer ${apiKey}` }).then((signed) =>
+        const signingInput: Record<string, string | null> = { ...(options?.headers as Record<string, string | null> ?? {}), Authorization: `Bearer ${apiKey}` };
+        return resolveZCodeSigningHeaders(signingInput).then((signed) =>
           anthropicStreamSimple!(fallbackModel as Parameters<NonNullable<typeof anthropicStreamSimple>>[0], context, {
             ...options,
             headers: { ...(options?.headers ?? {}), ...signed },
@@ -226,12 +235,13 @@ export function resetOffPeakStateForTests(): void {
   offPeakTaskId = undefined;
 }
 
+/** Test hook: force transport readiness off to simulate import failure. */
+export function setOffPeakTransportForTests(ready: boolean | undefined): void {
+  offPeakTransportOverride = ready;
+}
+
 export default function glmZcodeExtension(pi: ExtensionAPI): void {
   pi.on("before_provider_headers", async (event) => {
-    if (event.headers["X-ZCode-Route"] === "off-peak") {
-      delete event.headers["X-ZCode-Route"];
-      return;
-    }
     Object.assign(event.headers, await resolveZCodeSigningHeaders(event.headers));
   });
   pi.registerProvider("glm-zcode", {
@@ -240,7 +250,7 @@ export default function glmZcodeExtension(pi: ExtensionAPI): void {
     authHeader: true,
     headers: buildZCodeSourceHeaders(),
     models: MODELS.map((model) => ({ ...model, baseUrl: resolveZCodeAnthropicBaseUrl() })),
-    ...(anthropicStreamSimple && createEventStream ? { streamSimple: offPeakStreamSimple } : {}),
+    ...(offPeakTransportReady() ? { streamSimple: offPeakStreamSimple } : {}),
     refreshModels,
     oauth: {
       name: "GLM ZCode (unofficial)",

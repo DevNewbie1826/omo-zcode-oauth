@@ -3,7 +3,6 @@ import type { ProviderModelConfig } from "@code-yeongyu/senpi";
 import {
   installOffPeakAuth,
   OFFPEAK_BASE_URL,
-  OFFPEAK_ROUTE_MARKER,
   applyOffPeakRouting,
   ensureOffPeakTicket,
   fetchOffPeakAvailability,
@@ -54,9 +53,9 @@ describe("isFlashModelId / isOffPeakRouted", () => {
     expect(isFlashModelId("glm-5.3-flash")).toBe(true);
     expect(isFlashModelId("GLM-5.3-Flash")).toBe(true);
     expect(isFlashModelId("glm-5.3")).toBe(false);
-    expect(isOffPeakRouted({ baseUrl: OFFPEAK_BASE_URL, headers: { ...OFFPEAK_ROUTE_MARKER } })).toBe(true);
-    expect(isOffPeakRouted({ baseUrl: OFFPEAK_BASE_URL })).toBe(false);
-    expect(isOffPeakRouted({ headers: { ...OFFPEAK_ROUTE_MARKER } })).toBe(false);
+    expect(isOffPeakRouted({ baseUrl: OFFPEAK_BASE_URL })).toBe(true);
+    expect(isOffPeakRouted({ baseUrl: "https://zcode.z.ai/api/v1/ultra-zai/anthropic" })).toBe(false);
+    expect(isOffPeakRouted({})).toBe(false);
   });
 });
 
@@ -138,10 +137,9 @@ describe("offPeakRequestHeaders", () => {
 });
 
 describe("applyOffPeakRouting", () => {
-  test("active: flash gets the off-peak base and marker, others keep ultra; inactive: everything ultra", () => {
+  test("active: flash gets the off-peak base, others keep ultra; inactive: everything ultra", () => {
     const [routedFlash, routedPlain] = applyOffPeakRouting([flashModel(), plainModel()], true);
     expect(routedFlash.baseUrl).toBe(OFFPEAK_BASE_URL);
-    expect(routedFlash.headers).toEqual({ ...OFFPEAK_ROUTE_MARKER });
     expect(routedPlain.baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
     expect(routedPlain.headers).toBeUndefined();
 
@@ -160,11 +158,11 @@ describe("applyOffPeakRouting", () => {
     vi.unstubAllEnvs();
   });
 
-  test("existing model headers survive routing in both directions, only the marker comes and goes", () => {
+  test("existing model headers survive routing untouched in both directions", () => {
     const custom = flashModel({ headers: { "anthropic-beta": "x-1", "X-Custom": "keep" } });
     const [routed] = applyOffPeakRouting([custom], true);
-    expect(routed.headers).toEqual({ "anthropic-beta": "x-1", "X-Custom": "keep", "X-ZCode-Route": "off-peak" });
-    const [stale] = applyOffPeakRouting([flashModel({ baseUrl: OFFPEAK_BASE_URL, headers: { "X-Custom": "keep", ...OFFPEAK_ROUTE_MARKER } })], false);
+    expect(routed.headers).toEqual({ "anthropic-beta": "x-1", "X-Custom": "keep" });
+    const [stale] = applyOffPeakRouting([flashModel({ baseUrl: OFFPEAK_BASE_URL, headers: { "X-Custom": "keep", "X-ZCode-Route": "off-peak" } })], false);
     expect(stale.headers).toEqual({ "X-Custom": "keep" });
     expect(stale.baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
   });
