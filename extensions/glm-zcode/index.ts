@@ -196,9 +196,9 @@ const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["stre
         ? waitFresh(
             (pendingTicket && pendingTicket.apiKey === apiKey && pendingTicket.jwt === credential.jwt
               ? pendingTicket.promise
-              : (pendingTicket = { apiKey, jwt: credential.jwt, promise: ensureOffPeakTicket(credential.jwt, apiKey, currentOffPeakTaskId()) }).promise
+              : startPendingTicket(credential.jwt, apiKey)
             ).then((ticketId) => {
-              if (ticketId) preTakenTicket = takeTicketState(credential.jwt, apiKey, ticketId, now);
+              if (ticketId) preTakenTicket = takeTicketState(credential.jwt, apiKey, ticketId, offPeakTestClock ?? new Date());
               return ticketId;
             }),
           )
@@ -238,6 +238,17 @@ const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["stre
   }
   return anthropicStreamSimple!(model as Parameters<NonNullable<typeof anthropicStreamSimple>>[0], context, options);
 }) as unknown as NonNullable<ProviderConfig["streamSimple"]>;
+
+/** Starts a request-time acquisition; the pending entry always clears on settlement, success included. */
+function startPendingTicket(jwt: string, apiKey: string): Promise<string | undefined> {
+  const attempt = ensureOffPeakTicket(jwt, apiKey, currentOffPeakTaskId());
+  pendingTicket = { apiKey, jwt, promise: attempt };
+  const clear = () => {
+    if (pendingTicket?.promise === attempt) pendingTicket = undefined;
+  };
+  attempt.then(clear, clear);
+  return attempt;
+}
 
 /** Test hook: deterministic clock for window-boundary coverage. */
 export function setOffPeakClockForTests(clock: Date | undefined): void {

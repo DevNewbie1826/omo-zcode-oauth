@@ -300,3 +300,61 @@ describe("off-peak wire routing (real signer, composer-shaped models)", () => {
     expect(plain?.baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
   });
 });
+
+describe("pending ticket lifecycle (retry and reacquisition)", () => {
+  const routedModel = () => composedOffPeakModel();
+  const run = (config: ProviderConfig, clock: Date) =>
+    config.streamSimple!(routedModel(), wireContext, { apiKey: KEY, headers: { Authorization: `Bearer ${KEY}`, "X-ZCode-Agent": "glm" } } as never).result();
+
+  test("a failed request-time acquisition is retried on the next request", async () => {
+    setOffPeakClockForTests(IN_WINDOW);
+    let takes = 0;
+    const wire: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/off-peak/ticket")) {
+          takes += 1;
+          return takes === 1 ? json({ code: 3103, msg: "limit" }, 429) : json({ ticket_id: "t-retry", state: "ready" });
+        }
+        if (url.endsWith("/agent/configs")) return json({ code: 0, data: { codingPlanSignature: { enable: true } } });
+        if (url.endsWith("/api/paas/c1f3a7e2/v2/client")) return json({ code: 200, data: { privateCipher: await cipherFixture() } });
+        wire.push(url);
+        return sseResponse();
+      }),
+    );
+
+    const { config } = captureProvider();
+    config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
+    await run(config, IN_WINDOW);
+    await run(config, IN_WINDOW);
+
+    expect(takes).toBe(2);
+    expect(wire).toEqual([ULTRA_MESSAGES, OFFPEAK_MESSAGES]);
+  });
+
+  test("a fulfilled pending promise does not outlive the ticket TTL", async () => {
+    setOffPeakClockForTests(IN_WINDOW);
+    let takes = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/off-peak/ticket")) {
+          takes += 1;
+          return json({ ticket_id: `t-${takes}`, state: "ready" });
+        }
+        throw new Error(`unexpected ${url}`);
+      }),
+    );
+
+    const { config } = captureProvider();
+    config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
+    await run(config, IN_WINDOW); // take 1, cached fresh
+    setOffPeakClockForTests(new Date(IN_WINDOW.getTime() + 11 * 60_000)); // TTL expired, same window
+    await run(config, IN_WINDOW); // must re-take, not reuse the fulfilled promise
+
+    expect(takes).toBe(2);
+  });
+});
