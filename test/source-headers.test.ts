@@ -48,7 +48,7 @@ describe("buildZCodeSourceHeaders", () => {
     delete process.env.ZCODE_APP_VERSION;
     try {
       const headers = buildZCodeSourceHeaders();
-      expect(headers["User-Agent"]).toBe("ZCode/3.11.2");
+      expect(headers["User-Agent"]).toContain("ZCode/3.11.2 ai-sdk/provider-utils/4.0.27 runtime/node.js/");
       expect(headers["X-ZCode-App-Version"]).toBe("3.11.2");
     } finally {
       if (previous === undefined) delete process.env.ZCODE_APP_VERSION;
@@ -59,7 +59,7 @@ describe("buildZCodeSourceHeaders", () => {
   test("honors ZCODE_APP_VERSION for User-Agent and X-ZCode-App-Version", () => {
     vi.stubEnv("ZCODE_APP_VERSION", "9.9.9");
     const headers = buildZCodeSourceHeaders();
-    expect(headers["User-Agent"]).toBe("ZCode/9.9.9");
+    expect(headers["User-Agent"]).toContain("ZCode/9.9.9 ai-sdk/provider-utils/4.0.27");
     expect(headers["X-ZCode-App-Version"]).toBe("9.9.9");
   });
 

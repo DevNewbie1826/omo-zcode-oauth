@@ -4,6 +4,10 @@ import type { OAuthCredentials } from "@earendil-works/pi-ai/compat";
 import { CATALOG_TTL_MS, buildZCodeSourceHeaders, catalogToPersistedModels, fetchCatalogModels, resolveZCodeAnthropicBaseUrl, storedToConfig, thinkingConfigFor } from "./models.js";
 import { fetchLiveModels } from "./live-catalog.js";
 import { loginGlmZcode, refreshGlmZcode } from "./oauth.js";
+import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolveZCodeSigningHeaders } from "./signing.js";
 
 let anthropicStreamSimple: typeof import("@earendil-works/pi-ai/api/anthropic-messages").streamSimple | undefined;
@@ -127,6 +131,7 @@ function offPeakTransportReady(): boolean {
 
 /** The per-model off-peak route decision: transport + window + entitlement + a usable JWT. */
 async function offPeakActiveFor(context: RefreshModelsContext): Promise<boolean> {
+  if (process.env.ZCODE_OFFPEAK_ENABLE !== "1") return false;
   if (!offPeakTransportReady()) return false;
   if (!isOffPeakWindow(offPeakTestClock ?? new Date()) || !context.allowNetwork || context.signal.aborted) return false;
   if (context.credential?.type !== "oauth") return false;
@@ -136,7 +141,10 @@ async function offPeakActiveFor(context: RefreshModelsContext): Promise<boolean>
   if (!(await fetchOffPeakAvailability(jwt, apiKey))) return false;
   preTakenTicket = undefined;
   startPendingTicket(jwt, apiKey).then((ticketId) => {
-    if (ticketId) preTakenTicket = takeTicketState(jwt, apiKey, ticketId, offPeakTestClock ?? new Date());
+    // A late settlement must not resurrect state after a reset or credential swap.
+    if (ticketId && cachedCredential?.apiKey === apiKey && cachedCredential.jwt === jwt) {
+      preTakenTicket = takeTicketState(jwt, apiKey, ticketId, offPeakTestClock ?? new Date());
+    }
   }).catch(() => {});
   // Routing only requires the entitlement; the ticket warms up in the background.
   return true;
@@ -185,9 +193,10 @@ const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["stre
     const credential = cachedCredential && cachedCredential.apiKey === apiKey ? cachedCredential : undefined;
     const waitFresh = (promise: Promise<string | undefined>) =>
       Promise.race([promise, new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), TICKET_REQUEST_WAIT_MS))]);
-    const acquire = isTicketFresh(preTakenTicket, now, apiKey, credential?.jwt ?? "")
+    const offPeakEnabled = process.env.ZCODE_OFFPEAK_ENABLE === "1";
+    const acquire = offPeakEnabled && isTicketFresh(preTakenTicket, now, apiKey, credential?.jwt ?? "")
       ? Promise.resolve(preTakenTicket!.ticketId)
-      : credential && isOffPeakWindow(now)
+      : offPeakEnabled && credential && isOffPeakWindow(now)
         ? waitFresh(
             (pendingTicket && pendingTicket.apiKey === apiKey && pendingTicket.jwt === credential.jwt
               ? pendingTicket.promise
@@ -202,7 +211,7 @@ const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["stre
       .then((ticketId) => {
         const stillInWindow = isOffPeakWindow(offPeakTestClock ?? new Date());
         const fallbackModel = { ...model, baseUrl: resolveZCodeAnthropicBaseUrl() };
-        if (ticketId && credential && stillInWindow) {
+        if (ticketId && credential && stillInWindow && process.env.ZCODE_OFFPEAK_ENABLE === "1") {
           const stripped: Record<string, string | null> = { ...(options?.headers as Record<string, string | null> ?? {}) };
           for (const header of SIGNATURE_HEADERS) delete stripped[header];
           return anthropicStreamSimple!(
@@ -263,11 +272,84 @@ export function setOffPeakTransportForTests(ready: boolean | undefined): void {
   offPeakTransportOverride = ready;
 }
 
+let defaultDeviceId: string | undefined;
+
+function printableAsciiEnv(name: string): string | undefined {
+  const value = process.env[name]?.trim() ?? "";
+  return value && /^[\x20-\x7e]+$/.test(value) ? value : undefined;
+}
+
+function deviceMidPath(): string {
+  return join(homedir(), ".zcode/v2/telemetry-state.json");
+}
+
+/**
+ * Reads the app-registered device id; on app-less machines, creates one in
+ * the app's own telemetry format so the id stays stable and a later real
+ * app install adopts the SAME id instead of forking the device identity.
+ */
+function getOrCreateDeviceMid(): string | undefined {
+  const path = deviceMidPath();
+  let existing: string | undefined;
+  try {
+    const raw = readFileSync(path, "utf8");
+    const state = JSON.parse(raw) as { deviceMid?: string };
+    const mid = state.deviceMid?.trim();
+    if (mid && /^[\x20-\x7e]+$/.test(mid)) return mid;
+    // Malformed or mid-less but present: NEVER overwrite app-owned state.
+    existing = undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return undefined; // unreadable: leave untouched
+  }
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    const fresh = randomUUID();
+    writeFileSync(path, JSON.stringify({ deviceMid: fresh }, null, 2), { flag: "wx" }); // exclusive
+    return fresh;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      // A concurrent creator won: adopt its id.
+      try {
+        const state = JSON.parse(readFileSync(path, "utf8")) as { deviceMid?: string };
+        const mid = state.deviceMid?.trim();
+        return mid && /^[\x20-\x7e]+$/.test(mid) ? mid : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  }
+}
+
+/**
+ * Device-identity metadata for glm-zcode request bodies. The real app
+ * (captured 2026-09-10) sends metadata.user_id = JSON({device_id,
+ * account_uuid, session_id}); without it the identical signed ultra request
+ * is billed at par, with it the campaign zero-quota classification applies.
+ */
+function deviceIdentityMetadata(): { user_id: string } | undefined {
+  const deviceId = printableAsciiEnv("ZCODE_DEVICE_ID") ?? defaultDeviceId;
+  if (!deviceId) return undefined;
+  return { user_id: JSON.stringify({ device_id: deviceId, account_uuid: "", session_id: currentOffPeakTaskId() }) };
+}
+
 export default function glmZcodeExtension(pi: ExtensionAPI): void {
+  defaultDeviceId ??= getOrCreateDeviceMid();
+  pi.on("before_provider_request", (event) => {
+    if (event.model?.provider !== "glm-zcode" || event.payload == null || typeof event.payload !== "object") return event.payload;
+    const payload = event.payload as { metadata?: { user_id?: unknown } & Record<string, unknown> };
+    if (payload.metadata?.user_id !== undefined) return event.payload;
+    const metadata = deviceIdentityMetadata();
+    if (!metadata) return event.payload;
+    payload.metadata = { ...(payload.metadata as Record<string, unknown> | undefined), ...metadata };
+    return payload;
+  });
   pi.on("before_provider_headers", async (event) => {
     Object.assign(event.headers, await resolveZCodeSigningHeaders(event.headers));
   });
-  pi.registerProvider("glm-zcode", {
+    defaultDeviceId ??= getOrCreateDeviceMid();
+
+pi.registerProvider("glm-zcode", {
     name: "GLM ZCode (unofficial)",
     api: "anthropic-messages",
     authHeader: true,
