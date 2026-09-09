@@ -100,6 +100,26 @@ zcode://oauth/callback?code=<authorization-code>&state=<state>
 
 로그인 후 Z.AI Coding Plan의 전체 모델 목록을 사용할 수 있습니다 (`glm-zcode/glm-5.3`, `glm-zcode/glm-5.3-flash`, `glm-zcode/glm-5.2`, `glm-zcode/glm-4.7` 등). 목록은 models.dev 카탈로그(`zai-coding-plan`)에서 동적으로 가져오므로 새 모델이 나오면 자동으로 반영됩니다.
 
+## 클라이언트 서명과 무제한 캠페인 (2026-09-03 ~ 09-20)
+
+ZCode 앱이 3.11.2부터 모델 요청에 **클라이언트 서명(ClientRequestSigningV4)** 을 붙이고, 요청을 Z.AI의 **ultra 게이트웨이**로 보냅니다. GLM Coding Plan의 Usage Campaign 기간(매일 00:00–10:00 KST)에는 glm-5.3-Flash 한정으로 서명된 "ZCode 경유" 트래픽의 쿼터 소모가 0이 되고, 그 외 Agent 경유는 쿼터가 2배로 지급됩니다.
+
+이 확장은 앱의 메커니즘을 그대로 재현합니다:
+
+1. `GET zcode.z.ai/api/v1/agent/configs` 로 서명 게이트(`codingPlanSignature.enable`)를 확인합니다.
+2. `POST api.z.ai/api/paas/c1f3a7e2/v2/client` 핸드셰이크에서 API 키로 Ed25519 서명 키를 발급받습니다.
+3. 모든 모델 요청에 `X-Client-Sig`(Ed25519), `X-Client-Pow`(8-bit PoW), `X-Client-Ts/Nonce/Version`, `X-App-Id: zcode`, `X-Session-Id` 헤더를 붙여 `https://zcode.z.ai/api/v1/ultra-zai/anthropic` 로 전송합니다.
+
+게이트가 꺼져 있거나 핸드셰이크가 실패하면 앱과 동일하게 **미서명으로 전송**됩니다(요청이 막히지 않음). 상세 근거는 [`docs/research/pr8-ultra-signing-definition.md`](docs/research/pr8-ultra-signing-definition.md) 를 참고하세요.
+
+### 환경 변수
+
+| 변수 | 기본값 | 설명 |
+|---|---|---|
+| `ZCODE_ANTHROPIC_BASE_URL` | `https://zcode.z.ai/api/v1/ultra-zai/anthropic` | 직접 엔드포인트(`https://api.z.ai/api/anthropic`)로 되돌릴 때 설정 |
+| `ZCODE_APP_VERSION` | `3.11.2` | User-Agent/`X-ZCode-App-Version`/`X-Client-Version` 공통 버전 |
+| `ZCODE_RELEASE_CHANNEL` | `production` | `X-Release-Channel` 값 |
+
 ## 모델 카탈로그
 
 모델 목록은 하드코딩되어 있지 않고 다음과 같이 관리됩니다.
@@ -111,11 +131,12 @@ zcode://oauth/callback?code=<authorization-code>&state=<state>
 
 ## 동작 원리
 
-ZCode 앱의 로그인 플로우를 재현합니다. 최종적으로 Z.AI 대시보드 API 키(`{id}.{secret}`)를 발급받아 `https://api.z.ai/api/anthropic` 엔드포인트에 Bearer 인증으로 사용합니다.
+ZCode 앱의 로그인 플로우와 요청 서명을 재현합니다. 최종적으로 Z.AI 대시보드 API 키(`{id}.{secret}`)를 발급받아 서명된 요청과 함께 Z.AI ultra 게이트웨이(`https://zcode.z.ai/api/v1/ultra-zai/anthropic`)에서 사용합니다.
 
 1. **Device flow**: CLI init으로 브라우저 로그인 URL과 폴링 정보를 받고, 로그인 완료 후 authorization code를 자동으로 가져옵니다.
 2. **폴백**: device flow 엔드포인트에 연결할 수 없으면 `chat.z.ai/api/oauth/authorize`의 최종 `zcode://` URL을 사용자가 직접 붙여넣고, `zcode.z.ai/api/v1/oauth/token`에서 upstream Z.AI 토큰으로 교환합니다.
 3. **Provision**: Z.AI business 로그인 후 대시보드 API 키를 조회하거나 생성해 최종 키를 얻습니다.
+4. **서명**: 모델 요청마다 게이트 확인 → 핸드셰이크로 Ed25519 키 확보 → 서명/PoW 헤더 주입(`before_provider_headers` 훅). 실패 시 미서명 폴백.
 
 ## 기존 zai provider와의 공존
 

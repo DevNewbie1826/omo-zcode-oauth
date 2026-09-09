@@ -6,6 +6,23 @@ export const MODELS_DEV_API_URL = "https://models.dev/api.json";
 export const CATALOG_PROVIDER = "zai-coding-plan";
 export const CATALOG_TTL_MS = 24 * 60 * 60 * 1000;
 
+/**
+ * Inference base URL. ZCode 3.11.2 routes `api.z.ai/api/anthropic/v1/messages`
+ * here via the agent-configs proxy mapping; the ultra gateway is where signed
+ * (client-signature V4) traffic is recognized for plan-quota classification.
+ * `ZCODE_ANTHROPIC_BASE_URL` reverts to the direct endpoint when set.
+ */
+export const ULTRA_BASE_URL = "https://zcode.z.ai/api/v1/ultra-zai/anthropic";
+
+export function resolveZCodeAnthropicBaseUrl(): string {
+  const override = printableAscii(process.env.ZCODE_ANTHROPIC_BASE_URL || "");
+  return override || ULTRA_BASE_URL;
+}
+
+export function zcodeAppVersion(): string {
+  return printableAscii(process.env.ZCODE_APP_VERSION || "3.11.2");
+}
+
 const REQUEST_TIMEOUT_MS = 30_000;
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 
@@ -143,7 +160,7 @@ function toPersistedModel(model: ProviderModelConfig): ZCodePersistedModel {
   return {
     provider: "glm-zcode",
     api: "anthropic-messages",
-    baseUrl: "https://api.z.ai/api/anthropic",
+    baseUrl: resolveZCodeAnthropicBaseUrl(),
     id: model.id,
     name: model.name,
     reasoning: model.reasoning,
@@ -231,7 +248,7 @@ export function osCategory(platform: string): "macos" | "windows" | "linux" {
 }
 
 export function buildZCodeSourceHeaders(): Record<string, string> {
-  const version = printableAscii(process.env.ZCODE_APP_VERSION || "3.10.2");
+  const version = zcodeAppVersion();
   const channel = printableAscii(process.env.ZCODE_RELEASE_CHANNEL || "production");
   const raw: Record<string, string> = {
     "User-Agent": `ZCode/${version}`,

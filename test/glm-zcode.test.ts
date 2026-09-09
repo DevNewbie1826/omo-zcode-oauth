@@ -12,6 +12,11 @@ import {
   thinkingConfigFor,
 } from "../extensions/glm-zcode/models.js";
 import { loginGlmZcode, refreshGlmZcode } from "../extensions/glm-zcode/oauth.js";
+import { resolveZCodeSigningHeaders } from "../extensions/glm-zcode/signing.js";
+
+vi.mock("../extensions/glm-zcode/signing.js", () => ({
+  resolveZCodeSigningHeaders: vi.fn(async () => ({ "X-Client-Sig": "sig", "X-App-Id": "zcode" })),
+}));
 
 type RegisteredProvider = {
   name: string;
@@ -176,7 +181,7 @@ describe("glm-zcode extension", () => {
     const { name, config } = captureProvider();
 
     expect(name).toBe("glm-zcode");
-    expect(config.baseUrl).toBe("https://api.z.ai/api/anthropic");
+    expect(config.baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
     expect(config.api).toBe("anthropic-messages");
     expect(config.authHeader).toBe(true);
     expect(config.headers).toEqual(buildZCodeSourceHeaders());
@@ -202,6 +207,53 @@ describe("glm-zcode extension", () => {
     expect(config.oauth!.getApiKey({ access: "key-id.api-secret", refresh: "refresh", expires: 1 })).toBe(
       "key-id.api-secret",
     );
+  });
+
+  test("wires before_provider_headers to client signing", async () => {
+    const handlers = new Map<string, (event: unknown) => Promise<void> | void>();
+    const pi = new Proxy(
+      {},
+      {
+        get: (_target, property) => {
+          if (property === "registerProvider") {
+            return (name: string, config: RegisteredProvider["config"]) => {
+              expect(name).toBe("glm-zcode");
+            };
+          }
+          if (property === "on") {
+            return (event: string, handler: (eventArg: unknown) => Promise<void> | void) => {
+              handlers.set(event, handler);
+            };
+          }
+          return () => undefined;
+        },
+      },
+    );
+    glmZcodeExtension(pi as Parameters<typeof glmZcodeExtension>[0]);
+
+    const handler = handlers.get("before_provider_headers");
+    expect(handler).toBeTypeOf("function");
+    const headers: Record<string, string | null> = { Authorization: "Bearer id.secret", "X-ZCode-Agent": "glm" };
+    await handler?.({ headers });
+
+    const mocked = vi.mocked(resolveZCodeSigningHeaders);
+    expect(mocked).toHaveBeenCalledTimes(1);
+    expect(mocked.mock.calls[0]?.[0]).toBe(headers);
+    expect(headers).toEqual({
+      Authorization: "Bearer id.secret",
+      "X-ZCode-Agent": "glm",
+      "X-Client-Sig": "sig",
+      "X-App-Id": "zcode",
+    });
+  });
+
+  test("honors ZCODE_ANTHROPIC_BASE_URL to revert to the direct endpoint", () => {
+    vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", "https://api.z.ai/api/anthropic");
+    try {
+      expect(captureProvider().config.baseUrl).toBe("https://api.z.ai/api/anthropic");
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   test("completes the full OAuth flow: broker exchange, z/login, customer lookup, key create + copy", async () => {
@@ -649,7 +701,7 @@ describe("dynamic model catalog", () => {
         (model) =>
           model.provider === "glm-zcode" &&
           model.api === "anthropic-messages" &&
-          model.baseUrl === "https://api.z.ai/api/anthropic",
+          model.baseUrl === "https://zcode.z.ai/api/v1/ultra-zai/anthropic",
       ),
     ).toBe(true);
     expect(publication?.persist?.checkedAt).toEqual(expect.any(Number));
@@ -885,7 +937,7 @@ describe("hybrid live model catalog", () => {
         (model) =>
           model.provider === "glm-zcode" &&
           model.api === "anthropic-messages" &&
-          model.baseUrl === "https://api.z.ai/api/anthropic",
+          model.baseUrl === "https://zcode.z.ai/api/v1/ultra-zai/anthropic",
       ),
     ).toBe(true);
     expect(publication?.persist?.checkedAt).toEqual(expect.any(Number));

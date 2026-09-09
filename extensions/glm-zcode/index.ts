@@ -1,16 +1,10 @@
 import type { ExtensionAPI, ProviderConfig, ProviderModelConfig } from "@code-yeongyu/senpi";
 import type { RefreshModelsContext } from "@earendil-works/pi-ai";
 import type { OAuthCredentials } from "@earendil-works/pi-ai/compat";
-import {
-  CATALOG_TTL_MS,
-  buildZCodeSourceHeaders,
-  catalogToPersistedModels,
-  fetchCatalogModels,
-  storedToConfig,
-  thinkingConfigFor,
-} from "./models.js";
+import { CATALOG_TTL_MS, buildZCodeSourceHeaders, catalogToPersistedModels, fetchCatalogModels, resolveZCodeAnthropicBaseUrl, storedToConfig, thinkingConfigFor } from "./models.js";
 import { fetchLiveModels } from "./live-catalog.js";
 import { loginGlmZcode, refreshGlmZcode } from "./oauth.js";
+import { resolveZCodeSigningHeaders } from "./signing.js";
 
 type RefreshModels = NonNullable<ProviderConfig["refreshModels"]>;
 
@@ -116,9 +110,12 @@ async function refreshModels(context: RefreshModelsContext): Promise<ProviderMod
 }
 
 export default function glmZcodeExtension(pi: ExtensionAPI): void {
+  pi.on("before_provider_headers", async (event) => {
+    Object.assign(event.headers, await resolveZCodeSigningHeaders(event.headers));
+  });
   pi.registerProvider("glm-zcode", {
     name: "GLM ZCode (unofficial)",
-    baseUrl: "https://api.z.ai/api/anthropic",
+    baseUrl: resolveZCodeAnthropicBaseUrl(),
     api: "anthropic-messages",
     authHeader: true,
     headers: buildZCodeSourceHeaders(),
