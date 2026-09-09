@@ -4,9 +4,10 @@ import type { OAuthCredentials } from "@earendil-works/pi-ai/compat";
 import { CATALOG_TTL_MS, buildZCodeSourceHeaders, catalogToPersistedModels, fetchCatalogModels, resolveZCodeAnthropicBaseUrl, storedToConfig, thinkingConfigFor } from "./models.js";
 import { fetchLiveModels } from "./live-catalog.js";
 import { loginGlmZcode, refreshGlmZcode } from "./oauth.js";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolveZCodeSigningHeaders } from "./signing.js";
 
 let anthropicStreamSimple: typeof import("@earendil-works/pi-ai/api/anthropic-messages").streamSimple | undefined;
@@ -140,7 +141,10 @@ async function offPeakActiveFor(context: RefreshModelsContext): Promise<boolean>
   if (!(await fetchOffPeakAvailability(jwt, apiKey))) return false;
   preTakenTicket = undefined;
   startPendingTicket(jwt, apiKey).then((ticketId) => {
-    if (ticketId) preTakenTicket = takeTicketState(jwt, apiKey, ticketId, offPeakTestClock ?? new Date());
+    // A late settlement must not resurrect state after a reset or credential swap.
+    if (ticketId && cachedCredential?.apiKey === apiKey && cachedCredential.jwt === jwt) {
+      preTakenTicket = takeTicketState(jwt, apiKey, ticketId, offPeakTestClock ?? new Date());
+    }
   }).catch(() => {});
   // Routing only requires the entitlement; the ticket warms up in the background.
   return true;
@@ -191,7 +195,7 @@ const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["stre
       Promise.race([promise, new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), TICKET_REQUEST_WAIT_MS))]);
     const acquire = isTicketFresh(preTakenTicket, now, apiKey, credential?.jwt ?? "")
       ? Promise.resolve(preTakenTicket!.ticketId)
-      : credential && isOffPeakWindow(now)
+      : credential && process.env.ZCODE_OFFPEAK_ENABLE === "1" && isOffPeakWindow(now)
         ? waitFresh(
             (pendingTicket && pendingTicket.apiKey === apiKey && pendingTicket.jwt === credential.jwt
               ? pendingTicket.promise
@@ -274,11 +278,28 @@ function printableAsciiEnv(name: string): string | undefined {
   return value && /^[\x20-\x7e]+$/.test(value) ? value : undefined;
 }
 
-function readDeviceMid(): string | undefined {
+function deviceMidPath(): string {
+  return join(homedir(), ".zcode/v2/telemetry-state.json");
+}
+
+/**
+ * Reads the app-registered device id; on app-less machines, creates one in
+ * the app's own telemetry format so the id stays stable and a later real
+ * app install adopts the SAME id instead of forking the device identity.
+ */
+function getOrCreateDeviceMid(): string | undefined {
   try {
-    const state = JSON.parse(readFileSync(join(homedir(), ".zcode/v2/telemetry-state.json"), "utf8")) as { deviceMid?: string };
+    const state = JSON.parse(readFileSync(deviceMidPath(), "utf8")) as { deviceMid?: string };
     const mid = state.deviceMid?.trim();
-    return mid && /^[\x20-\x7e]+$/.test(mid) ? mid : undefined;
+    if (mid && /^[\x20-\x7e]+$/.test(mid)) return mid;
+  } catch {
+    // missing or unreadable: (re)create below
+  }
+  try {
+    const fresh = randomUUID();
+    mkdirSync(dirname(deviceMidPath()), { recursive: true });
+    writeFileSync(deviceMidPath(), JSON.stringify({ deviceMid: fresh }, null, 2));
+    return fresh;
   } catch {
     return undefined;
   }
@@ -297,7 +318,7 @@ function deviceIdentityMetadata(): { user_id: string } | undefined {
 }
 
 export default function glmZcodeExtension(pi: ExtensionAPI): void {
-  defaultDeviceId ??= readDeviceMid();
+  defaultDeviceId ??= getOrCreateDeviceMid();
   pi.on("before_provider_request", (event) => {
     if (event.model?.provider !== "glm-zcode" || event.payload == null || typeof event.payload !== "object") return event.payload;
     const payload = event.payload as { metadata?: { user_id?: unknown } & Record<string, unknown> };
@@ -310,16 +331,8 @@ export default function glmZcodeExtension(pi: ExtensionAPI): void {
   pi.on("before_provider_headers", async (event) => {
     Object.assign(event.headers, await resolveZCodeSigningHeaders(event.headers));
   });
-    defaultDeviceId ??= readDeviceMid();
-  pi.on("before_provider_request", (event) => {
-    if (event.model?.provider !== "glm-zcode" || event.payload == null || typeof event.payload !== "object") return event.payload;
-    const payload = event.payload as { metadata?: { user_id?: unknown } & Record<string, unknown> };
-    if (payload.metadata?.user_id !== undefined) return event.payload;
-    const metadata = deviceIdentityMetadata();
-    if (!metadata) return event.payload;
-    payload.metadata = { ...payload.metadata, ...metadata };
-    return payload;
-  });
+    defaultDeviceId ??= getOrCreateDeviceMid();
+  
 pi.registerProvider("glm-zcode", {
     name: "GLM ZCode (unofficial)",
     api: "anthropic-messages",
@@ -343,4 +356,3 @@ pi.registerProvider("glm-zcode", {
     },
   });
 }
-
