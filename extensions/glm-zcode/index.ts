@@ -29,8 +29,10 @@ import {
 
 /** Side-channel for hooks that never see credentials: the JWT cached at auth resolution, bound to its API key so concurrent credential swaps cannot mix accounts. */
 let cachedCredential: { apiKey: string; jwt: string } | undefined;
+const TICKET_REQUEST_WAIT_MS = 60_000;
 let offPeakTaskId: string | undefined;
 let preTakenTicket: import("./offpeak.js").OffPeakTicketState | undefined;
+let pendingTicket: { apiKey: string; jwt: string; promise: Promise<string | undefined> } | undefined;
 let offPeakTestClock: Date | undefined;
 
 function currentOffPeakTaskId(): string {
@@ -133,9 +135,16 @@ async function offPeakActiveFor(context: RefreshModelsContext): Promise<boolean>
   if (!jwt || !apiKey) return false;
   if (!(await fetchOffPeakAvailability(jwt, apiKey))) return false;
   preTakenTicket = undefined;
-  const ticketId = await ensureOffPeakTicket(jwt, apiKey, currentOffPeakTaskId());
-  if (ticketId) preTakenTicket = takeTicketState(jwt, apiKey, ticketId, offPeakTestClock ?? new Date());
-  return ticketId !== undefined;
+  const warm = ensureOffPeakTicket(jwt, apiKey, currentOffPeakTaskId());
+  pendingTicket = { apiKey, jwt, promise: warm };
+  warm.then((ticketId) => {
+    if (ticketId) preTakenTicket = takeTicketState(jwt, apiKey, ticketId, offPeakTestClock ?? new Date());
+    else if (pendingTicket?.promise === warm) pendingTicket = undefined;
+  }).catch(() => {
+    if (pendingTicket?.promise === warm) pendingTicket = undefined;
+  });
+  // Routing only requires the entitlement; the ticket warms up in the background.
+  return true;
 }
 
 async function refreshModels(context: Parameters<RefreshModels>[0]): ReturnType<RefreshModels>;
@@ -179,13 +188,20 @@ const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["stre
     const now = offPeakTestClock ?? new Date();
     const apiKey = options?.apiKey ?? "";
     const credential = cachedCredential && cachedCredential.apiKey === apiKey ? cachedCredential : undefined;
+    const waitFresh = (promise: Promise<string | undefined>) =>
+      Promise.race([promise, new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), TICKET_REQUEST_WAIT_MS))]);
     const acquire = isTicketFresh(preTakenTicket, now, apiKey, credential?.jwt ?? "")
       ? Promise.resolve(preTakenTicket!.ticketId)
       : credential && isOffPeakWindow(now)
-        ? ensureOffPeakTicket(credential.jwt, apiKey, currentOffPeakTaskId()).then((ticketId) => {
-            if (ticketId) preTakenTicket = takeTicketState(credential.jwt, apiKey, ticketId, now);
-            return ticketId;
-          })
+        ? waitFresh(
+            (pendingTicket && pendingTicket.apiKey === apiKey && pendingTicket.jwt === credential.jwt
+              ? pendingTicket.promise
+              : (pendingTicket = { apiKey, jwt: credential.jwt, promise: ensureOffPeakTicket(credential.jwt, apiKey, currentOffPeakTaskId()) }).promise
+            ).then((ticketId) => {
+              if (ticketId) preTakenTicket = takeTicketState(credential.jwt, apiKey, ticketId, now);
+              return ticketId;
+            }),
+          )
         : Promise.resolve(undefined);
     acquire
       .then((ticketId) => {
@@ -232,6 +248,7 @@ export function setOffPeakClockForTests(clock: Date | undefined): void {
 export function resetOffPeakStateForTests(): void {
   cachedCredential = undefined;
   preTakenTicket = undefined;
+  pendingTicket = undefined;
   offPeakTaskId = undefined;
 }
 
