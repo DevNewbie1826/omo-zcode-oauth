@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ProviderModelConfig } from "@code-yeongyu/senpi";
 import {
+  installOffPeakAuth,
   OFFPEAK_BASE_URL,
   OFFPEAK_ROUTE_MARKER,
   applyOffPeakRouting,
@@ -147,5 +148,129 @@ describe("applyOffPeakRouting", () => {
     const [plainFlash] = applyOffPeakRouting([flashModel()], false);
     expect(plainFlash.baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
     expect(plainFlash.headers).toBeUndefined();
+  });
+
+  test("an explicit ZCODE_ANTHROPIC_BASE_URL override beats off-peak routing on every model", () => {
+    vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", "https://api.z.ai/api/anthropic");
+    const [routed] = applyOffPeakRouting([flashModel()], true);
+    expect(routed.baseUrl).toBe("https://api.z.ai/api/anthropic");
+    expect(routed.headers).toBeUndefined();
+    const [rebased] = applyOffPeakRouting([flashModel({ baseUrl: OFFPEAK_BASE_URL })], false);
+    expect(rebased.baseUrl).toBe("https://api.z.ai/api/anthropic");
+    vi.unstubAllEnvs();
+  });
+
+  test("existing model headers survive routing in both directions, only the marker comes and goes", () => {
+    const custom = flashModel({ headers: { "anthropic-beta": "x-1", "X-Custom": "keep" } });
+    const [routed] = applyOffPeakRouting([custom], true);
+    expect(routed.headers).toEqual({ "anthropic-beta": "x-1", "X-Custom": "keep", "X-ZCode-Route": "off-peak" });
+    const [stale] = applyOffPeakRouting([flashModel({ baseUrl: OFFPEAK_BASE_URL, headers: { "X-Custom": "keep", ...OFFPEAK_ROUTE_MARKER } })], false);
+    expect(stale.headers).toEqual({ "X-Custom": "keep" });
+    expect(stale.baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
+  });
+});
+
+describe("ensureOffPeakTicket final-poll semantics", () => {
+  test("a ticket that becomes ready on the last permitted poll is still returned", async () => {
+    vi.useFakeTimers();
+    try {
+      let statusCalls = 0;
+      const fetch = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/ticket")) return json({ ticket_id: "t-late", state: "queued" });
+        if (url.endsWith("/ticket/status")) {
+          statusCalls += 1;
+          return json({ tickets: [{ ticket_id: "t-late", state: statusCalls >= 4 ? "ready" : "queued" }] });
+        }
+        throw new Error(`unexpected ${url}`);
+      });
+      vi.stubGlobal("fetch", fetch);
+      const pending = ensureOffPeakTicket("jwt", "key", "task-late");
+      const advance = (async () => { for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(600); })();
+      const [ticket] = await Promise.all([pending, advance]);
+      expect(ticket).toBe("t-late");
+      expect(statusCalls).toBe(4);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("a ticket still queued after the final poll gives up", async () => {
+    vi.useFakeTimers();
+    try {
+      const fetch = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/ticket")) return json({ ticket_id: "t-stuck", state: "queued" });
+        if (url.endsWith("/ticket/status")) return json({ tickets: [{ ticket_id: "t-stuck", state: "queued" }] });
+        throw new Error(`unexpected ${url}`);
+      });
+      vi.stubGlobal("fetch", fetch);
+      const pending = ensureOffPeakTicket("jwt", "key", "task-stuck");
+      const advance = (async () => { for (let i = 0; i < 6; i++) await vi.advanceTimersByTimeAsync(600); })();
+      const [ticket] = await Promise.all([pending, advance]);
+      expect(ticket).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("installOffPeakAuth", () => {
+  const inWin = new Date("2026-09-09T18:00:00Z"); // 03:00 KST
+  const outWin = new Date("2026-09-09T08:00:00Z"); // 17:00 KST
+  const markerHeaders = () => ({ Authorization: "Bearer key-id.secret", "X-ZCode-Route": "off-peak" });
+
+  test("matching credential in-window installs JWT + ticket auth and drops the marker", async () => {
+    const headers = markerHeaders();
+    const ok = await installOffPeakAuth(headers, {
+      now: inWin,
+      credential: { apiKey: "key-id.secret", jwt: "jwt-tok" },
+      ensureTicket: async (jwt, apiKey) => (jwt === "jwt-tok" && apiKey === "key-id.secret" ? "t-7" : undefined),
+    });
+    expect(ok).toBe(true);
+    expect(headers).toEqual({
+      Authorization: "Bearer jwt-tok",
+      "X-Coding-Plan-Api-Key": "key-id.secret",
+      "X-Off-Peak-Ticket-ID": "t-7",
+    });
+  });
+
+  test("outside the window the marker is dropped but API-key auth stays untouched (fail-open)", async () => {
+    const headers = markerHeaders();
+    const ok = await installOffPeakAuth(headers, {
+      now: outWin,
+      credential: { apiKey: "key-id.secret", jwt: "jwt-tok" },
+      ensureTicket: async () => "t-7",
+    });
+    expect(ok).toBe(false);
+    expect(headers).toEqual({ Authorization: "Bearer key-id.secret" });
+  });
+
+  test("a credential pair bound to a different API key never installs, and ticket failure fails open", async () => {
+    const stale = markerHeaders();
+    expect(
+      await installOffPeakAuth(stale, {
+        now: inWin,
+        credential: { apiKey: "other-account-key", jwt: "jwt-other" },
+        ensureTicket: async () => "t-7",
+      }),
+    ).toBe(false);
+    expect(stale).toEqual({ Authorization: "Bearer key-id.secret" });
+
+    const noTicket = markerHeaders();
+    expect(
+      await installOffPeakAuth(noTicket, {
+        now: inWin,
+        credential: { apiKey: "key-id.secret", jwt: "jwt-tok" },
+        ensureTicket: async () => undefined,
+      }),
+    ).toBe(false);
+    expect(noTicket).toEqual({ Authorization: "Bearer key-id.secret" });
+  });
+
+  test("requests without the marker are left completely alone", async () => {
+    const headers = { Authorization: "Bearer key-id.secret", "User-Agent": "ZCode/3.11.2" };
+    expect(await installOffPeakAuth(headers, { ensureTicket: async () => "t" })).toBe(false);
+    expect(headers).toEqual({ Authorization: "Bearer key-id.secret", "User-Agent": "ZCode/3.11.2" });
   });
 });

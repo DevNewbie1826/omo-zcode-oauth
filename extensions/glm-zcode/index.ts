@@ -7,6 +7,7 @@ import { loginGlmZcode, refreshGlmZcode } from "./oauth.js";
 import { resolveZCodeSigningHeaders } from "./signing.js";
 import {
   OFFPEAK_ROUTE_MARKER,
+  installOffPeakAuth,
   applyOffPeakRouting,
   ensureOffPeakTicket,
   fetchOffPeakAvailability,
@@ -14,9 +15,10 @@ import {
   offPeakRequestHeaders,
 } from "./offpeak.js";
 
-/** Side-channel for hooks that never see credentials: the JWT cached at auth resolution. */
-let cachedZcodeJwtToken: string | undefined;
+/** Side-channel for hooks that never see credentials: the JWT cached at auth resolution, bound to its API key so concurrent credential swaps cannot mix accounts. */
+let cachedCredential: { apiKey: string; jwt: string } | undefined;
 let offPeakTaskId: string | undefined;
+let preTakenTicket: { apiKey: string; jwt: string; ticketId: string } | undefined;
 
 function currentOffPeakTaskId(): string {
   offPeakTaskId ??= `omo-offpeak-${crypto.randomUUID()}`;
@@ -104,15 +106,15 @@ async function refreshCatalogDev(context: RefreshModelsContext): Promise<Provide
 /** The per-model off-peak route decision: window + entitlement + a usable JWT. */
 async function offPeakActiveFor(context: RefreshModelsContext): Promise<boolean> {
   if (!isOffPeakWindow() || !context.allowNetwork || context.signal.aborted) return false;
-  const credentialJwt =
-    context.credential?.type === "oauth" && typeof context.credential.zcodeJwtToken === "string"
-      ? context.credential.zcodeJwtToken
-      : undefined;
-  const jwt = credentialJwt ?? cachedZcodeJwtToken;
-  if (!jwt) return false;
+  if (context.credential?.type !== "oauth") return false;
+  const jwt = typeof context.credential.zcodeJwtToken === "string" ? context.credential.zcodeJwtToken : undefined;
   const apiKey = credentialApiKey(context.credential);
-  if (!apiKey) return false;
-  return fetchOffPeakAvailability(jwt, apiKey);
+  if (!jwt || !apiKey) return false;
+  if (!(await fetchOffPeakAvailability(jwt, apiKey))) return false;
+  preTakenTicket = undefined;
+  const ticketId = await ensureOffPeakTicket(jwt, apiKey, currentOffPeakTaskId());
+  if (ticketId) preTakenTicket = { apiKey, jwt, ticketId };
+  return ticketId !== undefined;
 }
 
 async function refreshModels(context: Parameters<RefreshModels>[0]): ReturnType<RefreshModels>;
@@ -143,17 +145,16 @@ async function refreshModels(context: RefreshModelsContext): Promise<ProviderMod
   return fromDev === undefined ? undefined : applyOffPeakRouting(fromDev, await offPeakActiveFor(context));
 }
 
-/** Replaces Bearer API-key auth with the off-peak JWT + ticket when the model is off-peak routed. */
+/** Thin state wrapper: binds the request's API key to its cached JWT and the pre-taken ticket. */
 async function applyOffPeakHeaders(headers: Record<string, string | null>): Promise<boolean> {
-  if (headers["X-ZCode-Route"] !== "off-peak" || !cachedZcodeJwtToken) return false;
-  const authorization = typeof headers.Authorization === "string" ? headers.Authorization : "";
-  const apiKey = /^Bearer\s+(\S+)$/i.exec(authorization.trim())?.[1];
-  if (!apiKey) return false;
-  const ticketId = await ensureOffPeakTicket(cachedZcodeJwtToken, apiKey, currentOffPeakTaskId());
-  if (!ticketId) return false;
-  delete headers["X-ZCode-Route"];
-  Object.assign(headers, offPeakRequestHeaders(cachedZcodeJwtToken, apiKey, ticketId));
-  return true;
+  const credential = cachedCredential;
+  return installOffPeakAuth(headers, {
+    credential: credential ? { ...credential } : undefined,
+    ensureTicket: async (jwt, apiKey) => {
+      if (preTakenTicket && preTakenTicket.apiKey === apiKey && preTakenTicket.jwt === jwt) return preTakenTicket.ticketId;
+      return ensureOffPeakTicket(jwt, apiKey, currentOffPeakTaskId());
+    },
+  });
 }
 
 export default function glmZcodeExtension(pi: ExtensionAPI): void {
@@ -173,10 +174,9 @@ export default function glmZcodeExtension(pi: ExtensionAPI): void {
       login: loginGlmZcode,
       refreshToken: refreshGlmZcode,
       getApiKey: (credentials: OAuthCredentials) => {
-        cachedZcodeJwtToken =
-          typeof credentials.zcodeJwtToken === "string" && credentials.zcodeJwtToken
-            ? credentials.zcodeJwtToken
-            : undefined;
+        const jwt = typeof credentials.zcodeJwtToken === "string" && credentials.zcodeJwtToken ? credentials.zcodeJwtToken : undefined;
+        cachedCredential = jwt ? { apiKey: credentials.access, jwt } : undefined;
+        preTakenTicket = preTakenTicket?.apiKey === credentials.access ? preTakenTicket : undefined;
         return credentials.access;
       },
     },

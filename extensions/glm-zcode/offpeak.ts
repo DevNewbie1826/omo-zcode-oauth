@@ -101,10 +101,11 @@ export async function ensureOffPeakTicket(
   const ticketId = ticket?.ticket_id;
   if (typeof ticketId !== "string" || !ticketId) return undefined;
 
-  for (let poll = 0; poll < STATUS_POLLS; poll += 1) {
-    const state = ticket?.state;
+  let state = ticket?.state;
+  for (let poll = 0; poll <= STATUS_POLLS; poll += 1) {
     if (state === "ready" || state === "active") return ticketId;
     if (state !== "queued") return undefined;
+    if (poll === STATUS_POLLS) return undefined;
     await sleep(STATUS_POLL_INTERVAL_MS);
     const status = await ticketFetch(`${TICKET_BASE_URL}/status`, {
       method: "POST",
@@ -121,9 +122,35 @@ export async function ensureOffPeakTicket(
     const tickets = Array.isArray(body?.tickets) ? body.tickets : [];
     const entry = tickets.find((item): item is Record<string, unknown> => isRecord(item) && item.ticket_id === ticketId);
     if (!isRecord(entry)) return undefined;
-    ticket.state = entry.state ?? "queued";
+    state = entry.state ?? "queued";
   }
   return undefined;
+}
+
+/**
+ * Installs off-peak JWT+ticket auth on a routed request's headers. The URL is
+ * fixed per-model, so fail-open means NOT installing off-peak auth: the
+ * request proceeds with its normal signed API-key authorization (a visible
+ * failure beats silent mis-billing).
+ */
+export async function installOffPeakAuth(
+  headers: Record<string, string | null>,
+  deps: {
+    now?: Date;
+    credential?: { apiKey: string; jwt: string };
+    ensureTicket: (jwt: string, apiKey: string) => Promise<string | undefined>;
+  },
+): Promise<boolean> {
+  if (headers["X-ZCode-Route"] !== "off-peak") return false;
+  delete headers["X-ZCode-Route"];
+  if (!isOffPeakWindow(deps.now ?? new Date())) return false;
+  const authorization = typeof headers.Authorization === "string" ? headers.Authorization : "";
+  const apiKey = /^Bearer\s+(\S+)$/i.exec(authorization.trim())?.[1];
+  if (!apiKey || !deps.credential || deps.credential.apiKey !== apiKey) return false;
+  const ticketId = await deps.ensureTicket(deps.credential.jwt, apiKey);
+  if (!ticketId) return false;
+  Object.assign(headers, offPeakRequestHeaders(deps.credential.jwt, apiKey, ticketId));
+  return true;
 }
 
 /** Auth headers an off-peak inference request must carry. */
@@ -146,16 +173,32 @@ export function isOffPeakRouted(model: { baseUrl?: string; headers?: Record<stri
  * Assigns per-model base URLs: flash models go to the off-peak gateway with
  * the route marker when active; everything else stays on the ultra gateway.
  */
+/** An explicit ZCODE_ANTHROPIC_BASE_URL override always wins over off-peak routing. */
+function explicitEndpointOverride(): string | undefined {
+  const override = process.env.ZCODE_ANTHROPIC_BASE_URL?.trim();
+  return override ? override : undefined;
+}
+
+function withoutRouteMarker(headers: Record<string, string> | undefined): Record<string, string> | undefined {
+  if (!headers || headers["X-ZCode-Route"] === undefined) return headers;
+  const { "X-ZCode-Route": _marker, ...rest } = headers;
+  return Object.keys(rest).length > 0 ? rest : undefined;
+}
+
 export function applyOffPeakRouting(
   models: readonly ProviderModelConfig[],
   offPeakActive: boolean,
 ): ProviderModelConfig[] {
   const ultra = resolveZCodeAnthropicBaseUrl();
+  const override = explicitEndpointOverride();
+  const routeOffPeak = offPeakActive && override === undefined;
+  const fallbackBase = override ?? ultra;
   return models.map((model) => {
-    if (offPeakActive && isFlashModelId(model.id)) {
-      return { ...model, baseUrl: OFFPEAK_BASE_URL, headers: { ...OFFPEAK_ROUTE_MARKER } };
+    if (routeOffPeak && isFlashModelId(model.id)) {
+      return { ...model, baseUrl: OFFPEAK_BASE_URL, headers: { ...model.headers, ...OFFPEAK_ROUTE_MARKER } };
     }
-    const { headers: _dropped, ...rest } = model;
-    return { ...rest, baseUrl: model.baseUrl && model.baseUrl === OFFPEAK_BASE_URL ? ultra : (model.baseUrl ?? ultra) };
+    const headers = withoutRouteMarker(model.headers);
+    const base = !model.baseUrl || model.baseUrl === OFFPEAK_BASE_URL ? fallbackBase : (override ?? model.baseUrl);
+    return headers === undefined ? { ...model, baseUrl: base } : { ...model, baseUrl: base, headers };
   });
 }
