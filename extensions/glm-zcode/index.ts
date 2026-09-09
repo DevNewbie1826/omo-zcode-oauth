@@ -126,7 +126,7 @@ function offPeakTransportReady(): boolean {
 /** The per-model off-peak route decision: transport + window + entitlement + a usable JWT. */
 async function offPeakActiveFor(context: RefreshModelsContext): Promise<boolean> {
   if (!offPeakTransportReady()) return false;
-  if (!isOffPeakWindow() || !context.allowNetwork || context.signal.aborted) return false;
+  if (!isOffPeakWindow(offPeakTestClock ?? new Date()) || !context.allowNetwork || context.signal.aborted) return false;
   if (context.credential?.type !== "oauth") return false;
   const jwt = typeof context.credential.zcodeJwtToken === "string" ? context.credential.zcodeJwtToken : undefined;
   const apiKey = credentialApiKey(context.credential);
