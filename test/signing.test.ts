@@ -236,14 +236,22 @@ describe("resolveZCodeSigningHeaders", () => {
     const fetch = stubGateAndHandshake({ code: 0, msg: "", data: { codingPlanSignature: { enable: true } } }, cipher);
     vi.stubGlobal("fetch", fetch);
 
-    const first = await resolveZCodeSigningHeaders(glmHeaders(apiKey));
-    const second = await resolveZCodeSigningHeaders(glmHeaders(apiKey));
+    const clock = { now: 1_000_000_000_000 };
+    const realNow = Date.now;
+    Date.now = () => clock.now;
+    try {
+      const first = await resolveZCodeSigningHeaders(glmHeaders(apiKey));
+      clock.now += 2_000;
+      const second = await resolveZCodeSigningHeaders(glmHeaders(apiKey));
 
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(second["X-Session-Id"]).toBe(first["X-Session-Id"]);
-    expect(second["X-Client-Ts"]).not.toBe(first["X-Client-Ts"]);
-    expect(second["X-Client-Nonce"]).not.toBe(first["X-Client-Nonce"]);
-    expect(second["X-Client-Sig"]).not.toBe(first["X-Client-Sig"]);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(second["X-Session-Id"]).toBe(first["X-Session-Id"]);
+      expect(Number(second["X-Client-Ts"])).toBe(clock.now);
+      expect(second["X-Client-Nonce"]).not.toBe(first["X-Client-Nonce"]);
+      expect(second["X-Client-Sig"]).not.toBe(first["X-Client-Sig"]);
+    } finally {
+      Date.now = realNow;
+    }
   });
 
   test("Given a disabled gate, when resolved, then no signing headers are added and no handshake happens", async () => {

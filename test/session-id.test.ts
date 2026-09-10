@@ -1,9 +1,12 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ProviderConfig } from "@code-yeongyu/senpi";
 import glmZcodeExtension from "../extensions/glm-zcode/index.js";
+import { zcodeSessionId } from "../extensions/glm-zcode/signing.js";
+import { resetZCodeSigningState } from "../extensions/glm-zcode/signing.js";
 
 afterEach(() => {
   vi.unstubAllEnvs();
+  resetZCodeSigningState();
 });
 
 describe("session id unification", () => {
@@ -32,5 +35,13 @@ describe("session id unification", () => {
     const meta = JSON.parse((payload.metadata as { user_id: string }).user_id) as { session_id: string };
     expect(meta.session_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
     expect(meta.session_id.includes("omo-offpeak")).toBe(false);
+
+    expect(meta.session_id).toBe(zcodeSessionId());
+
+    const second: Record<string, unknown> = { model: "glm-5.3-flash", messages: [] };
+    hook({ payload: second, model: { provider: "glm-zcode" } });
+    const secondMeta = JSON.parse((second.metadata as { user_id: string }).user_id) as { session_id: string };
+    expect(secondMeta.session_id).toBe(meta.session_id);
+    expect(zcodeSessionId()).toBe(meta.session_id);
   });
 });
