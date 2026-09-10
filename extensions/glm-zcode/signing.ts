@@ -80,6 +80,11 @@ function currentSessionId(): string {
   return sessionId;
 }
 
+/** The same session id the app carries in both x-session-id and metadata.user_id. */
+export function zcodeSessionId(): string {
+  return currentSessionId();
+}
+
 /** Splits a provisioned Z.AI key into its id/secret halves; anything else is unusable. */
 export function parseZCodeApiKey(key: string): ZCodeApiKeyCredential | undefined {
   const separator = key.indexOf(".");

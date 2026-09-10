@@ -8,7 +8,7 @@ import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { resolveZCodeSigningHeaders } from "./signing.js";
+import { resolveZCodeSigningHeaders, zcodeSessionId } from "./signing.js";
 
 let anthropicStreamSimple: typeof import("@earendil-works/pi-ai/api/anthropic-messages").streamSimple | undefined;
 let createEventStream: typeof import("@earendil-works/pi-ai/utils/event-stream").createAssistantMessageEventStream | undefined;
@@ -330,7 +330,7 @@ function getOrCreateDeviceMid(): string | undefined {
 function deviceIdentityMetadata(): { user_id: string } | undefined {
   const deviceId = printableAsciiEnv("ZCODE_DEVICE_ID") ?? defaultDeviceId;
   if (!deviceId) return undefined;
-  return { user_id: JSON.stringify({ device_id: deviceId, account_uuid: "", session_id: currentOffPeakTaskId() }) };
+  return { user_id: JSON.stringify({ device_id: deviceId, account_uuid: "", session_id: zcodeSessionId() }) };
 }
 
 export default function glmZcodeExtension(pi: ExtensionAPI): void {
