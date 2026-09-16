@@ -100,6 +100,23 @@ function composedOffPeakModel() {
   } as unknown as Parameters<NonNullable<ProviderConfig["streamSimple"]>>[0];
 }
 
+/** Composer-shaped glm-zcode model with a fake host and no off-peak routing marker. */
+function composedPassthroughModel() {
+  return {
+    provider: "glm-zcode",
+    api: "anthropic-messages",
+    baseUrl: "https://fake-glm-host.example/anthropic",
+    headers: undefined,
+    id: "glm-5.3-flash",
+    name: "GLM-5.3-Flash",
+    reasoning: true,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 1_000_000,
+    maxTokens: 131_072,
+  } as unknown as Parameters<NonNullable<ProviderConfig["streamSimple"]>>[0];
+}
+
 const wireContext = {
   tools: [],
   messages: [{ role: "user" as const, content: [{ type: "text" as const, text: "Say OK" }], timestamp: Date.now() }],
@@ -597,5 +614,35 @@ describe("flag drops mid-acquisition", () => {
     expect(model.headers.authorization).toBe(`Bearer ${KEY}`);
     expect(model.headers["x-off-peak-ticket-id"]).toBeUndefined();
     expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
+  });
+});
+
+describe("non-routed passthrough wire", () => {
+  test("plain glm-zcode model hits only the model baseUrl /v1/messages", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
+    const { config } = captureProvider();
+    const FAKE_MESSAGES = "https://fake-glm-host.example/anthropic/v1/messages";
+    const wire: (WireEntry & { body: string })[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        const raw = init?.body;
+        wire.push({ url, headers: Object.fromEntries(new Headers(init?.headers).entries()), body: typeof raw === "string" ? raw : raw == null ? "" : String(raw) });
+        return sseResponse();
+      }),
+    );
+
+    const stream = config.streamSimple!(composedPassthroughModel(), wireContext, {
+      apiKey: KEY,
+      headers: { Authorization: `Bearer ${KEY}`, "X-ZCode-Agent": "glm" },
+    } as never);
+    const message = await stream.result();
+
+    expect(message.content).toEqual([{ type: "text", text: "OK" }]);
+    expect(wire).toHaveLength(1);
+    expect(wire[0].url).toBe(FAKE_MESSAGES);
+    expect(JSON.parse(wire[0].body).model).toBe("glm-5.3-flash");
+    expect(wire.some((entry) => /\/off-peak\/ticket|\/agent\/configs|\/api\/paas\//.test(entry.url))).toBe(false);
   });
 });
