@@ -1,6 +1,10 @@
 import type { ExtensionAPI, ProviderConfig, ProviderModelConfig } from "@code-yeongyu/senpi";
 import type { RefreshModelsContext, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import type { OAuthCredentials } from "@earendil-works/pi-ai/compat";
+import {
+  streamSimple as anthropicStreamSimple,
+  createAssistantMessageEventStream as createEventStream,
+} from "@earendil-works/pi-ai/compat";
 import { CATALOG_TTL_MS, buildZCodeSourceHeaders, catalogToPersistedModels, fetchCatalogModels, resolveZCodeAnthropicBaseUrl, storedToConfig, thinkingConfigFor } from "./models.js";
 import { fetchLiveModels } from "./live-catalog.js";
 import { loginGlmZcode, refreshGlmZcode } from "./oauth.js";
@@ -10,14 +14,6 @@ import { dirname, join } from "node:path";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { resolveZCodeSigningHeaders, zcodeSessionId } from "./signing.js";
 
-let anthropicStreamSimple: typeof import("@earendil-works/pi-ai/api/anthropic-messages").streamSimple | undefined;
-let createEventStream: typeof import("@earendil-works/pi-ai/utils/event-stream").createAssistantMessageEventStream | undefined;
-try {
-  ({ streamSimple: anthropicStreamSimple } = await import("@earendil-works/pi-ai/api/anthropic-messages"));
-  ({ createAssistantMessageEventStream: createEventStream } = await import("@earendil-works/pi-ai/utils/event-stream"));
-} catch {
-  anthropicStreamSimple = undefined;
-}
 import {
   OFFPEAK_BASE_URL,
   SIGNATURE_HEADERS,
@@ -124,9 +120,9 @@ async function refreshCatalogDev(context: RefreshModelsContext): Promise<Provide
  */
 let offPeakTransportOverride: boolean | undefined;
 
-/** Transport readiness: without the wrapped streamSimple, off-peak models could never reroute on failure. */
+/** Transport helpers are statically imported (always available); the override remains a test hook simulating unavailability. */
 function offPeakTransportReady(): boolean {
-  return offPeakTransportOverride ?? (anthropicStreamSimple !== undefined && createEventStream !== undefined);
+  return offPeakTransportOverride ?? true;
 }
 
 /** The per-model off-peak route decision: transport + window + entitlement + a usable JWT. */
@@ -186,7 +182,7 @@ async function refreshModels(context: RefreshModelsContext): Promise<ProviderMod
  * falls back to the signed ultra gateway with the normal API key.
  */
 const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["streamSimple"]>>[0], context: Parameters<NonNullable<ProviderConfig["streamSimple"]>>[1], options?: SimpleStreamOptions) => {
-  const outer = createEventStream!() as unknown as ReturnType<NonNullable<ProviderConfig["streamSimple"]>>;
+  const outer = createEventStream() as unknown as ReturnType<NonNullable<ProviderConfig["streamSimple"]>>;
   if (isOffPeakRouted(model)) {
     const now = offPeakTestClock ?? new Date();
     const apiKey = options?.apiKey ?? "";
@@ -214,7 +210,7 @@ const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["stre
         if (ticketId && credential && stillInWindow && process.env.ZCODE_OFFPEAK_ENABLE === "1") {
           const stripped: Record<string, string | null> = { ...(options?.headers as Record<string, string | null> ?? {}) };
           for (const header of SIGNATURE_HEADERS) delete stripped[header];
-          return anthropicStreamSimple!(
+          return anthropicStreamSimple(
             { ...fallbackModel, baseUrl: OFFPEAK_BASE_URL } as Parameters<NonNullable<typeof anthropicStreamSimple>>[0],
             context,
             {
@@ -225,7 +221,7 @@ const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["stre
         }
         const signingInput: Record<string, string | null> = { ...(options?.headers as Record<string, string | null> ?? {}), Authorization: `Bearer ${apiKey}` };
         return resolveZCodeSigningHeaders(signingInput).then((signed) =>
-          anthropicStreamSimple!(fallbackModel as Parameters<NonNullable<typeof anthropicStreamSimple>>[0], context, {
+          anthropicStreamSimple(fallbackModel as Parameters<NonNullable<typeof anthropicStreamSimple>>[0], context, {
             ...options,
             headers: { ...(options?.headers ?? {}), ...signed },
           }),
@@ -240,7 +236,7 @@ const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["stre
       .catch((error) => outer.fail(error));
     return outer;
   }
-  return anthropicStreamSimple!(model as Parameters<NonNullable<typeof anthropicStreamSimple>>[0], context, options);
+  return anthropicStreamSimple(model as Parameters<NonNullable<typeof anthropicStreamSimple>>[0], context, options);
 }) as unknown as NonNullable<ProviderConfig["streamSimple"]>;
 
 /** Starts a request-time acquisition; the pending entry always clears on settlement, success included. */
