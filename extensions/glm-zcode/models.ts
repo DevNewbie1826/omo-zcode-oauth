@@ -20,7 +20,7 @@ export function resolveZCodeAnthropicBaseUrl(): string {
 }
 
 export function zcodeAppVersion(): string {
-  return printableAscii(process.env.ZCODE_APP_VERSION || "3.11.2");
+  return printableAscii(process.env.ZCODE_APP_VERSION || "3.12.3");
 }
 
 const REQUEST_TIMEOUT_MS = 30_000;
