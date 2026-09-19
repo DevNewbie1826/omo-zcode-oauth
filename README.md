@@ -117,7 +117,7 @@ ZCode 앱이 3.11.2부터 모델 요청에 **클라이언트 서명(ClientReques
 | 변수 | 기본값 | 설명 |
 |---|---|---|
 | `ZCODE_ANTHROPIC_BASE_URL` | `https://zcode.z.ai/api/v1/ultra-zai/anthropic` | 직접 엔드포인트(`https://api.z.ai/api/anthropic`)로 되돌릴 때 설정 |
-| `ZCODE_APP_VERSION` | `3.11.2` | User-Agent/`X-ZCode-App-Version`/`X-Client-Version` 공통 버전 |
+| `ZCODE_APP_VERSION` | `3.12.3` | User-Agent/`X-ZCode-App-Version`/`X-Client-Version` 공통 버전 |
 | `ZCODE_RELEASE_CHANNEL` | `production` | `X-Release-Channel` 값 |
 
 ## 모델 카탈로그

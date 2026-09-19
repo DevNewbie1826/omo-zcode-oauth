@@ -43,13 +43,13 @@ describe("buildZCodeSourceHeaders", () => {
     }
   });
 
-  test("User-Agent defaults to ZCode/3.11.2 and X-ZCode-App-Version uses the same version", () => {
+  test("User-Agent defaults to ZCode/3.12.3 and X-ZCode-App-Version uses the same version", () => {
     const previous = process.env.ZCODE_APP_VERSION;
     delete process.env.ZCODE_APP_VERSION;
     try {
       const headers = buildZCodeSourceHeaders();
-      expect(headers["User-Agent"]).toContain("ZCode/3.11.2 ai-sdk/provider-utils/4.0.27 runtime/node.js/");
-      expect(headers["X-ZCode-App-Version"]).toBe("3.11.2");
+      expect(headers["User-Agent"]).toContain("ZCode/3.12.3 ai-sdk/provider-utils/4.0.27 runtime/node.js/");
+      expect(headers["X-ZCode-App-Version"]).toBe("3.12.3");
     } finally {
       if (previous === undefined) delete process.env.ZCODE_APP_VERSION;
       else process.env.ZCODE_APP_VERSION = previous;

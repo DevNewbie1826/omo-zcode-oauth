@@ -209,7 +209,7 @@ describe("resolveZCodeSigningHeaders", () => {
 
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(headers["X-App-Id"]).toBe("zcode");
-    expect(headers["X-Client-Version"]).toBe("3.11.2");
+    expect(headers["X-Client-Version"]).toBe("3.12.3");
     expect(headers["X-Session-Id"]).toMatch(/^[0-9a-f-]{36}$/);
     expect(headers["X-Client-Nonce"]).toMatch(/^[0-9a-f]{32}$/);
     expect(headers["X-Client-Ts"]).toMatch(/^\d+$/);
@@ -220,7 +220,7 @@ describe("resolveZCodeSigningHeaders", () => {
     }
 
     const message = encodeUtf8(
-      `${credential.apiKeyId}\n${headers["X-Client-Ts"]}\n3.11.2\n${headers["X-Session-Id"]}\n${headers["X-Client-Nonce"]}`,
+      `${credential.apiKeyId}\n${headers["X-Client-Ts"]}\n3.12.3\n${headers["X-Session-Id"]}\n${headers["X-Client-Nonce"]}`,
     );
     expect(await subtle.verify("Ed25519", publicKey, fromBase64(headers["X-Client-Sig"]), message)).toBe(true);
 
