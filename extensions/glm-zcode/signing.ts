@@ -3,8 +3,10 @@ import { zcodeAppVersion } from "./models.js";
 
 /**
  * ZCode client request signing ("ClientRequestSigningV4"), reverse-engineered
- * from the ZCode 3.11.2 agent bundle (glm/zcode.cjs) and verified live against
- * the real endpoints on 2026-09-09:
+ * from the ZCode 3.11.2 agent bundle (glm/zcode.cjs), verified live against
+ * the real endpoints on 2026-09-09, and re-confirmed unchanged in the 3.14.4
+ * bundle (same handshake path, KDF constants, signature format, PoW bits,
+ * and fail-open semantics; see docs/research/zcode-3.14.4-protocol-diff.md):
  *
  * 1. Feature gate: GET https://zcode.z.ai/api/v1/agent/configs with the ZCode
  *    source headers plus `x-api-key` reports `data.codingPlanSignature.enable`.
