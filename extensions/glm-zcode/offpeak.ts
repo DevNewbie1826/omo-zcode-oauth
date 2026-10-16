@@ -3,7 +3,12 @@ import { buildZCodeSourceHeaders, resolveZCodeAnthropicBaseUrl } from "./models.
 
 /**
  * ZCode off-peak ("Idle plan") inference path, reverse-engineered from the
- * 3.11.2 host bundle. During the GLM-5.3-Flash usage campaign window
+ * 3.11.2 host bundle. NOTE (2026-09-29): the ticket-acquisition flow below
+ * was removed from the app bundle in the 3.13+/3.14 series (off-peak is now
+ * a desktop-host scheduled-task path; only the header name survives in the
+ * bundle's redaction list), so this opt-in path is deprecated and kept solely
+ * behind ZCODE_OFFPEAK_ENABLE=1 for servers that still expose the endpoints.
+ * During the GLM-5.3-Flash usage campaign window
  * (23:00-09:00 SGT == 00:00-10:00 KST daily), ZCode routes flash traffic
  * through `zcode.z.ai/api/v1/off-peak/anthropic` authenticated by the zcode
  * JWT (broker `data.token`) plus a ticket from `/api/v1/off-peak/ticket`,

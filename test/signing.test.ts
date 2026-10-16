@@ -200,6 +200,42 @@ describe("resolveZCodeSigningHeaders", () => {
     });
   }
 
+  function stubGateBehavior(onGate: (gateCall: number) => Response, cipher: string) {
+    let gateCalls = 0;
+    return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url === SIGNING_GATE_URL) {
+        gateCalls += 1;
+        expect(init?.method).toBe("GET");
+        const headers = new Headers(init?.headers);
+        expect(headers.get("x-api-key")).toBe(apiKey);
+        expect(headers.get("X-ZCode-App-Version")).toBe("3.11.2");
+        expect(headers.get("X-ZCode-Agent")).toBeNull();
+        return onGate(gateCalls);
+      }
+      if (url === SIGNING_HANDSHAKE_URL) {
+        expect(init?.method).toBe("POST");
+        const headers = new Headers(init?.headers);
+        expect(headers.get("Authorization")).toBe(apiKey);
+        const body = JSON.parse(String(init?.body)) as Record<string, string>;
+        expect(body.apiKey).toBe(apiKey);
+        expect(body.nonce).toMatch(/^[0-9a-f]{32}$/);
+        expect(body.ts).toMatch(/^\d+$/);
+        return json({ code: 200, msg: "Operation successful", data: { privateCipher: cipher } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    });
+  }
+
+  async function expectVerifiableSignature(headers: Record<string, string>, publicKey: CryptoKey): Promise<void> {
+    expect(headers["X-App-Id"]).toBe("zcode");
+    expect(headers["X-Client-Version"]).toBe("3.15.3");
+    const message = encodeUtf8(
+      `${credential.apiKeyId}\n${headers["X-Client-Ts"]}\n3.15.3\n${headers["X-Session-Id"]}\n${headers["X-Client-Nonce"]}`,
+    );
+    expect(await subtle.verify("Ed25519", publicKey, fromBase64(headers["X-Client-Sig"]), message)).toBe(true);
+  }
+
   test("Given an enabled gate and a working handshake, when resolved, then the request carries verifiable signature headers", async () => {
     const { cipher, publicKey } = await makePrivateCipher(credential);
     const fetch = stubGateAndHandshake({ code: 0, msg: "", data: { codingPlanSignature: { enable: true } } }, cipher);
@@ -209,7 +245,7 @@ describe("resolveZCodeSigningHeaders", () => {
 
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(headers["X-App-Id"]).toBe("zcode");
-    expect(headers["X-Client-Version"]).toBe("3.12.3");
+    expect(headers["X-Client-Version"]).toBe("3.15.3");
     expect(headers["X-Session-Id"]).toMatch(/^[0-9a-f-]{36}$/);
     expect(headers["X-Client-Nonce"]).toMatch(/^[0-9a-f]{32}$/);
     expect(headers["X-Client-Ts"]).toMatch(/^\d+$/);
@@ -220,7 +256,7 @@ describe("resolveZCodeSigningHeaders", () => {
     }
 
     const message = encodeUtf8(
-      `${credential.apiKeyId}\n${headers["X-Client-Ts"]}\n3.12.3\n${headers["X-Session-Id"]}\n${headers["X-Client-Nonce"]}`,
+      `${credential.apiKeyId}\n${headers["X-Client-Ts"]}\n3.15.3\n${headers["X-Session-Id"]}\n${headers["X-Client-Nonce"]}`,
     );
     expect(await subtle.verify("Ed25519", publicKey, fromBase64(headers["X-Client-Sig"]), message)).toBe(true);
 
@@ -261,6 +297,79 @@ describe("resolveZCodeSigningHeaders", () => {
 
     expect(await resolveZCodeSigningHeaders(glmHeaders(apiKey))).toEqual({});
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  type GateCase =
+    | { readonly kind: "payload"; readonly payload: unknown }
+    | { readonly kind: "status"; readonly status: number }
+    | { readonly kind: "throw" };
+
+  function installUnansweredFetch(fixture: GateCase, cipher: string) {
+    if (fixture.kind === "payload") return stubGateAndHandshake(fixture.payload, cipher);
+    return stubGateBehavior(() => {
+      if (fixture.kind === "throw") throw new TypeError("failed to fetch");
+      return new Response("unavailable", { status: fixture.status });
+    }, cipher);
+  }
+
+  test.each<[string, GateCase]>([
+    ["a code-0 payload with no signature flag", { kind: "payload", payload: { code: 0, data: {} } }],
+    [
+      "a code-0 signature flag that omits enable",
+      { kind: "payload", payload: { code: 0, data: { codingPlanSignature: {} } } },
+    ],
+    ["an HTTP 503 gate response", { kind: "status", status: 503 }],
+    ["a gate payload whose code is not 0", { kind: "payload", payload: { code: 1 } }],
+    ["a gate fetch that throws TypeError", { kind: "throw" }],
+  ])(
+    "Given %s, when resolved, then the request carries a verifiable signature and the handshake was fetched",
+    async (_label, fixture) => {
+      const { cipher, publicKey } = await makePrivateCipher(credential);
+      const fetchMock = installUnansweredFetch(fixture, cipher);
+      vi.stubGlobal("fetch", fetchMock);
+
+      const headers = await resolveZCodeSigningHeaders(glmHeaders(apiKey));
+
+      expect(fetchMock.mock.calls.filter((call) => String(call[0]) === SIGNING_HANDSHAKE_URL)).toHaveLength(1);
+      await expectVerifiableSignature(headers, publicKey);
+    },
+  );
+
+  test("Given a gate HTTP 503 and then an explicit disable, when resolved twice, then the failure is signed and not cached", async () => {
+    const { cipher, publicKey } = await makePrivateCipher(credential);
+    const fetchMock = stubGateBehavior((gateCall) => {
+      if (gateCall === 1) return new Response("unavailable", { status: 503 });
+      return json({ code: 0, msg: "", data: { codingPlanSignature: { enable: false } } });
+    }, cipher);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = await resolveZCodeSigningHeaders(glmHeaders(apiKey));
+    await expectVerifiableSignature(first, publicKey);
+
+    expect(await resolveZCodeSigningHeaders(glmHeaders(apiKey))).toEqual({});
+    expect(fetchMock.mock.calls.filter((call) => String(call[0]) === SIGNING_GATE_URL)).toHaveLength(2);
+  });
+
+  test("Given an absent signature flag, when resolved again within the TTL, then the gate is fetched only once", async () => {
+    const { cipher, publicKey } = await makePrivateCipher(credential);
+    const fetchMock = stubGateAndHandshake({ code: 0, msg: "", data: { codingPlanSignature: {} } }, cipher);
+    vi.stubGlobal("fetch", fetchMock);
+
+    const clock = { now: 1_700_000_000_000 };
+    const realNow = Date.now;
+    Date.now = () => clock.now;
+    try {
+      const first = await resolveZCodeSigningHeaders(glmHeaders(apiKey));
+      await expectVerifiableSignature(first, publicKey);
+
+      clock.now += 60_000;
+      const second = await resolveZCodeSigningHeaders(glmHeaders(apiKey));
+      await expectVerifiableSignature(second, publicKey);
+      expect(second["X-Client-Nonce"]).not.toBe(first["X-Client-Nonce"]);
+      expect(fetchMock.mock.calls.filter((call) => String(call[0]) === SIGNING_GATE_URL)).toHaveLength(1);
+    } finally {
+      Date.now = realNow;
+    }
   });
 
   test("Given a rejected handshake, when resolved, then the request fails open unsigned", async () => {

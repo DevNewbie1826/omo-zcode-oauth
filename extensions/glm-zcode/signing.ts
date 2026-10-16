@@ -3,11 +3,18 @@ import { zcodeAppVersion } from "./models.js";
 
 /**
  * ZCode client request signing ("ClientRequestSigningV4"), reverse-engineered
- * from the ZCode 3.11.2 agent bundle (glm/zcode.cjs) and verified live against
- * the real endpoints on 2026-09-09:
+ * from the ZCode 3.11.2 agent bundle (glm/zcode.cjs), verified live against
+ * the real endpoints on 2026-09-09, and re-confirmed unchanged in the 3.14.4
+ * bundle (same handshake path, KDF constants, signature format, PoW bits,
+ * and fail-open semantics; see docs/research/zcode-3.14.4-protocol-diff.md):
  *
  * 1. Feature gate: GET https://zcode.z.ai/api/v1/agent/configs with the ZCode
- *    source headers plus `x-api-key` reports `data.codingPlanSignature.enable`.
+ *    source headers plus `x-api-key` may report `data.codingPlanSignature.enable`.
+ *    Signing proceeds unless that flag is exactly false. An absent flag, a
+ *    non-boolean enable, a non-2xx response, a payload whose code is not 0,
+ *    malformed JSON, or a thrown fetch is no answer, and the request is still
+ *    signed. ZCode 3.15.3 has no gate: its agent bundle never reads
+ *    codingPlanSignature.
  * 2. Handshake: POST https://api.z.ai/api/paas/c1f3a7e2/v2/client with the raw
  *    `{id}.{secret}` key as Authorization and a body proving knowledge of the
  *    secret (HKDF-derived HMAC over `get_sign_key\n{id}\n{ts}\n{nonce}`).
@@ -19,11 +26,13 @@ import { zcodeAppVersion } from "./models.js";
  *    Ed25519 signature covers `{id}\n{ts}\n{version}\n{sessionId}\n{nonce}`.
  *
  * Signed traffic is what Z.ai's ultra gateway (`zcode.z.ai/api/v1/ultra-zai/…`)
- * recognizes as "used via ZCode" — the basis of the GLM-5.3-Flash zero-quota
- * usage campaign (docs.z.ai/devpack/notice/event-glm-5.3-flash).
+ * recognizes as "used via ZCode" — the basis of the server's client/configs
+ * codingPlanBillingDiscount ("150% Quota": GLM via Coding Plan in ZCode charged
+ * at a 0.67 coefficient, no published end time). Whether plugin traffic gets
+ * that discount is unconfirmed.
  *
- * Every failure path mirrors the app's fail-open behavior: the request is sent
- * unsigned rather than blocked.
+ * Handshake failures stay fail-open: the request is sent unsigned rather than
+ * blocked.
  */
 
 const subtle = webcrypto.subtle;
@@ -48,6 +57,11 @@ type SigningState = {
   gate?: { enabled: boolean; checkedAt: number };
   keyPromise?: Promise<CryptoKey>;
 };
+
+type SigningGateDecision =
+  | { readonly kind: "explicit"; readonly enable: boolean }
+  | { readonly kind: "absent" }
+  | { readonly kind: "no-answer" };
 
 const states = new Map<string, SigningState>();
 let sessionId: string | undefined;
@@ -193,34 +207,54 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   return fetch(url, { ...init, redirect: "manual", signal: AbortSignal.timeout(timeoutMs) });
 }
 
-async function fetchSigningEnabled(apiKey: string, headers: Record<string, string>): Promise<boolean> {
+function assertNever(value: never): never {
+  throw new Error(`glm-zcode: unexpected signing gate decision ${JSON.stringify(value)}`);
+}
+
+async function fetchSigningGate(apiKey: string, headers: Record<string, string>): Promise<SigningGateDecision> {
   const response = await fetchWithTimeout(
     SIGNING_GATE_URL,
     { headers: { ...headers, "x-api-key": apiKey }, method: "GET" },
     GATE_TIMEOUT_MS,
   );
-  if (!response.ok) return false;
+  if (!response.ok) return { kind: "no-answer" };
   const payload: unknown = await response.json();
-  if (!isRecord(payload) || payload.code !== 0) return false;
+  if (!isRecord(payload) || payload.code !== 0) return { kind: "no-answer" };
   const data = isRecord(payload.data) ? payload.data : undefined;
   const signatureFlag = isRecord(data?.codingPlanSignature) ? data.codingPlanSignature : undefined;
-  return signatureFlag?.enable === true;
+  if (!signatureFlag || !("enable" in signatureFlag)) return { kind: "absent" };
+  if (typeof signatureFlag.enable !== "boolean") return { kind: "no-answer" };
+  return { kind: "explicit", enable: signatureFlag.enable };
 }
 
-/** Cached gate check (1h TTL on affirmative responses, re-checked after failures). */
+function applySigningGate(decision: SigningGateDecision): { readonly sign: boolean; readonly cache: boolean } {
+  switch (decision.kind) {
+    case "explicit":
+      return { sign: decision.enable, cache: decision.enable };
+    case "absent":
+      return { sign: true, cache: true };
+    case "no-answer":
+      return { sign: true, cache: false };
+    default:
+      return assertNever(decision);
+  }
+}
+
+/** Cached gate check (1h TTL only when a code-0 answer enables signing; explicit false and failures are re-checked). */
 async function signingEnabled(apiKey: string, headers: Record<string, string>): Promise<boolean> {
   const state = states.get(apiKey) ?? {};
   states.set(apiKey, state);
   if (state.gate && Date.now() - state.gate.checkedAt < GATE_TTL_MS) return state.gate.enabled;
-  let enabled = false;
+  let decision: SigningGateDecision = { kind: "no-answer" };
   try {
-    enabled = await fetchSigningEnabled(apiKey, headers);
+    decision = await fetchSigningGate(apiKey, headers);
   } catch {
-    enabled = false;
+    decision = { kind: "no-answer" };
   }
-  if (enabled) state.gate = { enabled, checkedAt: Date.now() };
+  const { sign, cache } = applySigningGate(decision);
+  if (cache) state.gate = { enabled: true, checkedAt: Date.now() };
   else state.gate = undefined;
-  return enabled;
+  return sign;
 }
 
 async function performHandshake(credential: ZCodeApiKeyCredential): Promise<CryptoKey> {
@@ -262,8 +296,8 @@ async function ensurePrivateKey(credential: ZCodeApiKeyCredential): Promise<Cryp
 /**
  * Computes the per-request client-signature and attribution headers for a
  * glm-zcode model request. Returns `{}` (unsigned) whenever signing does not
- * apply: foreign provider, missing/invalid key, gate disabled, or any internal
- * failure — never throws.
+ * apply: foreign provider, missing/invalid key, gate explicitly disabled, or any
+ * internal failure — never throws.
  */
 export async function resolveZCodeSigningHeaders(
   headers: Record<string, string | null | undefined>,

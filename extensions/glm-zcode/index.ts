@@ -320,8 +320,10 @@ function getOrCreateDeviceMid(): string | undefined {
 /**
  * Device-identity metadata for glm-zcode request bodies. The real app
  * (captured 2026-09-10) sends metadata.user_id = JSON({device_id,
- * account_uuid, session_id}); without it the identical signed ultra request
- * is billed at par, with it the campaign zero-quota classification applies.
+ * account_uuid, session_id}); with the metadata the request matches the
+ * app's shape that the server uses to classify "used via ZCode" (the basis
+ * of the current 150% quota campaign, 0.67 coefficient); the plugin-side
+ * effect is unconfirmed.
  */
 function deviceIdentityMetadata(): { user_id: string } | undefined {
   const deviceId = printableAsciiEnv("ZCODE_DEVICE_ID") ?? defaultDeviceId;
@@ -329,11 +331,44 @@ function deviceIdentityMetadata(): { user_id: string } | undefined {
   return { user_id: JSON.stringify({ device_id: deviceId, account_uuid: "", session_id: zcodeSessionId() }) };
 }
 
+/** ZCode 3.15.3 official GLM model-ID spelling; unknown IDs pass through. */
+const OFFICIAL_GLM_MODEL_IDS = [
+  "GLM-5.3",
+  "GLM-5.3-Flash",
+  "GLM-5V-Turbo",
+  "GLM-5.2",
+  "GLM-5.1",
+  "GLM-5.1-Highspeed",
+  "GLM-5",
+  "GLM-5-Turbo",
+  "GLM-4.7",
+  "GLM-4.7-FlashX",
+  "GLM-4.7-Flash",
+  "GLM-4.6",
+  "GLM-4.5-Air",
+  "GLM-4.5",
+  "GLM-4.6V",
+  "GLM-4.6V-Flash",
+  "GLM-4.6V-FlashX",
+  "GLM-4.1V-Thinking-FlashX",
+  "GLM-4.1V-Thinking-Flash",
+  "GLM-4-FlashX-250414",
+  "GLM-4-Flash-250414",
+  "GLM-4V-Flash",
+] as const;
+
+const officialGlmModelByLower = new Map(OFFICIAL_GLM_MODEL_IDS.map((id) => [id.toLowerCase(), id]));
+
+function officialGlmModelId(id: string): string {
+  return officialGlmModelByLower.get(id.toLowerCase()) ?? id;
+}
+
 export default function glmZcodeExtension(pi: ExtensionAPI): void {
   defaultDeviceId ??= getOrCreateDeviceMid();
   pi.on("before_provider_request", (event) => {
     if (event.model?.provider !== "glm-zcode" || event.payload == null || typeof event.payload !== "object") return event.payload;
-    const payload = event.payload as { metadata?: { user_id?: unknown } & Record<string, unknown> };
+    const payload = event.payload as { model?: unknown; metadata?: { user_id?: unknown } & Record<string, unknown> };
+    if (typeof payload.model === "string") payload.model = officialGlmModelId(payload.model);
     if (payload.metadata?.user_id !== undefined) return event.payload;
     const metadata = deviceIdentityMetadata();
     if (!metadata) return event.payload;
