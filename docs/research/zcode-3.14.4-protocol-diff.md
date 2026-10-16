@@ -50,8 +50,8 @@ controversy (2026-09-21) and open-sourced the codebase.
 1. **App version** — default bumped 3.12.3 → 3.14.4 (`ZCODE_APP_VERSION`,
    shared by User-Agent / X-ZCode-App-Version / X-Client-Version). Applied.
 2. **Off-peak ticket gateway removed from the app** — the 3.14.4 bundle no
-   longer contains `/api/v1/off-peak/ticket`, `X-Coding-Plan-Api-Key`, or
-   ticket acquisition; off-peak is now a desktop-host scheduled-task path
+   longer contains `/api/v1/off-peak/ticket` or ticket acquisition (the
+   `X-Coding-Plan-Api-Key` header name itself still appears); off-peak is now a desktop-host scheduled-task path
    ("off-peak-run" protocol messages, `account-offpeak` provider mode). Our
    opt-in (`ZCODE_OFFPEAK_ENABLE=1`) offpeak.ts path is deprecated: marked in
    its header comment; no code change (opt-in, fail-open, server may still
