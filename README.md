@@ -100,24 +100,26 @@ zcode://oauth/callback?code=<authorization-code>&state=<state>
 
 로그인 후 Z.AI Coding Plan의 전체 모델 목록을 사용할 수 있습니다 (`glm-zcode/glm-5.3`, `glm-zcode/glm-5.3-flash`, `glm-zcode/glm-5.2`, `glm-zcode/glm-4.7` 등). 목록은 models.dev 카탈로그(`zai-coding-plan`)에서 동적으로 가져오므로 새 모델이 나오면 자동으로 반영됩니다.
 
-## 클라이언트 서명과 무제한 캠페인 (2026-09-03 ~ 09-20)
+설정에서 사용하는 모델 ID는 소문자로 유지되고(예: `glm-zcode/glm-5.3`), 요청을 보내기 직전에 본문 model 값만 ZCode 3.15.3 앱의 공식 표기(예: `GLM-5.3`, `GLM-5.3-Flash`)로 바꾸며, 앱 모델 목록에 없는 ID(예: `glm-5.3-flashx`)는 바꾸지 않고 그대로 전송합니다.
 
-ZCode 앱이 3.11.2부터 모델 요청에 **클라이언트 서명(ClientRequestSigningV4)** 을 붙이고, 요청을 Z.AI의 **ultra 게이트웨이**로 보냅니다. GLM Coding Plan의 Usage Campaign 기간(매일 00:00–10:00 KST)에는 glm-5.3-Flash 한정으로 서명된 "ZCode 경유" 트래픽의 쿼터 소모가 0이 되고, 그 외 Agent 경유는 쿼터가 2배로 지급됩니다.
+## 클라이언트 서명과 150% 쿼터 캠페인
 
-이 확장은 앱의 메커니즘을 그대로 재현합니다:
+ZCode는 모델 요청에 **클라이언트 서명(ClientRequestSigningV4)** 을 붙이고 Z.AI의 **ultra 게이트웨이**로 보냅니다. 앱이 내려받는 서버 설정(`GET zcode.z.ai/api/v1/client/configs`, `codingPlanBillingDiscount`)에는 현재 "150% Quota" 배지가 표시됩니다. ZCode에서 Coding Plan으로 GLM을 사용할 때 쿼터 소모량은 0.67 계수로 환산되며, 종료 시점은 공개되지 않았고 공식 공지를 따릅니다. 앱은 이 값을 배지 표시에만 사용하고 요청에 별도 플래그를 보내지 않으므로, 서버가 요청 형태(서명, ultra 게이트웨이, 기기 메타데이터)를 바탕으로 판단합니다. 플러그인 트래픽에도 실제로 0.67이 적용되는지는 미확인입니다. 이전 GLM-5.3-Flash 무쿼터 캠페인(2026-09-03 ~ 09-20)은 종료됐습니다.
 
-1. `GET zcode.z.ai/api/v1/agent/configs` 로 서명 게이트(`codingPlanSignature.enable`)를 확인합니다.
+이 확장은 앱의 메커니즘을 재현합니다:
+
+1. `GET zcode.z.ai/api/v1/agent/configs` 로 서명 게이트(`codingPlanSignature.enable`)를 확인합니다. 플래그가 없거나 게이트에 도달할 수 없으면 서명하며, 명시적인 `false`일 때만 서명을 끕니다. ZCode 3.15.3 앱 자체는 이 플래그를 읽지 않고 Coding Plan 요청에 항상 서명합니다.
 2. `POST api.z.ai/api/paas/c1f3a7e2/v2/client` 핸드셰이크에서 API 키로 Ed25519 서명 키를 발급받습니다.
 3. 모든 모델 요청에 `X-Client-Sig`(Ed25519), `X-Client-Pow`(8-bit PoW), `X-Client-Ts/Nonce/Version`, `X-App-Id: zcode`, `X-Session-Id` 헤더를 붙여 `https://zcode.z.ai/api/v1/ultra-zai/anthropic` 로 전송합니다.
 
-게이트가 꺼져 있거나 핸드셰이크가 실패하면 앱과 동일하게 **미서명으로 전송**됩니다(요청이 막히지 않음). 상세 근거는 [`docs/research/pr8-ultra-signing-definition.md`](docs/research/pr8-ultra-signing-definition.md) 를 참고하세요.
+게이트가 명시적으로 `false`를 반환하거나 핸드셰이크가 실패한 경우에만 **미서명으로 전송**됩니다(fail-open이며 요청은 차단되지 않음). 상세 근거는 [`docs/research/pr8-ultra-signing-definition.md`](docs/research/pr8-ultra-signing-definition.md) 를 참고하세요.
 
 ### 환경 변수
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
 | `ZCODE_ANTHROPIC_BASE_URL` | `https://zcode.z.ai/api/v1/ultra-zai/anthropic` | 직접 엔드포인트(`https://api.z.ai/api/anthropic`)로 되돌릴 때 설정 |
-| `ZCODE_APP_VERSION` | `3.14.4` | User-Agent/`X-ZCode-App-Version`/`X-Client-Version` 공통 버전 |
+| `ZCODE_APP_VERSION` | `3.15.3` | User-Agent/`X-ZCode-App-Version`/`X-Client-Version` 공통 버전 |
 | `ZCODE_RELEASE_CHANNEL` | `production` | `X-Release-Channel` 값 |
 
 ## 모델 카탈로그
