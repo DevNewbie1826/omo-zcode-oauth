@@ -314,7 +314,7 @@ describe("glm-zcode extension", () => {
       expect(new Headers(call[1]?.headers).get("Authorization")).toBe(`Bearer ${BUSINESS_TOKEN}`);
     }
     const createBody = JSON.parse(String(fetch.mock.calls[5][1]?.body)) as Record<string, unknown>;
-    expect(createBody).toEqual({ name: "zcode-api-key" });
+    expect(createBody).toEqual({ name: "zcode-api-key", usageScene: 1 });
 
     // Provisioned credentials.
     expect(credentials).toMatchObject({

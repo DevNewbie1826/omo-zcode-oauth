@@ -20,7 +20,7 @@ export function resolveZCodeAnthropicBaseUrl(): string {
 }
 
 export function zcodeAppVersion(): string {
-  return printableAscii(process.env.ZCODE_APP_VERSION || "3.15.3");
+  return printableAscii(process.env.ZCODE_APP_VERSION || "4.0.0");
 }
 
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -258,7 +258,7 @@ export function buildZCodeSourceHeaders(): Record<string, string> {
     "X-Release-Channel": channel,
     "X-Platform": `${process.platform}-${process.arch}`,
     "X-Os-Category": osCategory(process.platform),
-    "X-Os-Version": os.version(),
+    "X-Os-Version": os.release(),
     "X-Client-Language": Intl.DateTimeFormat().resolvedOptions().locale,
     "X-Client-Timezone": Intl.DateTimeFormat().resolvedOptions().timeZone,
     "X-ZCode-Agent": "glm",

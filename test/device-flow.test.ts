@@ -244,6 +244,10 @@ describe("glm-zcode CLI device-flow login", () => {
     const urls = fetch.mock.calls.map((call) => String(call[0]));
     expect(urls).toContain("https://api.z.ai/api/auth/z/login");
     expect(urls).toContain(`${KEYS_URL}/copy/key-id`);
+    const createCall = fetch.mock.calls.find(
+      (call) => String(call[0]) === KEYS_URL && call[1]?.method === "POST",
+    );
+    expect(JSON.parse(String(createCall?.[1]?.body))).toEqual({ name: "zcode-api-key", usageScene: 1 });
 
     expect(credentials).toMatchObject({
       access: "key-id.api-secret",

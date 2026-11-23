@@ -1,3 +1,4 @@
+import { release } from "node:os";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { buildZCodeSourceHeaders, osCategory } from "../extensions/glm-zcode/index.js";
 
@@ -35,6 +36,7 @@ describe("buildZCodeSourceHeaders", () => {
       expect(headers["X-Release-Channel"]).toBe("production");
       expect(headers["X-Platform"]).toBe(`${process.platform}-${process.arch}`);
       expect(headers["X-Os-Category"]).toBe(osCategory(process.platform));
+      expect(headers["X-Os-Version"]).toBe(release());
     } finally {
       if (previousVersion === undefined) delete process.env.ZCODE_APP_VERSION;
       else process.env.ZCODE_APP_VERSION = previousVersion;
@@ -43,13 +45,13 @@ describe("buildZCodeSourceHeaders", () => {
     }
   });
 
-  test("User-Agent defaults to ZCode/3.15.3 and X-ZCode-App-Version uses the same version", () => {
+  test("User-Agent defaults to ZCode/4.0.0 and X-ZCode-App-Version uses the same version", () => {
     const previous = process.env.ZCODE_APP_VERSION;
     delete process.env.ZCODE_APP_VERSION;
     try {
       const headers = buildZCodeSourceHeaders();
-      expect(headers["User-Agent"]).toContain("ZCode/3.15.3 ai-sdk/provider-utils/4.0.27 runtime/node.js/");
-      expect(headers["X-ZCode-App-Version"]).toBe("3.15.3");
+      expect(headers["User-Agent"]).toContain("ZCode/4.0.0 ai-sdk/provider-utils/4.0.27 runtime/node.js/");
+      expect(headers["X-ZCode-App-Version"]).toBe("4.0.0");
     } finally {
       if (previous === undefined) delete process.env.ZCODE_APP_VERSION;
       else process.env.ZCODE_APP_VERSION = previous;

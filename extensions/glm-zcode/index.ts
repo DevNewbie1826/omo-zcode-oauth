@@ -331,7 +331,7 @@ function deviceIdentityMetadata(): { user_id: string } | undefined {
   return { user_id: JSON.stringify({ device_id: deviceId, account_uuid: "", session_id: zcodeSessionId() }) };
 }
 
-/** ZCode 3.15.3 official GLM model-ID spelling; unknown IDs pass through. */
+/** ZCode 4.0.0 official GLM model-ID spelling; unknown IDs pass through. */
 const OFFICIAL_GLM_MODEL_IDS = [
   "GLM-5.3",
   "GLM-5.3-Flash",

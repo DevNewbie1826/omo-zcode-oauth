@@ -229,9 +229,9 @@ describe("resolveZCodeSigningHeaders", () => {
 
   async function expectVerifiableSignature(headers: Record<string, string>, publicKey: CryptoKey): Promise<void> {
     expect(headers["X-App-Id"]).toBe("zcode");
-    expect(headers["X-Client-Version"]).toBe("3.15.3");
+    expect(headers["X-Client-Version"]).toBe("4.0.0");
     const message = encodeUtf8(
-      `${credential.apiKeyId}\n${headers["X-Client-Ts"]}\n3.15.3\n${headers["X-Session-Id"]}\n${headers["X-Client-Nonce"]}`,
+      `${credential.apiKeyId}\n${headers["X-Client-Ts"]}\n4.0.0\n${headers["X-Session-Id"]}\n${headers["X-Client-Nonce"]}`,
     );
     expect(await subtle.verify("Ed25519", publicKey, fromBase64(headers["X-Client-Sig"]), message)).toBe(true);
   }
@@ -245,7 +245,7 @@ describe("resolveZCodeSigningHeaders", () => {
 
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(headers["X-App-Id"]).toBe("zcode");
-    expect(headers["X-Client-Version"]).toBe("3.15.3");
+    expect(headers["X-Client-Version"]).toBe("4.0.0");
     expect(headers["X-Session-Id"]).toMatch(/^[0-9a-f-]{36}$/);
     expect(headers["X-Client-Nonce"]).toMatch(/^[0-9a-f]{32}$/);
     expect(headers["X-Client-Ts"]).toMatch(/^\d+$/);
@@ -256,7 +256,7 @@ describe("resolveZCodeSigningHeaders", () => {
     }
 
     const message = encodeUtf8(
-      `${credential.apiKeyId}\n${headers["X-Client-Ts"]}\n3.15.3\n${headers["X-Session-Id"]}\n${headers["X-Client-Nonce"]}`,
+      `${credential.apiKeyId}\n${headers["X-Client-Ts"]}\n4.0.0\n${headers["X-Session-Id"]}\n${headers["X-Client-Nonce"]}`,
     );
     expect(await subtle.verify("Ed25519", publicKey, fromBase64(headers["X-Client-Sig"]), message)).toBe(true);
 
