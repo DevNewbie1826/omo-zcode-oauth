@@ -24,6 +24,16 @@ function isIndented(line) {
   return line.startsWith(" ") || line.startsWith("\t");
 }
 
+// latest.yml is a plain block mapping: keys at column 0, values in block
+// scalars. A root flow collection, a quoted root key, a flow value, a root
+// sequence entry or a directive is a different document shape, and guessing
+// which nested scalar belongs to the root is how a nested "version" used to
+// win. Such documents are refused rather than interpreted.
+function isPlainRootEntry(line) {
+  if (/^(?:[-?][ \t]|[{}\[\]%]|['"])/.test(line)) return false;
+  return !/^[^#:]+:[ \t]*[\[{]/.test(line);
+}
+
 // Reads the document's top-level "version" entry as one YAML scalar: the text
 // after the key, then every indented continuation line, folded the way YAML
 // folds it. Returns null when the document has no such key, has more than one
@@ -34,7 +44,9 @@ function readVersionField(yml) {
   const keyIndexes = [];
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
-    if (line === "" || line === "---" || line === "..." || isIndented(line)) continue;
+    if (line.trim() === "" || line.startsWith("#") || isIndented(line)) continue;
+    if (line === "---" || line === "...") continue;
+    if (!isPlainRootEntry(line)) return null;
     if (VERSION_KEY_LINE.test(line)) keyIndexes.push(index);
   }
   if (keyIndexes.length !== 1) return null;
