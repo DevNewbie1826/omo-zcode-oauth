@@ -2,7 +2,8 @@
 // Compares the plugin's default ZCODE_APP_VERSION with the latest ZCode release.
 // Sources: GitHub Releases (zai-org/ZCode) and the public CDN latest.yml for that tag.
 // Both sources must yield a valid version and agree with each other.
-// Exit codes: 0 = up to date, 1 = plugin default is behind, 2 = a source could not be read or the sources disagree.
+// Exit codes: 0 = up to date, 1 = plugin default is behind, 2 = a source could not be read, the sources disagree,
+// or the plugin default is ahead of the latest release.
 import { readFile } from "node:fs/promises";
 
 const MODELS_TS = new URL("../extensions/glm-zcode/models.ts", import.meta.url);
@@ -10,7 +11,7 @@ const GITHUB_LATEST = "https://api.github.com/repos/zai-org/ZCode/releases/lates
 const CDN_LATEST_YML = (version) =>
   `https://cdn-zcode.z.ai/zcode/electron/releases/${version}/macos-arm64/latest.yml`;
 
-const VERSION_PATTERN = /^\d+(?:\.\d+)*$/;
+const VERSION_PATTERN = /^(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))*$/;
 
 function normalizeVersion(raw) {
   if (typeof raw !== "string") return null;
@@ -81,7 +82,7 @@ try {
   console.log(`plugin default : ${current}`);
   console.log(`GitHub latest  : ${github.version} (published ${github.publishedAt ?? "?"})`);
   console.log(`CDN latest.yml : ${cdn.version} (releaseDate ${cdn.releaseDate ?? "?"})`);
-  if (compareVersions(github.version, cdn.version) !== 0) {
+  if (cdn.version !== github.version) {
     throw new Error(`release sources disagree: GitHub ${github.version}, CDN ${cdn.version}`);
   }
   const delta = compareVersions(current, github.version);
@@ -91,7 +92,7 @@ try {
   }
   if (delta > 0) {
     console.log(`AHEAD: plugin default ${current} is newer than release ${github.version}`);
-    process.exit(0);
+    process.exit(2);
   }
   console.log("UP TO DATE");
 } catch (error) {
