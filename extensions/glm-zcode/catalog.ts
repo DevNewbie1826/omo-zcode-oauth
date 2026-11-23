@@ -155,7 +155,7 @@ export function createZCodeCatalog(
       const lower = id.toLowerCase();
       return appWireNames.get(lower) ?? state.wireNames.get(id) ?? state.foldedWireNames.get(lower) ?? id;
     },
-    async refresh(ctx: RefreshModelsContext, deadline = Date.now() + CATALOG_TRIGGER_TIMEOUT_MS): Promise<void> {
+    async refresh(ctx: RefreshModelsContext, deadline = Date.now() + CATALOG_TRIGGER_TIMEOUT_MS): Promise<"source-unavailable" | void> {
       // The host uses one generation signal for restore and online phases.
       let session = generationSessions.get(ctx.signal);
       if (!session) {
@@ -193,7 +193,8 @@ export function createZCodeCatalog(
         ? { session, access: credential.access, jwt: credential.zcodeJwtToken } : undefined;
       const discovery = await discover(context, deadline, owner && offPeakActiveFor
         ? optionalSignal => offPeakActiveFor({ ...context, signal: optionalSignal }, session) : undefined);
-      if (!discovery.rows.length || !isCurrent()) return;
+      if (!isCurrent()) return;
+      if (!discovery.rows.length) return "source-unavailable";
       const rows = uniqueRows(discovery.rows);
       const now = Date.now();
       const persist: ModelsStoreEntry = {

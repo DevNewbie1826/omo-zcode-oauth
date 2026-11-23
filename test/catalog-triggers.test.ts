@@ -207,6 +207,60 @@ test("startup recovery leaves a newer force alone while its first store read is 
   }
 });
 
+test.each(["force superseded", "force sources fail", "retry superseded"])(
+  "startup defers to force and bounds recovery when %s", async mode => {
+    const h = await host();
+    const startupEntered = deferred<void>();
+    const forceEntered = deferred<void>();
+    const retryEntered = deferred<void>();
+    const startup = deferred<Response>();
+    const force = deferred<Response>();
+    const retry = deferred<Response>();
+    const live = vi.fn<() => Response | Promise<Response>>(() => reply("recovered"))
+      .mockImplementationOnce(() => { startupEntered.resolve(); return startup.promise; })
+      .mockImplementationOnce(() => { forceEntered.resolve(); return force.promise; });
+    if (mode === "retry superseded") {
+      live.mockImplementationOnce(() => { retryEntered.resolve(); return retry.promise; });
+    }
+    sources(live);
+    try {
+      h.start();
+      await startupEntered.promise;
+      const command = h.command("--force");
+      await forceEntered.promise;
+      await vi.advanceTimersByTimeAsync(0);
+      expect(live).toHaveBeenCalledTimes(2);
+
+      const cacheOnly = { providers: [providerId], allowNetwork: false };
+      if (mode !== "force sources fail") await h.models.refresh(cacheOnly);
+      else force.resolve(new Response(null, { status: 503 }));
+      await command;
+      startup.resolve(reply("superseded startup"));
+      force.resolve(reply("superseded force"));
+      await vi.advanceTimersByTimeAsync(0);
+      if (mode === "retry superseded") {
+        expect(live).toHaveBeenCalledTimes(3);
+        await retryEntered.promise;
+        await h.models.refresh(cacheOnly);
+        retry.resolve(reply("superseded retry"));
+        await vi.advanceTimersByTimeAsync(0);
+      }
+
+      const recovered = mode === "force superseded";
+      expect((await h.modelsStore.read(providerId))?.models.map(model => model.id)).toEqual(recovered ? ["recovered"] : undefined);
+      if (recovered) expect(h.models.getModels(providerId).map(model => model.id)).toEqual(["recovered"]);
+      expect(live).toHaveBeenCalledTimes(mode === "force sources fail" ? 2 : 3);
+      expect(h.notify.mock.calls.map(([, level]) => level)).toEqual(recovered ? ["error"] : ["error", "warning"]);
+      expect(vi.getTimerCount()).toBe(1);
+    } finally {
+      h.shutdown();
+      startup.resolve(reply("cleanup"));
+      force.resolve(reply("cleanup"));
+      retry.resolve(reply("cleanup"));
+    }
+  },
+);
+
 test.each(["before provider entry", "during online phase"])("force never reports success when superseded %s", async boundary => {
   const h = await host(now);
   const entered = deferred<void>();
@@ -235,6 +289,58 @@ test.each(["before provider entry", "during online phase"])("force never reports
   } finally {
     h.shutdown();
     release.resolve();
+  }
+});
+
+test.each(["before", "after"])("an offline restart fences a host cache snapshot delivered %s the fence", async delivery => {
+  vi.stubEnv("OFFLINE", "");
+  const h = await host(now);
+  await h.credentials.modify(providerId, async () => undefined);
+  h.start();
+  const options = { providers: [providerId], allowNetwork: false };
+  const [prior] = h.provider.getModels();
+  const read = h.modelsStore.read.bind(h.modelsStore);
+  const entered = deferred<void>();
+  const releaseOld = deferred<void>();
+  const releaseFence = deferred<void>();
+  await h.modelsStore.write(providerId, { checkedAt: now, models: [{ ...prior, id: "obsolete" }] });
+  vi.spyOn(h.modelsStore, "read").mockImplementationOnce(async (...args) => {
+    const captured = await read(...args);
+    entered.resolve();
+    await releaseOld.promise;
+    return captured;
+  });
+  const pending = h.models.refresh(options);
+  try {
+    await entered.promise;
+    h.shutdown();
+    await h.modelsStore.write(providerId, { checkedAt: now, models: [prior] });
+    // ModelRuntime can yield before it starts the new generation (loading models.json).
+    h.refresh.mockImplementationOnce(async opts => {
+      await releaseFence.promise;
+      return h.models.refresh(opts);
+    });
+    const restarted = h.start();
+    if (delivery === "before") {
+      releaseOld.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.provider.getModels().map(model => model.id)).toEqual(["cached"]);
+    }
+    releaseFence.resolve();
+    await restarted;
+    releaseOld.resolve();
+    await pending;
+    expect(h.provider.getModels().map(model => model.id)).toEqual(["cached"]);
+    expect((await read(providerId))?.models.map(model => model.id)).toEqual(["cached"]);
+    expect(vi.getTimerCount()).toBe(0);
+
+    await h.modelsStore.write(providerId, { checkedAt: now, models: [{ ...prior, id: "current" }] });
+    await h.models.refresh(options);
+    expect(h.provider.getModels().map(model => model.id)).toEqual(["current"]);
+  } finally {
+    releaseFence.resolve();
+    releaseOld.resolve();
+    h.shutdown();
   }
 });
 

@@ -193,7 +193,7 @@ test.each([undefined, { type: "api_key", key: "" }, { ...oauth, access: "" }] as
     sources(undefined, reject);
     const c = createZCodeCatalog();
     const h = host({ credential, stored: stale });
-    await c.refresh(h.ctx);
+    await expect(c.refresh(h.ctx)).resolves.toBe("source-unavailable");
     expect(h.publish.mock.calls).toEqual([[{ update: expect.any(Function) }]]);
     expect(ids(c)).toEqual(["old"]);
     expect(c.checkedAt).toBe(stale.checkedAt);
@@ -206,7 +206,7 @@ test("both sources failing retains the previously accepted state even without a 
   await c.refresh(host({ stored: stale, allowNetwork: false }).ctx);
   sources(reject, reject);
   const h = host();
-  await c.refresh(h.ctx);
+  await expect(c.refresh(h.ctx)).resolves.toBe("source-unavailable");
   expect(h.publish).not.toHaveBeenCalled();
   expect(ids(c)).toEqual(["old"]);
   expect(c.checkedAt).toBe(stale.checkedAt);
@@ -355,7 +355,8 @@ test("registry reports a rejected write once and retains the restored snapshot",
   const base = createProvider({ id: provider, auth: { apiKey: {
     name: "Test", resolve: async ({ credential }) => ({ auth: { apiKey: credential?.key } }),
   } }, models: c.getModels(), api: { stream: reject, streamSimple: reject } });
-  registry.setProvider({ ...base, getModels: c.getModels, getAllModels: c.getModels, refreshModels: c.refresh });
+  registry.setProvider({ ...base, getModels: c.getModels, getAllModels: c.getModels,
+    refreshModels: async ctx => { await c.refresh(ctx); } });
 
   const result = await registry.refresh({ providers: [provider], force: true, allowNetwork: true });
   expect(result.errors.get(provider)).toBe(failure);
