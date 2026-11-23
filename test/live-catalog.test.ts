@@ -1,31 +1,24 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { LIVE_MODELS_MAX_BYTES, LIVE_MODELS_URL, fetchLiveModels } from "../extensions/glm-zcode/live-catalog.js";
+import { ZCODE_CHAT_DEFAULTS, toChatModelConfig } from "../extensions/glm-zcode/models.js";
 
 function json(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), { status, headers: { "Content-Type": "application/json" } });
 }
 
-const EXPECTED_THINKING = {
-  minimal: "low",
-  low: "low",
-  medium: "low",
-  high: "high",
-  xhigh: "max",
-  max: "max",
-};
-
+/** The one row shape the live reader must produce: M's chat builder over the shared defaults. */
 function expectedLiveModel(id: string, name: string) {
-  return {
-    id,
-    name,
-    reasoning: true,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 1_000_000,
-    maxTokens: 131_072,
-    thinkingLevelMap: EXPECTED_THINKING,
-    compat: { supportsDisabledThinking: false, forceAdaptiveThinking: true },
-  };
+  return toChatModelConfig(id, name, ZCODE_CHAT_DEFAULTS);
+}
+
+/** A transport double that only answers the live catalog GET; anything else is a test bug. */
+function stubCatalog(response: () => Response): ReturnType<typeof vi.fn> {
+  const fetch = vi.fn(async (input: string | URL | Request) => {
+    if (String(input) !== LIVE_MODELS_URL) throw new Error(`unexpected request: ${String(input)}`);
+    return response();
+  });
+  vi.stubGlobal("fetch", fetch);
+  return fetch;
 }
 
 afterEach(() => {
@@ -33,10 +26,9 @@ afterEach(() => {
 });
 
 describe("fetchLiveModels", () => {
-  test("Given a {data:[...]} envelope, when fetched, then usable entries map with static metadata defaults", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => json({ data: [{ id: "glm-live-a", display_name: "GLM Live A" }, { id: "glm-live-b" }] })),
+  test("Given a {data:[...]} envelope, when fetched, then usable entries map through the typed chat builder", async () => {
+    stubCatalog(() =>
+      json({ data: [{ id: "glm-live-a", display_name: "GLM Live A" }, { id: "glm-live-b" }] }),
     );
 
     const models = await fetchLiveModels("key-123");
@@ -45,16 +37,40 @@ describe("fetchLiveModels", () => {
   });
 
   test("Given a bare array envelope, when fetched, then usable entries map the same way", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => json([{ id: "glm-bare", display_name: "GLM Bare" }])));
+    stubCatalog(() => json([{ id: "glm-bare", display_name: "GLM Bare" }]));
 
     const models = await fetchLiveModels("key-123");
 
     expect(models).toEqual([expectedLiveModel("glm-bare", "GLM Bare")]);
   });
 
+  test("Given safe display names, when fetched, then each name is preserved byte-for-byte", async () => {
+    const names = ["GLM-5.4", "GLM-5.3-FlashX-Legal", "  padded name  ", "GLM 비전 preview", "glm lowercase"];
+    stubCatalog(() =>
+      json({ data: names.map((name, index) => ({ id: `glm-${index}`, display_name: name })) }),
+    );
+
+    const models = await fetchLiveModels("key-123");
+
+    expect(models.map((model) => model.name)).toEqual(names);
+    expect(models.map((model) => model.id)).toEqual(["glm-0", "glm-1", "glm-2", "glm-3", "glm-4"]);
+  });
+
+  test("Given a 5.4 live row, when fetched, then it keeps the shared text-only defaults (no image override)", async () => {
+    stubCatalog(() => json({ data: [{ id: "glm-5.4", display_name: "GLM-5.4" }] }));
+
+    const [model] = await fetchLiveModels("key-123");
+
+    expect(model).toEqual(expectedLiveModel("glm-5.4", "GLM-5.4"));
+    expect(model?.input).toEqual(["text"]);
+    expect(model?.contextWindow).toBe(1_000_000);
+    expect(model?.maxTokens).toBe(131_072);
+    expect(model?.reasoning).toBe(true);
+    expect(model?.cost).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+  });
+
   test("Given an api key, when fetched, then the request carries Bearer auth, Accept json, and the ZCode source headers", async () => {
-    const fetch = vi.fn(async (_input: string | URL | Request, _init?: RequestInit) => json({ data: [] }));
-    vi.stubGlobal("fetch", fetch);
+    const fetch = stubCatalog(() => json({ data: [] }));
 
     await fetchLiveModels("secret-key");
 
@@ -69,7 +85,7 @@ describe("fetchLiveModels", () => {
     expect(headerKeys).toContain("User-Agent");
   });
 
-  test("Given unsanitary ids or display names, when fetched, then unsafe entries drop silently and ids are never rewritten", async () => {
+  test("Given unsanitary ids or display names, when fetched, then unsafe entries drop silently and names fall back to the id", async () => {
     const payload = {
       data: [
         { id: "keep", display_name: "Keep Me" },
@@ -88,7 +104,7 @@ describe("fetchLiveModels", () => {
         { id: "b".repeat(200) },
       ],
     };
-    vi.stubGlobal("fetch", vi.fn(async () => json(payload)));
+    stubCatalog(() => json(payload));
 
     const models = await fetchLiveModels("key-123");
 
@@ -110,6 +126,16 @@ describe("fetchLiveModels", () => {
       " spaced ",
       "b".repeat(200),
     ]);
+    for (const [index, model] of models.entries()) {
+      const unsafeName = index >= 2;
+      if (unsafeName) expect(model.name).toBe(model.id);
+    }
+  });
+
+  test("Given a 200 error envelope, when fetched, then no rows are returned and nothing throws", async () => {
+    stubCatalog(() => json({ error: { code: 1210, message: "invalid api key" } }));
+
+    await expect(fetchLiveModels("key-123")).resolves.toEqual([]);
   });
 
   test("Given a response body over 1MB, when fetched, then reading stops once the cap is crossed", async () => {
@@ -130,10 +156,7 @@ describe("fetchLiveModels", () => {
         probe.cancelCount += 1;
       },
     });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async () => new Response(body, { status: 200, headers: { "Content-Type": "application/json" } })),
-    );
+    stubCatalog(() => new Response(body, { status: 200, headers: { "Content-Type": "application/json" } }));
 
     await expect(fetchLiveModels("key-123")).rejects.toBeInstanceOf(Error);
     expect(probe.bytesPulled).toBeGreaterThan(LIVE_MODELS_MAX_BYTES);
@@ -142,20 +165,49 @@ describe("fetchLiveModels", () => {
     expect(probe.cancelCount).toBe(1);
   });
 
+  test("Given a caller signal aborted mid-flight, when fetched, then the request signal aborts with the caller reason", async () => {
+    let requestSignal: AbortSignal | undefined;
+    const fetch = vi.fn((input: string | URL | Request, init?: RequestInit) => {
+      if (String(input) !== LIVE_MODELS_URL) throw new Error(`unexpected request: ${String(input)}`);
+      requestSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        requestSignal?.addEventListener("abort", () => reject(requestSignal?.reason), { once: true });
+      });
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    const controller = new AbortController();
+    const pending = fetchLiveModels("key-123", controller.signal);
+    const reason = new DOMException("caller aborted", "AbortError");
+    controller.abort(reason);
+
+    await expect(pending).rejects.toBe(reason);
+    expect(requestSignal?.aborted).toBe(true);
+  });
+
+  test("Given an already-aborted caller signal, when fetched, then it rejects without issuing a request", async () => {
+    const fetch = stubCatalog(() => json({ data: [{ id: "should-not-arrive" }] }));
+    const controller = new AbortController();
+    const reason = new DOMException("caller aborted early", "AbortError");
+    controller.abort(reason);
+
+    await expect(fetchLiveModels("key-123", controller.signal)).rejects.toBe(reason);
+  });
+
   test("Given a non-2xx response, when fetched, then it rejects", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => json({ error: "unauthorized" }, 401)));
+    stubCatalog(() => json({ error: "unauthorized" }, 401));
 
     await expect(fetchLiveModels("key-123")).rejects.toBeInstanceOf(Error);
   });
 
   test("Given a non-JSON body, when fetched, then it rejects", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => new Response("not-json", { status: 200 })));
+    stubCatalog(() => new Response("not-json", { status: 200 }));
 
     await expect(fetchLiveModels("key-123")).rejects.toBeInstanceOf(Error);
   });
 
   test("Given an envelope without a model array, when fetched, then no models are returned", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => json({ data: { id: "not-an-array" } })));
+    stubCatalog(() => json({ data: { id: "not-an-array" } }));
 
     await expect(fetchLiveModels("key-123")).resolves.toEqual([]);
   });

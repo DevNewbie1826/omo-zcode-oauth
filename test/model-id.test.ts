@@ -1,8 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import type { ProviderConfig } from "@code-yeongyu/senpi";
+import type { Provider, ModelsStoreEntry, RefreshModelsContext } from "@earendil-works/pi-ai";
+import { LIVE_MODELS_URL } from "../extensions/glm-zcode/live-catalog.js";
+import { MODELS_DEV_API_URL } from "../extensions/glm-zcode/models.js";
 import glmZcodeExtension from "../extensions/glm-zcode/index.js";
 
 beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(Date.UTC(2026, 10, 23));
+  vi.stubEnv("OFFLINE", undefined);
+  vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
   vi.stubEnv("ZCODE_DEVICE_ID", "test-device-1234");
   vi.stubGlobal(
     "fetch",
@@ -13,18 +19,21 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
 });
 
-function loadGlmZcode(): { hook: (event: unknown) => unknown; config: ProviderConfig } {
-  const handlers: Record<string, unknown[]> = {};
-  let config: ProviderConfig | undefined;
-  const pi = new Proxy({}, { get: (_t: any, p: any) => (p === "registerProvider" ? (_n: string, c: ProviderConfig) => { config = c; } : (p === "on" ? (e: string, h: any) => { (handlers[e] ??= []).push(h); } : () => undefined)) });
-  glmZcodeExtension(pi as Parameters<typeof glmZcodeExtension>[0]);
+function loadGlmZcode() {
+  const on = vi.fn();
+  let config: Provider | undefined;
+  glmZcodeExtension({ on, registerCommand: vi.fn(), registerProvider(p) {
+    if (typeof p === "string") throw new Error("Expected native provider");
+    config = p;
+  } });
   if (!config) throw new Error("not registered");
-  const hook = handlers["before_provider_request"]?.[0] as ((event: unknown) => unknown) | undefined;
-  if (!hook) throw new Error("before_provider_request not registered");
+  const hook = on.mock.calls.find(([name]) => name === "before_provider_request")?.[1];
+  if (typeof hook !== "function") throw new Error("before_provider_request not registered");
   return { hook, config };
 }
 
@@ -77,7 +86,7 @@ describe("official GLM model id on the wire", () => {
 
   test("Given the provider is registered, when inspected, then the static model id is still glm-5.3", () => {
     const { config } = loadGlmZcode();
-    expect(config.models?.[0]?.id).toBe("glm-5.3");
+    expect(config.getModels().map(m => m.id)).toContain("glm-5.3");
   });
 
   test("Given a glm-zcode payload, when the hook runs, then it returns the same payload object", () => {
@@ -87,4 +96,44 @@ describe("official GLM model id on the wire", () => {
     expect(result).toBe(payload);
     expect(payload.model).toBe("GLM-4.6V-FlashX");
   });
+});
+
+test("live and offline-restored catalogs supply only matching wire spellings to the hook", async () => {
+  const live = loadGlmZcode();
+  function wire(ext: ReturnType<typeof loadGlmZcode>, id: string) {
+    const payload = { model: id, metadata: { user_id: "original" } };
+    expect(ext.hook({ payload, model: { provider: "glm-zcode" } })).toBe(payload);
+    expect(payload.metadata.user_id).toBe("original");
+    return payload.model;
+  }
+  expect(wire(live, "glm-5.4")).toBe("glm-5.4");
+  expect(wire(live, "glm-5v-turbo")).toBe("GLM-5V-Turbo");
+  const rows = [
+    ["glm-5.4", "GLM-5.4"], ["glm-future", "GLM-Future"],
+    ["glm-friendly", "Vision preview"], ["glm-5.3-flashx", "GLM-5.3-FlashX"],
+  ];
+  const fetch = vi.fn(async (url: RequestInfo | URL) => {
+    if (String(url) === LIVE_MODELS_URL) return Response.json(rows.map(([id, display_name]) => ({ id, display_name })));
+    if (String(url) === MODELS_DEV_API_URL) return Response.json({});
+    throw new Error("Unexpected catalog URL");
+  });
+  vi.stubGlobal("fetch", fetch);
+  let stored: ModelsStoreEntry | undefined;
+  const publish: RefreshModelsContext["publish"] = async p => {
+    if (p.persist) stored = structuredClone(p.persist);
+    p.update?.();
+    return true;
+  };
+  const signal = new AbortController().signal;
+  await live.config.refreshModels?.({ signal, publish, allowNetwork: true, credential: { type: "api_key", key: "test" } });
+  const restored = loadGlmZcode();
+  await restored.config.refreshModels?.({ signal, publish, stored, allowNetwork: false });
+  expect(fetch.mock.calls.map(([url]) => String(url))).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
+  for (const ext of [live, restored]) {
+    expect(ext.config.getModels().map(m => m.id)).toEqual(rows.map(([id]) => id));
+    for (const [id, expected] of [["glm-5.4", "GLM-5.4"], ["glm-future", "GLM-Future"],
+      ["glm-friendly", "glm-friendly"], ["unknown", "unknown"], ["GLM-5.3-FlashX", "glm-5.3-flashx"]]) {
+      expect(wire(ext, id)).toBe(expected);
+    }
+  }
 });

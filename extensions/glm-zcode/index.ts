@@ -1,12 +1,8 @@
-import type { ExtensionAPI, ProviderConfig, ProviderModelConfig } from "@code-yeongyu/senpi";
-import type { RefreshModelsContext, SimpleStreamOptions } from "@earendil-works/pi-ai";
-import type { OAuthCredentials } from "@earendil-works/pi-ai/compat";
-import {
-  streamSimple as anthropicStreamSimple,
-  createAssistantMessageEventStream as createEventStream,
-} from "@earendil-works/pi-ai/compat";
-import { CATALOG_TTL_MS, buildZCodeSourceHeaders, catalogToPersistedModels, fetchCatalogModels, resolveZCodeAnthropicBaseUrl, storedToConfig, thinkingConfigFor } from "./models.js";
-import { fetchLiveModels } from "./live-catalog.js";
+import type { ExtensionAPI, ExtensionContext } from "@code-yeongyu/senpi";
+import { createAssistantMessageEventStream, createProvider, hasApi, type OAuthAuth, type ProviderStreams, type RefreshModelsContext } from "@earendil-works/pi-ai";
+import { stream as anthropicStream, streamSimple as anthropicStreamSimple } from "@earendil-works/pi-ai/api/anthropic-messages";
+import { CATALOG_REFRESH_INTERVAL_MS, ZCODE_PROVIDER_ID, buildZCodeSourceHeaders, resolveZCodeAnthropicBaseUrl } from "./models.js";
+import { createZCodeCatalog } from "./catalog.js";
 import { loginGlmZcode, refreshGlmZcode } from "./oauth.js";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
@@ -21,7 +17,6 @@ import {
   isOffPeakWindow,
   isTicketFresh,
   takeTicketState,
-  applyOffPeakRouting,
   ensureOffPeakTicket,
   fetchOffPeakAvailability,
   offPeakRequestHeaders,
@@ -40,84 +35,9 @@ function currentOffPeakTaskId(): string {
   return offPeakTaskId;
 }
 
-type RefreshModels = NonNullable<ProviderConfig["refreshModels"]>;
-
 // Existing consumers (and tests) import these from the extension entry point.
 export { buildZCodeSourceHeaders, osCategory } from "./models.js";
 
-// Static fallback for offline/first-run before catalog fetch.
-const MODELS = [
-  {
-    id: "glm-5.3",
-    name: "GLM-5.3",
-    reasoning: true,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 1_000_000,
-    maxTokens: 131_072,
-    baseUrl: resolveZCodeAnthropicBaseUrl(),
-    ...thinkingConfigFor(undefined),
-  },
-] satisfies ProviderModelConfig[];
-
-/** Resolves the effective API key from the type-tagged credential union; missing/empty means none. */
-function credentialApiKey(credential: RefreshModelsContext["credential"]): string | undefined {
-  switch (credential?.type) {
-    case "oauth":
-      return credential.access || undefined;
-    case "api_key":
-      return credential.key || undefined;
-    case undefined:
-      return undefined;
-    default: {
-      const unhandled: never = credential;
-      throw new Error(`unsupported credential type: ${String(unhandled)}`);
-    }
-  }
-}
-
-/** Whether the stored snapshot is fresh enough to skip both catalogs (force always bypasses). */
-function hasFreshSnapshot(context: RefreshModelsContext): boolean {
-  const checkedAt = context.stored?.checkedAt;
-  return !context.force && typeof checkedAt === "number" && Date.now() - checkedAt < CATALOG_TTL_MS;
-}
-
-function restoreStored(context: RefreshModelsContext): ProviderModelConfig[] | undefined {
-  const restored = storedToConfig(context.stored);
-  return restored.length > 0 ? restored : undefined;
-}
-
-/** The pre-existing models.dev path: TTL/stored/static behavior, unchanged. */
-async function refreshCatalogDev(context: RefreshModelsContext): Promise<ProviderModelConfig[] | undefined> {
-  // Offline or first-run-without-store: keep static fallback
-  if (!context.allowNetwork || context.signal.aborted) return restoreStored(context);
-  // TTL: skip network when the snapshot is fresh (unless forced)
-  if (hasFreshSnapshot(context)) return restoreStored(context);
-  try {
-    const models = await fetchCatalogModels(context.signal);
-    if (models.length === 0) return restoreStored(context);
-    await context.publish({
-      persist: {
-        models: catalogToPersistedModels(models),
-        checkedAt: Date.now(),
-      },
-    });
-    return models;
-  } catch {
-    // Never throw from refreshModels: graceful degradation to stored/static
-    return restoreStored(context);
-  }
-}
-
-/**
- * Hybrid catalog: with a credential and network access, prefer the authenticated live
- * /v1/models endpoint; any live failure (network, non-2xx, bad shape, empty) degrades to
- * the models.dev path verbatim. Without a credential only models.dev runs.
- *
- * Cache note: ModelsStoreEntry has no typed credential-fingerprint slot, so the live path
- * honors the shared 24h TTL and only context.force bypasses it. A re-login under a
- * different account may therefore serve a stale live snapshot for up to the TTL.
- */
 let offPeakTransportOverride: boolean | undefined;
 
 /** Transport helpers are statically imported (always available); the override remains a test hook simulating unavailability. */
@@ -127,12 +47,11 @@ function offPeakTransportReady(): boolean {
 
 /** The per-model off-peak route decision: transport + window + entitlement + a usable JWT. */
 async function offPeakActiveFor(context: RefreshModelsContext): Promise<boolean> {
-  if (process.env.ZCODE_OFFPEAK_ENABLE !== "1") return false;
-  if (!offPeakTransportReady()) return false;
+  if (!ticketRouteEnabled()) return false;
   if (!isOffPeakWindow(offPeakTestClock ?? new Date()) || !context.allowNetwork || context.signal.aborted) return false;
   if (context.credential?.type !== "oauth") return false;
   const jwt = typeof context.credential.zcodeJwtToken === "string" ? context.credential.zcodeJwtToken : undefined;
-  const apiKey = credentialApiKey(context.credential);
+  const apiKey = context.credential.access;
   if (!jwt || !apiKey) return false;
   if (!(await fetchOffPeakAvailability(jwt, apiKey))) return false;
   preTakenTicket = undefined;
@@ -146,98 +65,58 @@ async function offPeakActiveFor(context: RefreshModelsContext): Promise<boolean>
   return true;
 }
 
-async function refreshModels(context: Parameters<RefreshModels>[0]): ReturnType<RefreshModels>;
-async function refreshModels(context: RefreshModelsContext): Promise<ProviderModelConfig[] | undefined> {
-  const apiKey = credentialApiKey(context.credential);
-  if (context.allowNetwork && !context.signal.aborted && apiKey !== undefined && !hasFreshSnapshot(context)) {
-    try {
-      const live = await fetchLiveModels(apiKey, context.signal);
-      if (live.length > 0) {
-        const routed = applyOffPeakRouting(live, await offPeakActiveFor(context));
-        await context.publish({
-          persist: {
-            models: catalogToPersistedModels(routed),
-            checkedAt: Date.now(),
-          },
-        });
-        return routed;
-      }
-    } catch (error) {
-      console.debug(
-        `glm-zcode: live catalog unavailable, falling back to models.dev (${
-          error instanceof Error ? error.message : String(error)
-        })`,
-      );
-    }
-  }
-  const fromDev = await refreshCatalogDev(context);
-  return fromDev === undefined ? undefined : applyOffPeakRouting(fromDev, await offPeakActiveFor(context));
+function ticketRouteEnabled(): boolean {
+  return process.env.ZCODE_OFFPEAK_ENABLE === "1" && offPeakTransportReady() && !process.env.ZCODE_ANTHROPIC_BASE_URL?.trim();
 }
 
-/**
- * Request-time endpoint selection. The headers hook can only strip the
- * marker (and skip signing); this streamSimple override is the one layer
- * that controls the actual destination: a fresh ticket inside the window
- * sends the request to the off-peak gateway with JWT auth, anything else
- * falls back to the signed ultra gateway with the normal API key.
- */
-const offPeakStreamSimple = ((model: Parameters<NonNullable<ProviderConfig["streamSimple"]>>[0], context: Parameters<NonNullable<ProviderConfig["streamSimple"]>>[1], options?: SimpleStreamOptions) => {
-  const outer = createEventStream() as unknown as ReturnType<NonNullable<ProviderConfig["streamSimple"]>>;
-  if (isOffPeakRouted(model)) {
-    const now = offPeakTestClock ?? new Date();
-    const apiKey = options?.apiKey ?? "";
-    const credential = cachedCredential && cachedCredential.apiKey === apiKey ? cachedCredential : undefined;
-    const waitFresh = (promise: Promise<string | undefined>) =>
-      Promise.race([promise, new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), TICKET_REQUEST_WAIT_MS))]);
-    const offPeakEnabled = process.env.ZCODE_OFFPEAK_ENABLE === "1";
-    const acquire = offPeakEnabled && isTicketFresh(preTakenTicket, now, apiKey, credential?.jwt ?? "")
-      ? Promise.resolve(preTakenTicket!.ticketId)
-      : offPeakEnabled && credential && isOffPeakWindow(now)
-        ? waitFresh(
-            (pendingTicket && pendingTicket.apiKey === apiKey && pendingTicket.jwt === credential.jwt
-              ? pendingTicket.promise
-              : startPendingTicket(credential.jwt, apiKey)
-            ).then((ticketId) => {
-              if (ticketId) preTakenTicket = takeTicketState(credential.jwt, apiKey, ticketId, offPeakTestClock ?? new Date());
-              return ticketId;
-            }),
-          )
-        : Promise.resolve(undefined);
-    acquire
-      .then((ticketId) => {
-        const stillInWindow = isOffPeakWindow(offPeakTestClock ?? new Date());
-        const fallbackModel = { ...model, baseUrl: resolveZCodeAnthropicBaseUrl() };
-        if (ticketId && credential && stillInWindow && process.env.ZCODE_OFFPEAK_ENABLE === "1") {
-          const stripped: Record<string, string | null> = { ...(options?.headers as Record<string, string | null> ?? {}) };
-          for (const header of SIGNATURE_HEADERS) delete stripped[header];
-          return anthropicStreamSimple(
-            { ...fallbackModel, baseUrl: OFFPEAK_BASE_URL } as Parameters<NonNullable<typeof anthropicStreamSimple>>[0],
-            context,
-            {
-              ...options,
-              headers: { ...stripped, ...offPeakRequestHeaders(credential.jwt, apiKey, ticketId) },
-            },
-          );
-        }
-        const signingInput: Record<string, string | null> = { ...(options?.headers as Record<string, string | null> ?? {}), Authorization: `Bearer ${apiKey}` };
-        return resolveZCodeSigningHeaders(signingInput).then((signed) =>
-          anthropicStreamSimple(fallbackModel as Parameters<NonNullable<typeof anthropicStreamSimple>>[0], context, {
-            ...options,
-            headers: { ...(options?.headers ?? {}), ...signed },
-          }),
-        );
-      })
-      .then((inner) => {
-        (async () => {
-          for await (const event of inner) outer.push(event);
-          outer.end(await inner.result());
-        })().catch((error) => outer.fail(error));
-      })
-      .catch((error) => outer.fail(error));
+async function requestTicket(apiKey: string, jwt: string): Promise<string | undefined> {
+  const now = offPeakTestClock ?? new Date();
+  if (!isOffPeakWindow(now) || !ticketRouteEnabled()) return undefined;
+  if (preTakenTicket && isTicketFresh(preTakenTicket, now, apiKey, jwt)) return preTakenTicket.ticketId;
+  const pending = pendingTicket?.apiKey === apiKey && pendingTicket.jwt === jwt
+    ? pendingTicket.promise : startPendingTicket(jwt, apiKey);
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    const id = await Promise.race([pending, new Promise<undefined>(resolve => {
+      timer = setTimeout(() => resolve(undefined), TICKET_REQUEST_WAIT_MS).unref();
+    })]);
+    if (id && cachedCredential?.apiKey === apiKey && cachedCredential.jwt === jwt) {
+      preTakenTicket = takeTicketState(jwt, apiKey, id, offPeakTestClock ?? new Date());
+    }
+    return id;
+  } finally { clearTimeout(timer); }
+}
+
+const streams: ProviderStreams = {
+  stream(model, context, options) {
+    if (!hasApi(model, "anthropic-messages")) throw new Error("Expected an Anthropic chat model");
+    // Full streams never use a ticket; the headers hook already signed the normal request.
+    return anthropicStream(isOffPeakRouted(model) ? { ...model, baseUrl: resolveZCodeAnthropicBaseUrl() } : model, context, options);
+  },
+  streamSimple(model, context, options) {
+    if (!hasApi(model, "anthropic-messages")) throw new Error("Expected an Anthropic chat model");
+    if (!isOffPeakRouted(model)) return anthropicStreamSimple(model, context, options);
+    const outer = createAssistantMessageEventStream();
+    void (async () => {
+      const key = options?.apiKey ?? "";
+      const jwt = cachedCredential?.apiKey === key ? cachedCredential.jwt : undefined;
+      const id = jwt ? await requestTicket(key, jwt) : undefined;
+      const headers = { ...options?.headers };
+      let baseUrl = resolveZCodeAnthropicBaseUrl();
+      if (id && jwt && cachedCredential?.apiKey === key && cachedCredential.jwt === jwt && ticketRouteEnabled() && isOffPeakWindow(offPeakTestClock ?? new Date())) {
+        baseUrl = OFFPEAK_BASE_URL;
+        for (const header of SIGNATURE_HEADERS) delete headers[header];
+        Object.assign(headers, offPeakRequestHeaders(jwt, key, id));
+      } else if (!headers["X-Client-Sig"]) {
+        Object.assign(headers, await resolveZCodeSigningHeaders({ ...headers, Authorization: "Bearer " + key }));
+      }
+      const inner = anthropicStreamSimple({ ...model, baseUrl }, context, { ...options, headers });
+      for await (const event of inner) outer.push(event);
+      outer.end(await inner.result());
+    })().catch(error => outer.fail(error));
     return outer;
-  }
-  return anthropicStreamSimple(model as Parameters<NonNullable<typeof anthropicStreamSimple>>[0], context, options);
-}) as unknown as NonNullable<ProviderConfig["streamSimple"]>;
+  },
+};
 
 /** Starts a request-time acquisition; the pending entry always clears on settlement, success included. */
 function startPendingTicket(jwt: string, apiKey: string): Promise<string | undefined> {
@@ -331,44 +210,102 @@ function deviceIdentityMetadata(): { user_id: string } | undefined {
   return { user_id: JSON.stringify({ device_id: deviceId, account_uuid: "", session_id: zcodeSessionId() }) };
 }
 
-/** ZCode 4.0.0 official GLM model-ID spelling; unknown IDs pass through. */
-const OFFICIAL_GLM_MODEL_IDS = [
-  "GLM-5.3",
-  "GLM-5.3-Flash",
-  "GLM-5V-Turbo",
-  "GLM-5.2",
-  "GLM-5.1",
-  "GLM-5.1-Highspeed",
-  "GLM-5",
-  "GLM-5-Turbo",
-  "GLM-4.7",
-  "GLM-4.7-FlashX",
-  "GLM-4.7-Flash",
-  "GLM-4.6",
-  "GLM-4.5-Air",
-  "GLM-4.5",
-  "GLM-4.6V",
-  "GLM-4.6V-Flash",
-  "GLM-4.6V-FlashX",
-  "GLM-4.1V-Thinking-FlashX",
-  "GLM-4.1V-Thinking-Flash",
-  "GLM-4-FlashX-250414",
-  "GLM-4-Flash-250414",
-  "GLM-4V-Flash",
-] as const;
+const oauth: OAuthAuth = {
+  name: "GLM ZCode",
+  async login(interaction) {
+    const credential = await loginGlmZcode({
+      onAuth: info => interaction.notify({ type: "auth_url", ...info }),
+      onDeviceCode: info => interaction.notify({ type: "device_code", ...info }),
+      onProgress: message => interaction.notify({ type: "progress", message }),
+      onPrompt: prompt => interaction.prompt({ ...prompt, type: prompt.type ?? "text" }),
+      onManualCodeInput: () => interaction.prompt({ type: "manual_code", message: "Paste the ZCode redirect URL" }),
+      onSelect: prompt => interaction.prompt({ type: "select", ...prompt }),
+      signal: interaction.signal,
+    });
+    return { ...credential, type: "oauth" };
+  },
+  refresh: async (credential, signal) => ({ ...await refreshGlmZcode(credential, signal), type: "oauth" }),
+  async toAuth({ access, zcodeJwtToken }) {
+    const jwt = typeof zcodeJwtToken === "string" && zcodeJwtToken ? zcodeJwtToken : undefined;
+    cachedCredential = jwt ? { apiKey: access, jwt } : undefined;
+    if (preTakenTicket && (preTakenTicket.apiKey !== access || preTakenTicket.jwt !== jwt)) preTakenTicket = undefined;
+    return { apiKey: access, headers: { ...buildZCodeSourceHeaders(), Authorization: "Bearer " + access } };
+  },
+};
 
-const officialGlmModelByLower = new Map(OFFICIAL_GLM_MODEL_IDS.map((id) => [id.toLowerCase(), id]));
-
-function officialGlmModelId(id: string): string {
-  return officialGlmModelByLower.get(id.toLowerCase()) ?? id;
+async function refreshCatalog(ctx: ExtensionContext, force: boolean): Promise<boolean> {
+  try {
+    const result = await ctx.modelRegistry.refresh({ providers: [ZCODE_PROVIDER_ID], force,
+      allowNetwork: process.env.OFFLINE === undefined, signal: AbortSignal.timeout(15_000) });
+    return !result.aborted && result.errors.size === 0;
+  } catch {
+    // Registry errors may contain credentials. Never forward their messages to the UI.
+    return false;
+  }
 }
 
-export default function glmZcodeExtension(pi: ExtensionAPI): void {
-  defaultDeviceId ??= getOrCreateDeviceMid();
+type GlmExtensionAPI = Pick<ExtensionAPI, "on" | "registerProvider" | "registerCommand">;
+
+function registerCatalogTriggers(pi: GlmExtensionAPI, catalog: ReturnType<typeof createZCodeCatalog>): void {
+  let stop: (() => void) | undefined;
+  pi.on("session_start", (_event, ctx) => {
+    if (stop || process.env.OFFLINE !== undefined) return;
+    let cancelTimer: (() => void) | undefined;
+    let active = true;
+    stop = () => { active = false; cancelTimer?.(); };
+
+    function schedule() {
+      cancelTimer?.();
+      if (!active || process.env.OFFLINE !== undefined) return;
+      const age = catalog.checkedAt === undefined ? 0 : Date.now() - catalog.checkedAt;
+      if (age > 0 && age < CATALOG_REFRESH_INTERVAL_MS) {
+        const timer = setTimeout(tick, CATALOG_REFRESH_INTERVAL_MS - age).unref();
+        cancelTimer = () => clearTimeout(timer);
+      } else {
+        const timer = setInterval(tick, CATALOG_REFRESH_INTERVAL_MS).unref();
+        cancelTimer = () => clearInterval(timer);
+      }
+    }
+    function tick() {
+      if (!active || process.env.OFFLINE !== undefined || catalog.isFresh()) return schedule();
+      cancelTimer?.();
+      void refreshCatalog(ctx, false).then(ok => {
+        if (!active) return;
+        if (!ok && ctx.hasUI) ctx.ui.notify("GLM ZCode catalog refresh failed; retained cached models.", "warning");
+        schedule(); // Schedule from the accepted publication, not the start of this GET.
+      });
+    }
+    if (catalog.isFresh()) schedule();
+    else tick();
+  });
+  pi.on("session_shutdown", () => { stop?.(); stop = undefined; });
+  pi.registerCommand("glm-models", {
+    description: "Refresh and list GLM ZCode models", argumentHint: "[--force]",
+    async handler(args, ctx) {
+      const arg = args.trim();
+      if (arg && arg !== "--force") {
+        if (ctx.hasUI) ctx.ui.notify("Usage: /glm-models [--force]", "warning");
+        return;
+      }
+      const offline = process.env.OFFLINE !== undefined;
+      const ok = await refreshCatalog(ctx, arg === "--force");
+      if (!ctx.hasUI) return;
+      const ids = ctx.modelRegistry.getAll().filter(m => m.provider === ZCODE_PROVIDER_ID).map(m => m.id);
+      const checked = new Date(catalog.checkedAt ?? NaN);
+      const status = [offline && "offline", !ok && "refresh failed; retained cached models"].filter(Boolean).join("; ");
+      ctx.ui.notify(["GLM ZCode" + (status ? " (" + status + ")" : ""),
+        "checkedAt: " + (Number.isNaN(checked.getTime()) ? "never" : checked.toISOString()), ...ids].join("\n"), ok ? "info" : "error");
+    },
+  });
+}
+
+export default function glmZcodeExtension(pi: GlmExtensionAPI): void {
+  if (!printableAsciiEnv("ZCODE_DEVICE_ID")) defaultDeviceId ??= getOrCreateDeviceMid();
+  const catalog = createZCodeCatalog(offPeakActiveFor);
   pi.on("before_provider_request", (event) => {
     if (event.model?.provider !== "glm-zcode" || event.payload == null || typeof event.payload !== "object") return event.payload;
     const payload = event.payload as { model?: unknown; metadata?: { user_id?: unknown } & Record<string, unknown> };
-    if (typeof payload.model === "string") payload.model = officialGlmModelId(payload.model);
+    if (typeof payload.model === "string") payload.model = catalog.officialGlmModelId(payload.model);
     if (payload.metadata?.user_id !== undefined) return event.payload;
     const metadata = deviceIdentityMetadata();
     if (!metadata) return event.payload;
@@ -378,28 +315,8 @@ export default function glmZcodeExtension(pi: ExtensionAPI): void {
   pi.on("before_provider_headers", async (event) => {
     Object.assign(event.headers, await resolveZCodeSigningHeaders(event.headers));
   });
-    defaultDeviceId ??= getOrCreateDeviceMid();
-
-pi.registerProvider("glm-zcode", {
-    name: "GLM ZCode (unofficial)",
-    api: "anthropic-messages",
-    authHeader: true,
-    headers: buildZCodeSourceHeaders(),
-    models: MODELS.map((model) => ({ ...model, baseUrl: resolveZCodeAnthropicBaseUrl() })),
-    ...(offPeakTransportReady() ? { streamSimple: offPeakStreamSimple } : {}),
-    refreshModels,
-    oauth: {
-      name: "GLM ZCode (unofficial)",
-      login: loginGlmZcode,
-      refreshToken: refreshGlmZcode,
-      getApiKey: (credentials: OAuthCredentials) => {
-        const jwt = typeof credentials.zcodeJwtToken === "string" && credentials.zcodeJwtToken ? credentials.zcodeJwtToken : undefined;
-        cachedCredential = jwt ? { apiKey: credentials.access, jwt } : undefined;
-        if (preTakenTicket && (preTakenTicket.apiKey !== credentials.access || preTakenTicket.jwt !== (jwt ?? ""))) {
-          preTakenTicket = undefined;
-        }
-        return credentials.access;
-      },
-    },
-  });
+  const base = createProvider({ id: ZCODE_PROVIDER_ID, name: "GLM ZCode", baseUrl: resolveZCodeAnthropicBaseUrl(),
+    auth: { oauth }, models: catalog.getModels(), api: streams });
+  pi.registerProvider({ ...base, getModels: catalog.getModels, getAllModels: catalog.getModels, refreshModels: catalog.refresh });
+  registerCatalogTriggers(pi, catalog);
 }
