@@ -15,7 +15,8 @@ const VERSION_PATTERN = /^(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))*$/;
 
 function normalizeVersion(raw) {
   if (typeof raw !== "string") return null;
-  const value = raw.trim().replace(/^v/, "");
+  // No trimming: any surrounding character (including Unicode spaces) makes the version unreadable.
+  const value = raw.replace(/^v/, "");
   return VERSION_PATTERN.test(value) ? value : null;
 }
 
@@ -32,11 +33,13 @@ function readVersionLine(yml) {
 }
 
 function compareVersions(a, b) {
-  const pa = a.split(".").map(Number);
-  const pb = b.split(".").map(Number);
+  // BigInt components: large numbers must not round to equal values.
+  const pa = a.split(".").map(BigInt);
+  const pb = b.split(".").map(BigInt);
   for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
-    if (d !== 0) return Math.sign(d);
+    const x = pa[i] ?? 0n;
+    const y = pb[i] ?? 0n;
+    if (x !== y) return x < y ? -1 : 1;
   }
   return 0;
 }
@@ -93,6 +96,9 @@ try {
   if (delta > 0) {
     console.log(`AHEAD: plugin default ${current} is newer than release ${github.version}`);
     process.exit(2);
+  }
+  if (current !== github.version) {
+    throw new Error(`plugin default ${current} and release ${github.version} are equal only after normalization`);
   }
   console.log("UP TO DATE");
 } catch (error) {
