@@ -204,7 +204,8 @@ export function createZCodeCatalog(
         } }))) return;
       }
       if (!context.allowNetwork || !isCurrent() || process.env.OFFLINE !== undefined) return;
-      if (!context.force && restored.length && isFresh(checkedAt)) return;
+      // Skip only when the visible catalog is fresh too: a declined store snapshot cannot defer a due check.
+      if (!context.force && restored.length && isFresh(checkedAt) && isFresh(state.checkedAt)) return;
 
       const credential = context.credential;
       const owner = credential?.type === "oauth" && credential.access &&

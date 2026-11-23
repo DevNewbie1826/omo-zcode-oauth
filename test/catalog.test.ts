@@ -160,6 +160,19 @@ test.each([
   expect(c.checkedAt).toBe(due ? now : now - age);
 });
 
+test("a declined fresh store snapshot does not defer a due check of the visible catalog", async () => {
+  const c = createZCodeCatalog();
+  // Visible snapshot stamped in the future (clock correction): accepted but never fresh.
+  await c.refresh({ ...host({ stored: { models: [old], checkedAt: now + 300_000 } }).ctx, allowNetwork: false });
+  expect(c.isFresh()).toBe(false);
+  // A fresh store snapshot with a lower timestamp is declined by the monotonic restore...
+  regularSources();
+  await c.refresh(host({ stored: { models: [old], checkedAt: now } }).ctx);
+  // ...so the due visible catalog must still reach discovery.
+  expect(requests.map(r => r.url)).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
+  expect(ids(c)).toEqual(["new", "glm-5.4"]);
+});
+
 test.each(["OFFLINE", "aborted", "cache-only"])("force cannot override %s", async mode => {
   const c = createZCodeCatalog();
   if (mode === "OFFLINE") vi.stubEnv("OFFLINE", "");
