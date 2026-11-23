@@ -1,13 +1,22 @@
 #!/usr/bin/env node
 // Compares the plugin's default ZCODE_APP_VERSION with the latest ZCode release.
 // Sources: GitHub Releases (zai-org/ZCode) and the public CDN latest.yml for that tag.
-// Exit codes: 0 = up to date, 1 = plugin default is behind, 2 = a source could not be read.
+// Both sources must yield a valid version and agree with each other.
+// Exit codes: 0 = up to date, 1 = plugin default is behind, 2 = a source could not be read or the sources disagree.
 import { readFile } from "node:fs/promises";
 
 const MODELS_TS = new URL("../extensions/glm-zcode/models.ts", import.meta.url);
 const GITHUB_LATEST = "https://api.github.com/repos/zai-org/ZCode/releases/latest";
 const CDN_LATEST_YML = (version) =>
   `https://cdn-zcode.z.ai/zcode/electron/releases/${version}/macos-arm64/latest.yml`;
+
+const VERSION_PATTERN = /^\d+(?:\.\d+)*$/;
+
+function normalizeVersion(raw) {
+  if (typeof raw !== "string") return null;
+  const value = raw.trim().replace(/^v/, "");
+  return VERSION_PATTERN.test(value) ? value : null;
+}
 
 function compareVersions(a, b) {
   const pa = a.split(".").map(Number);
@@ -23,7 +32,9 @@ async function pluginDefaultVersion() {
   const source = await readFile(MODELS_TS, "utf8");
   const match = source.match(/process\.env\.ZCODE_APP_VERSION \|\| "([^"]+)"/);
   if (!match) throw new Error("default ZCODE_APP_VERSION not found in models.ts");
-  return match[1];
+  const version = normalizeVersion(match[1]);
+  if (!version) throw new Error(`default ZCODE_APP_VERSION is not a valid version: ${match[1]}`);
+  return version;
 }
 
 async function latestGitHubRelease() {
@@ -32,15 +43,20 @@ async function latestGitHubRelease() {
   const res = await fetch(GITHUB_LATEST, { headers, signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`GitHub releases: HTTP ${res.status}`);
   const body = await res.json();
-  return { version: String(body.tag_name).replace(/^v/, ""), publishedAt: body.published_at };
+  const version = normalizeVersion(body?.tag_name);
+  if (!version) throw new Error(`GitHub releases: missing or invalid tag_name ${JSON.stringify(body?.tag_name)}`);
+  return { version, publishedAt: body.published_at };
 }
 
 async function cdnRelease(version) {
   const res = await fetch(CDN_LATEST_YML(version), { signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`CDN latest.yml for ${version}: HTTP ${res.status}`);
   const yml = await res.text();
+  const rawVersion = yml.match(/^version:\s*(\S+)/m)?.[1];
+  const cdnVersion = normalizeVersion(rawVersion);
+  if (!cdnVersion) throw new Error(`CDN latest.yml for ${version}: missing or invalid version ${JSON.stringify(rawVersion)}`);
   return {
-    version: yml.match(/^version:\s*(\S+)/m)?.[1],
+    version: cdnVersion,
     releaseDate: yml.match(/^releaseDate:\s*'?([^'\n]+)'?/m)?.[1],
   };
 }
@@ -50,11 +66,19 @@ try {
   const github = await latestGitHubRelease();
   const cdn = await cdnRelease(github.version);
   console.log(`plugin default : ${current}`);
-  console.log(`GitHub latest  : ${github.version} (published ${github.publishedAt})`);
-  console.log(`CDN latest.yml : ${cdn.version ?? "?"} (releaseDate ${cdn.releaseDate ?? "?"})`);
-  if (compareVersions(current, github.version) < 0) {
+  console.log(`GitHub latest  : ${github.version} (published ${github.publishedAt ?? "?"})`);
+  console.log(`CDN latest.yml : ${cdn.version} (releaseDate ${cdn.releaseDate ?? "?"})`);
+  if (compareVersions(github.version, cdn.version) !== 0) {
+    throw new Error(`release sources disagree: GitHub ${github.version}, CDN ${cdn.version}`);
+  }
+  const delta = compareVersions(current, github.version);
+  if (delta < 0) {
     console.log(`BEHIND: bump ZCODE_APP_VERSION ${current} -> ${github.version} after a protocol diff`);
     process.exit(1);
+  }
+  if (delta > 0) {
+    console.log(`AHEAD: plugin default ${current} is newer than release ${github.version}`);
+    process.exit(0);
   }
   console.log("UP TO DATE");
 } catch (error) {
