@@ -307,7 +307,7 @@ function registerCatalogTriggers(pi: GlmExtensionAPI, catalog: ReturnType<typeof
 export default function glmZcodeExtension(pi: GlmExtensionAPI): void {
   if (!printableAsciiEnv("ZCODE_DEVICE_ID")) defaultDeviceId ??= getOrCreateDeviceMid();
   const session = { controller: new AbortController() };
-  const catalog = createZCodeCatalog(context => offPeakActiveFor(context, session.controller.signal));
+  const catalog = createZCodeCatalog(offPeakActiveFor, () => session.controller.signal);
   pi.on("before_provider_request", (event) => {
     if (event.model?.provider !== "glm-zcode" || event.payload == null || typeof event.payload !== "object") return event.payload;
     const payload = event.payload as { model?: unknown; metadata?: { user_id?: unknown } & Record<string, unknown> };
@@ -324,6 +324,6 @@ export default function glmZcodeExtension(pi: GlmExtensionAPI): void {
   const base = createProvider({ id: ZCODE_PROVIDER_ID, name: "GLM ZCode", baseUrl: resolveZCodeAnthropicBaseUrl(),
     auth: { oauth }, models: catalog.getModels(), api: streams(session) });
   pi.registerProvider({ ...base, getModels: catalog.getModels, getAllModels: catalog.getModels,
-    refreshModels: ctx => catalog.refresh({ ...ctx, signal: AbortSignal.any([ctx.signal, session.controller.signal]) }, triggerDeadline.getStore()) });
+    refreshModels: ctx => catalog.refresh(ctx, triggerDeadline.getStore()) });
   registerCatalogTriggers(pi, catalog, session);
 }

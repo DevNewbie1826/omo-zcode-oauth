@@ -24,7 +24,7 @@ interface Snapshot {
   readonly current: readonly Model<"anthropic-messages">[];
   readonly wireNames: ReadonlyMap<string, string>;
   readonly checkedAt?: number;
-  readonly route?: { access: string; jwt: string; canonical: ModelsStoreEntry };
+  readonly route?: { session: AbortSignal; access: string; jwt: string; canonical: ModelsStoreEntry };
 }
 
 function nativeModels(rows: ZCodeChatModelConfig[], offPeak: boolean): Snapshot["current"] {
@@ -62,23 +62,47 @@ function codingPlanRows(payload: unknown): ZCodeChatModelConfig[] {
     }));
 }
 
-async function discover({ credential, signal }: RefreshModelsContext, deadline: number): Promise<ZCodeChatModelConfig[]> {
+async function discover(
+  { credential, signal }: RefreshModelsContext,
+  deadline: number,
+  checkOffPeak: (signal: AbortSignal) => Promise<boolean> | undefined,
+): Promise<{ rows: ZCodeChatModelConfig[]; offPeak: boolean }> {
   const key = credential?.type === "oauth" ? credential.access : credential?.key;
   const live = key?.trim() ? await fetchLiveModels(key, signal).catch(() => []) : [];
-  if (signal.aborted) return [];
-  // Spend at most half the remaining trigger time on optional metadata; keep time to publish live rows.
-  const remaining = Math.max(0, deadline - Date.now());
-  const devSignal = live.length ? AbortSignal.any([signal, AbortSignal.timeout(Math.floor(remaining / 2))]) : signal;
-  let payload: unknown;
+  if (signal.aborted) return { rows: [], offPeak: false };
+  // Without live rows models.dev supplies membership, so this read is not optional.
+  const rows = live.length ? live : codingPlanRows(await fetchModelsDevPayload(signal).catch(() => undefined));
+  const budget = Math.floor((deadline - Date.now()) / 2);
+  if (!rows.length || signal.aborted || budget <= 0) return { rows, offPeak: false };
+
+  // Metadata and entitlement share one cutoff, leaving the rest of the trigger budget for publish.
+  const optional = new AbortController();
+  const optionalSignal = AbortSignal.any([signal, optional.signal]);
+  const timer = setTimeout(() => optional.abort(), budget).unref();
+  let onAbort: (() => void) | undefined;
+  const cutoff = new Promise<undefined>(resolve => {
+    onAbort = () => resolve(undefined);
+    optionalSignal.addEventListener("abort", onAbort, { once: true });
+  });
   try {
-    payload = await fetchModelsDevPayload(devSignal);
-  } catch {
-    return live;
+    // Race each result independently: a hung read must not hide the other stage's result.
+    const metadata = live.length ? fetchModelsDevPayload(optionalSignal).catch(() => undefined) : undefined;
+    const [payload, offPeak] = await Promise.all([
+      Promise.race([metadata, cutoff]),
+      Promise.race([checkOffPeak(optionalSignal), cutoff]),
+    ]);
+    return { rows: payload === undefined ? rows : mergeChatMetadata(rows, parseModelsDevMetadata(payload)), offPeak: offPeak ?? false };
+  } finally {
+    clearTimeout(timer);
+    if (onAbort) optionalSignal.removeEventListener("abort", onAbort);
   }
-  return live.length ? mergeChatMetadata(live, parseModelsDevMetadata(payload)) : codingPlanRows(payload);
 }
 
-export function createZCodeCatalog(offPeakActiveFor?: (context: RefreshModelsContext) => Promise<boolean>) {
+export function createZCodeCatalog(
+  offPeakActiveFor?: (context: RefreshModelsContext, session: AbortSignal) => Promise<boolean>,
+  getSessionSignal?: () => AbortSignal,
+) {
+  const standaloneSession = new AbortController().signal;
   let state: Snapshot = { current: nativeModels(zcodeFallbackChatModels(), false), wireNames: new Map() };
   return {
     getModels: () => state.current,
@@ -91,7 +115,10 @@ export function createZCodeCatalog(offPeakActiveFor?: (context: RefreshModelsCon
       const lower = id.toLowerCase();
       return appWireNames.get(lower) ?? state.wireNames.get(lower) ?? id;
     },
-    async refresh(context: RefreshModelsContext, deadline = Date.now() + CATALOG_TRIGGER_TIMEOUT_MS): Promise<void> {
+    async refresh(ctx: RefreshModelsContext, deadline = Date.now() + CATALOG_TRIGGER_TIMEOUT_MS): Promise<void> {
+      // Capture the session once; this signal's identity is also the route's generation token.
+      const session = getSessionSignal?.() ?? standaloneSession;
+      const context = { ...ctx, signal: AbortSignal.any([ctx.signal, session]) };
       const { stored, signal } = context;
       if (signal.aborted) return;
       const restored = stored && Array.isArray(stored.models)
@@ -104,30 +131,31 @@ export function createZCodeCatalog(offPeakActiveFor?: (context: RefreshModelsCon
         // The host restores a clone even on the same instance before each online check.
         const route = state.route;
         const credential = context.credential;
-        const sameRoute = route && credential?.type === "oauth" && credential.access === route.access &&
+        const sameRoute = route?.session === session && credential?.type === "oauth" && credential.access === route.access &&
           credential.zcodeJwtToken === route.jwt && isFresh(checkedAt) && checkedAt === state.checkedAt &&
           isDeepStrictEqual(stored?.models, route.canonical.models);
-        const candidate = sameRoute ? state : snapshot(restored, checkedAt);
-        if (!(await context.publish({ update: () => { state = candidate; } }))) return;
+        const canonical = snapshot(restored, checkedAt);
+        const candidate = sameRoute ? state : canonical;
+        if (!(await context.publish({ update: () => { state = session.aborted ? canonical : candidate; } }))) return;
       }
       if (!context.allowNetwork || signal.aborted || process.env.OFFLINE !== undefined) return;
       if (!context.force && restored.length && isFresh(checkedAt)) return;
 
-      const rows = await discover(context, deadline);
+      const { rows, offPeak } = await discover(context, deadline,
+        optionalSignal => offPeakActiveFor?.({ ...context, signal: optionalSignal }, session));
       if (!rows.length || signal.aborted) return;
-      const offPeak = await offPeakActiveFor?.(context) ?? false;
-      if (signal.aborted) return;
       const now = Date.now();
       const persist = { models: catalogToPersistedModels(rows), checkedAt: now };
       const credential = context.credential;
       const route = offPeak && credential?.type === "oauth" && typeof credential.zcodeJwtToken === "string"
-        ? { access: credential.access, jwt: credential.zcodeJwtToken, canonical: persist } : undefined;
-      const candidate = { ...snapshot(rows, now, offPeak), route };
-      // The host owns generation/abort checks and writes before invoking update.
+        ? { session, access: credential.access, jwt: credential.zcodeJwtToken, canonical: persist } : undefined;
+      const canonical = snapshot(rows, now);
+      const candidate = route ? { ...snapshot(rows, now, true), route } : canonical;
+      // A host-started publish checks its own signal after writing, not the session signal.
       // Do not catch a failed write as a source failure or retry with different rows.
       await context.publish({
         persist,
-        update: () => { state = candidate; },
+        update: () => { state = session.aborted ? canonical : candidate; },
       });
     },
   };

@@ -812,11 +812,15 @@ describe("non-routed passthrough wire", () => {
     const cipher = await cipherFixture();
     const wire: WireEntry[] = [];
     const auxiliary: string[] = [];
+    const unexpectedAuxiliary: string[] = [];
     vi.stubGlobal(
       "fetch",
       wireFetch(wire, (url) => {
-        if (url.startsWith(TICKET_BASE)) throw new Error(`unexpected ticket request: ${url}`);
-        return signingRoutes(cipher, auxiliary)(url);
+        if (url === SIGNING_GATE_URL || url === SIGNING_HANDSHAKE_URL) return signingRoutes(cipher, auxiliary)(url);
+        if (url !== `${FAKE_HOST}/v1/messages?beta=true`) {
+          unexpectedAuxiliary.push(url);
+          throw new Error(`unexpected auxiliary request: ${url}`);
+        }
       }),
     );
     const { provider, on } = captureExtension();
@@ -836,5 +840,6 @@ describe("non-routed passthrough wire", () => {
     expect(wire[0].headers["x-off-peak-ticket-id"]).toBeUndefined();
     expect(wire[0].headers["x-coding-plan-api-key"]).toBeUndefined();
     expect(auxiliary).toEqual([SIGNING_GATE_URL, SIGNING_HANDSHAKE_URL]);
+    expect(unexpectedAuxiliary).toEqual([]);
   });
 });

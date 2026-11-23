@@ -209,7 +209,7 @@ test.each(["restore", "network", "abort-during-live", "abort-during-publication"
 
 test("only update installs the routed snapshot; canonical names survive restart and disappear on replacement", async () => {
   const c = createZCodeCatalog(async () => true);
-  const h = host();
+  const h = host({ credential: { ...oauth, zcodeJwtToken: "fixture-jwt" } });
   const flash = { id: "glm-5.3-flashx", display_name: "GLM-5.3-FlashX" };
   sources(() => Response.json([...live, flash]), reject);
   await c.refresh({ ...h.ctx, publish: async p => {
@@ -284,6 +284,20 @@ test("same-instance fresh check keeps the accepted route only for unchanged rows
     else await c.refresh({ ...check, stored: { ...stored, models: [{ ...stored.models[0], name: "Changed" }] } });
     expect(c.getModels()[0].baseUrl).toBe(ULTRA_BASE_URL);
   }
+});
+
+test("a fresh restore does not reuse an identical snapshot's route under a different session token", async () => {
+  let session = new AbortController().signal;
+  const c = createZCodeCatalog(async () => true, () => session);
+  const h = host({ credential: { ...oauth, zcodeJwtToken: "fixture-jwt" } });
+  sources(() => Response.json([{ id: "glm-flash" }]), reject);
+  await c.refresh(h.ctx);
+  expect(c.getModels()[0].baseUrl).toBe(OFFPEAK_BASE_URL);
+
+  session = new AbortController().signal;
+  sources();
+  await c.refresh({ ...h.ctx, stored: h.stored(), force: false });
+  expect(c.getModels()[0].baseUrl).toBe(ULTRA_BASE_URL);
 });
 
 test.each([true, false])("slow live read gets one metadata attempt before the trigger deadline: available=%s", async available => {

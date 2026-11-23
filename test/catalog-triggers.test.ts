@@ -4,11 +4,14 @@ import {
 } from "@earendil-works/pi-ai";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import glmZcodeExtension from "../extensions/glm-zcode/index.js";
-import { CATALOG_REFRESH_INTERVAL_MS as period, MODELS_DEV_API_URL } from "../extensions/glm-zcode/models.js";
+import { CATALOG_REFRESH_INTERVAL_MS as period, MODELS_DEV_API_URL, ULTRA_BASE_URL } from "../extensions/glm-zcode/models.js";
 import { LIVE_MODELS_URL } from "../extensions/glm-zcode/live-catalog.js";
+import { OFFPEAK_BASE_URL } from "../extensions/glm-zcode/offpeak.js";
 
 const now = Date.UTC(2026, 10, 23, 12);
+const inWindow = Date.UTC(2026, 10, 23, 0); // 09:00 KST
 const providerId = "glm-zcode";
+const ticket = "https://zcode.z.ai/api/v1/off-peak/ticket";
 const unexpected: string[] = [];
 function sources(live?: () => Response | Promise<Response>) {
   const fetch = vi.fn(async (input: RequestInfo | URL) => {
@@ -159,11 +162,10 @@ test("shutdown clears an alignment timeout and ignores late startup completion",
 });
 
 test("shutdown cancels every queued ticket warm-up before it can poll", async () => {
-  vi.setSystemTime(Date.UTC(2026, 10, 23, 0)); // 09:00 KST
+  vi.setSystemTime(inWindow);
   vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
   vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
   const h = await host();
-  const ticket = "https://zcode.z.ai/api/v1/off-peak/ticket";
   let takes = 0, polls = 0;
   vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
     switch (String(input)) {
@@ -183,6 +185,99 @@ test("shutdown cancels every queued ticket warm-up before it can poll", async ()
   expect(vi.getTimerCount()).toBe(0);
   await vi.advanceTimersByTimeAsync(2000);
   expect(polls).toBe(0);
+});
+
+test.each([true, false])("fresh restore after a gated host write keeps the route only within the same session: shutdown=%s", async shutdown => {
+  vi.setSystemTime(inWindow);
+  vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+  vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
+  const h = await host();
+  const flash = "glm-5.3-flash";
+  const fetch = vi.fn(async (input: RequestInfo | URL) => {
+    switch (String(input)) {
+      case LIVE_MODELS_URL: return reply(flash);
+      case MODELS_DEV_API_URL: return Response.json({});
+      case `${ticket}/availability`: return Response.json({ can_take_number: true });
+      case ticket: return Response.json({ state: "ready", ticket_id: "fixture-ticket" });
+      default: unexpected.push(String(input)); throw new Error("Unexpected request");
+    }
+  });
+  vi.stubGlobal("fetch", fetch);
+
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const write = h.modelsStore.write.bind(h.modelsStore);
+  vi.spyOn(h.modelsStore, "write").mockImplementationOnce(async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return write(...args);
+  });
+  const providers = [providerId];
+  const pending = h.models.refresh({ providers, allowNetwork: true, force: true });
+  try {
+    await entered.promise;
+    if (shutdown) h.shutdown();
+    release.resolve();
+    await pending;
+    const lateBaseUrl = h.models.getModel(providerId, flash)?.baseUrl;
+    h.start();
+    await h.models.refresh({ providers, allowNetwork: true, force: false });
+
+    const expected = shutdown ? ULTRA_BASE_URL : OFFPEAK_BASE_URL;
+    expect(h.models.getModel(providerId, flash)?.baseUrl).toBe(expected);
+    if (shutdown) expect([undefined, expected]).toContain(lateBaseUrl);
+    else expect(lateBaseUrl).toBe(expected);
+    expect((await h.modelsStore.read(providerId))?.models).toMatchObject([{ id: flash, baseUrl: ULTRA_BASE_URL }]);
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
+      LIVE_MODELS_URL, MODELS_DEV_API_URL, `${ticket}/availability`, ticket,
+    ]);
+  } finally {
+    release.resolve();
+    h.shutdown();
+  }
+});
+
+test("startup publishes canonical live rows before the deadline when metadata and availability run long", async () => {
+  vi.setSystemTime(inWindow);
+  vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+  vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
+  // Native AbortSignal.timeout uses its own clock, not Vitest's fake timers.
+  vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), ms);
+    return controller.signal;
+  });
+  const h = await host();
+  const flash = "glm-5.3-flash";
+  const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    switch (String(input)) {
+      case LIVE_MODELS_URL: return new Promise<Response>(resolve => setTimeout(() => resolve(reply(flash)), 10_500));
+      case MODELS_DEV_API_URL: {
+        const signal = init?.signal;
+        if (!signal) throw new Error("Missing metadata signal");
+        return new Promise<Response>((_, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      }
+      case `${ticket}/availability`:
+        // The response arrives after the optional cutoff even if the caller aborts.
+        return new Promise<Response>(resolve => setTimeout(() => resolve(Response.json({ can_take_number: false })), 3000));
+      default: unexpected.push(String(input)); throw new Error("Unexpected request");
+    }
+  });
+  vi.stubGlobal("fetch", fetch);
+  h.start();
+  try {
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(h.models.getModels(providerId)).toMatchObject([{ id: flash, baseUrl: ULTRA_BASE_URL, input: ["text"] }]);
+    expect((await h.modelsStore.read(providerId))?.models).toMatchObject([{ id: flash, baseUrl: ULTRA_BASE_URL }]);
+    expect(h.refresh.mock.calls[0][0].signal?.aborted).toBe(false);
+    expect(fetch.mock.calls.map(([input]) => String(input))).toEqual([
+      LIVE_MODELS_URL, MODELS_DEV_API_URL, `${ticket}/availability`,
+    ]);
+    expect(fetch.mock.calls.find(([input]) => input === `${ticket}/availability`)?.[1]?.signal?.aborted).toBe(true);
+  } finally {
+    h.shutdown();
+    vi.clearAllTimers();
+  }
 });
 
 test("OFFLINE even when empty prevents startup polling and forced online refresh", async () => {
