@@ -2,6 +2,7 @@ import {
   createModels, InMemoryCredentialStore, InMemoryModelsStore, normalizeContext,
   type ModelsRefreshOptions, type Provider,
 } from "@earendil-works/pi-ai";
+import { ModelRegistry, ModelRuntime } from "@code-yeongyu/senpi";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import glmZcodeExtension, { resetOffPeakStateForTests } from "../extensions/glm-zcode/index.js";
 import { CATALOG_REFRESH_INTERVAL_MS as period, MODELS_DEV_API_URL, ULTRA_BASE_URL } from "../extensions/glm-zcode/models.js";
@@ -49,34 +50,46 @@ afterEach(() => {
   expect(unexpected.splice(0)).toEqual([]);
 });
 
-async function host(checkedAt?: number) {
+async function host(checkedAt?: number, useRuntime = false) {
   let registered: Provider | undefined;
+  const modelsStore = new InMemoryModelsStore();
+  const credentials = new InMemoryCredentialStore();
+  const models = createModels({ modelsStore, credentials });
+  let directRegistryReady = false;
   const on = vi.fn();
   const registerCommand = vi.fn();
   glmZcodeExtension({ on, registerCommand, registerProvider(p) {
     if (typeof p === "string") throw new Error("Expected native provider");
     registered = p;
+    if (directRegistryReady) models.setProvider(p);
   } });
   if (!registered?.refreshModels) throw new Error("Missing dynamic provider");
   const provider = registered;
-  const modelsStore = new InMemoryModelsStore();
-  const credentials = new InMemoryCredentialStore();
   await credentials.modify(providerId, async () => account);
-  const models = createModels({ modelsStore, credentials });
   const seed = provider.getModels()[0];
   if (checkedAt !== undefined) await modelsStore.write(providerId, { checkedAt, models: [{ ...seed, id: "cached" }] });
   const phases = vi.fn(registered.refreshModels);
   provider.refreshModels = phases;
   models.setProvider(provider);
+  directRegistryReady = true;
   const foreign = vi.fn(async () => {});
   models.setProvider({ ...provider, id: "foreign", getModels: () => [{ ...seed, id: "foreign-only", provider: "foreign" }],
     refreshModels: foreign });
   // Host bootstrap restores only; network is disabled unless the extension explicitly opts in.
   await models.refresh({ providers: [providerId], allowNetwork: false });
   phases.mockClear();
-  const refresh = vi.fn((options: ModelsRefreshOptions) => models.refresh({ allowNetwork: false, ...options }));
+  const runtime = useRuntime ? await ModelRuntime.create({
+    credentials, modelsPath: null, modelsStore, refreshOnCreate: false,
+  }) : undefined;
+  if (runtime) {
+    await runtime.registerNativeProvider(provider, { refresh: false, extensionPath: "/fixture/glm-zcode" });
+    await runtime.refresh({ providers: [providerId], allowNetwork: false });
+  }
+  const registry = runtime ? new ModelRegistry(runtime) : undefined;
+  const refresh = vi.fn((options: ModelsRefreshOptions) => (registry ?? models).refresh({ allowNetwork: false, ...options }));
   const notify = vi.fn();
-  const ctx = { modelRegistry: { refresh, getAll: () => models.getModels() }, hasUI: true, ui: { notify } };
+  const ctx = { modelRegistry: { refresh, getAll: () => registry?.getAll() ?? models.getModels(), modelRuntime: runtime },
+    hasUI: true, ui: { notify } };
   function fire(event: string) {
     const fn = on.mock.calls.find(([name]) => name === event)?.[1];
     if (typeof fn !== "function") throw new Error("Missing " + event);
@@ -292,9 +305,9 @@ test.each(["before provider entry", "during online phase"])("force never reports
   }
 });
 
-test.each(["before", "after"])("an offline restart fences a host cache snapshot delivered %s the fence", async delivery => {
+test.each(["direct registry", "model runtime"])("shutdown retires an unseen cache generation in the %s", async kind => {
   vi.stubEnv("OFFLINE", "");
-  const h = await host(now);
+  const h = await host(now - 2, kind === "model runtime");
   await h.credentials.modify(providerId, async () => undefined);
   h.start();
   const options = { providers: [providerId], allowNetwork: false };
@@ -302,45 +315,87 @@ test.each(["before", "after"])("an offline restart fences a host cache snapshot 
   const read = h.modelsStore.read.bind(h.modelsStore);
   const entered = deferred<void>();
   const releaseOld = deferred<void>();
-  const releaseFence = deferred<void>();
-  await h.modelsStore.write(providerId, { checkedAt: now, models: [{ ...prior, id: "obsolete" }] });
+  await h.modelsStore.write(providerId, { checkedAt: now - 1, models: [{ ...prior, id: "obsolete" }] });
   vi.spyOn(h.modelsStore, "read").mockImplementationOnce(async (...args) => {
     const captured = await read(...args);
     entered.resolve();
     await releaseOld.promise;
     return captured;
   });
-  const pending = h.models.refresh(options);
+  const pending = h.refresh(options);
   try {
     await entered.promise;
-    h.shutdown();
-    await h.modelsStore.write(providerId, { checkedAt: now, models: [prior] });
-    // ModelRuntime can yield before it starts the new generation (loading models.json).
-    h.refresh.mockImplementationOnce(async opts => {
-      await releaseFence.promise;
-      return h.models.refresh(opts);
-    });
-    const restarted = h.start();
-    if (delivery === "before") {
-      releaseOld.resolve();
-      await vi.advanceTimersByTimeAsync(0);
-      expect(h.provider.getModels().map(model => model.id)).toEqual(["cached"]);
-    }
-    releaseFence.resolve();
-    await restarted;
+    await h.shutdown();
+    await h.modelsStore.write(providerId, { checkedAt: now - 2, models: [prior] });
+    h.refresh.mockClear();
+    expect(h.start()).toBeUndefined();
+    expect(h.refresh).not.toHaveBeenCalled();
     releaseOld.resolve();
     await pending;
+    await vi.advanceTimersByTimeAsync(0);
     expect(h.provider.getModels().map(model => model.id)).toEqual(["cached"]);
     expect((await read(providerId))?.models.map(model => model.id)).toEqual(["cached"]);
     expect(vi.getTimerCount()).toBe(0);
 
     await h.modelsStore.write(providerId, { checkedAt: now, models: [{ ...prior, id: "current" }] });
-    await h.models.refresh(options);
+    await h.refresh(options);
     expect(h.provider.getModels().map(model => model.id)).toEqual(["current"]);
+    if (h.ctx.modelRegistry.modelRuntime) {
+      expect(h.ctx.modelRegistry.modelRuntime.getProviderOrigin(providerId)?.extensionPath).toBe("/fixture/glm-zcode");
+    }
   } finally {
-    releaseFence.resolve();
     releaseOld.resolve();
-    h.shutdown();
+    await h.shutdown();
+  }
+});
+
+test("an offline restart leaves no refresh that can disable the next session's force or stream", async () => {
+  vi.stubEnv("OFFLINE", "");
+  const h = await host(now - 1, true);
+  const retiredRead = deferred<void>();
+  const forceEntered = deferred<void>();
+  const forceReply = deferred<Response>();
+  const messages = vi.fn(() => Response.json({ error: { message: "fixture" } }, { status: 400 }));
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url === LIVE_MODELS_URL) { forceEntered.resolve(); return forceReply.promise; }
+    if (url === MODELS_DEV_API_URL) return Response.json({});
+    if (url.split("?")[0] === `${ULTRA_BASE_URL}/v1/messages`) return messages();
+    unexpected.push(url);
+    throw new Error("Unexpected request");
+  });
+  try {
+    h.start();
+    await h.shutdown();
+    // Hold a stray startup call before the host can recompose the provider.
+    h.refresh.mockImplementationOnce(async opts => {
+      await retiredRead.promise;
+      return h.ctx.modelRegistry.modelRuntime?.refresh(opts) ?? h.models.refresh(opts);
+    });
+    expect(h.start()).toBeUndefined();
+    expect(h.refresh).not.toHaveBeenCalled();
+    h.refresh.mockReset().mockImplementation(opts => h.ctx.modelRegistry.modelRuntime?.refresh(opts) ?? h.models.refresh(opts));
+    await h.shutdown();
+    expect(h.start()).toBeUndefined();
+    vi.stubEnv("OFFLINE", undefined);
+    const command = h.command("--force");
+    await forceEntered.promise;
+    retiredRead.resolve();
+    forceReply.resolve(reply("forced"));
+    await command;
+    expect(h.notify.mock.calls).toEqual([[expect.stringContaining("\nforced"), "info"]]);
+    expect((await h.modelsStore.read(providerId))?.models.map(model => model.id)).toEqual(["forced"]);
+    const forced = h.ctx.modelRegistry.modelRuntime?.getModel(providerId, "forced");
+    if (!forced) throw new Error("Missing forced model");
+    const result = await h.provider.streamSimple(forced, transcript, {
+      apiKey: account.access, headers: { "X-Client-Sig": "fixture" }, maxRetries: 0,
+    }).result();
+    expect(messages).toHaveBeenCalledTimes(1);
+    expect(result.stopReason).toBe("error");
+  } finally {
+    retiredRead.resolve();
+    forceReply.resolve(reply("cleanup"));
+    await h.shutdown();
   }
 });
 

@@ -136,19 +136,29 @@ export function createZCodeCatalog(
   const standaloneSession = new AbortController().signal;
   const currentSession = getSessionSignal ?? (() => standaloneSession);
   const generationSessions = new WeakMap<AbortSignal, AbortSignal>();
+  let publishingGeneration: AbortSignal | undefined;
   let state: Snapshot = {
     current: nativeModels(zcodeFallbackChatModels(), false), wireNames: new Map(), foldedWireNames: new Map(),
   };
+  let hasAcceptedSnapshot = false;
   function install(candidate: Snapshot): void {
     const old = state.route;
     state = candidate;
+    hasAcceptedSnapshot = true;
     if (old !== candidate.route) old?.controller.abort();
+  }
+  function showCanonicalModels(): void {
+    const baseUrl = resolveZCodeAnthropicBaseUrl();
+    if (state.route || state.current.some(model => model.baseUrl !== baseUrl)) {
+      install({ ...state, current: state.current.map(model => ({ ...model, baseUrl })), route: undefined });
+    }
   }
   return {
     getModels: () => state.current,
     get checkedAt() { return state.checkedAt; },
+    hasPendingWrite: () => publishingGeneration?.aborted === false,
     clearSessionRoute() {
-      if (state.route) install(snapshot(storedToConfig(state.route.canonical), state.checkedAt));
+      if (state.route) showCanonicalModels();
     },
     isFresh: () => isFresh(state.checkedAt),
     officialGlmModelId(id: string): string {
@@ -175,14 +185,23 @@ export function createZCodeCatalog(
       const checkedAt = Number.isFinite(stored?.checkedAt) ? stored?.checkedAt : undefined;
       if (restored.length) {
         // The host restores a clone even on the same instance before each online check.
-        const route = state.route;
-        const credential = context.credential;
-        const sameRoute = route?.session === session && credential?.type === "oauth" && credential.access === route.access &&
-          credential.zcodeJwtToken === route.jwt && isFresh(checkedAt) && checkedAt === state.checkedAt &&
-          isDeepStrictEqual(stored?.models, route.canonical.models);
         const canonical = snapshot(restored, checkedAt);
-        const candidate = sameRoute ? state : canonical;
-        if (!(await context.publish({ update: () => { if (isCurrent()) install(candidate); } }))) return;
+        if (!(await context.publish({ update: () => {
+          if (!isCurrent()) return;
+          if (!hasAcceptedSnapshot ||
+            (checkedAt !== undefined && (state.checkedAt === undefined || checkedAt > state.checkedAt))) {
+            install(canonical);
+            return;
+          }
+          // A restore cannot move rows or wire names backwards. It can still
+          // withdraw an unverified route or reproject the accepted endpoint.
+          const route = state.route;
+          const credential = context.credential;
+          const sameRoute = route?.session === session && credential?.type === "oauth" && credential.access === route.access &&
+            credential.zcodeJwtToken === route.jwt && isFresh(checkedAt) && checkedAt === state.checkedAt &&
+            isDeepStrictEqual(stored?.models, route.canonical.models);
+          if (!sameRoute) showCanonicalModels();
+        } }))) return;
       }
       if (!context.allowNetwork || !isCurrent() || process.env.OFFLINE !== undefined) return;
       if (!context.force && restored.length && isFresh(checkedAt)) return;
@@ -206,10 +225,13 @@ export function createZCodeCatalog(
       const canonical = snapshot(rows, now);
       const candidate = route ? { ...canonical, current: nativeModels(rows, true), route } : canonical;
       // A host-started write may finish after shutdown. Only a current session may use its update.
-      const accepted = await context.publish({
-        persist,
-        update: () => { if (isCurrent()) install(candidate); },
-      });
+      publishingGeneration = ctx.signal;
+      let accepted: boolean;
+      try {
+        accepted = await context.publish({ persist, update: () => { if (isCurrent()) install(candidate); } });
+      } finally {
+        if (publishingGeneration === ctx.signal) publishingGeneration = undefined;
+      }
       if (accepted && route && isCurrent() && state.route === route) {
         const routeSignal = AbortSignal.any([session, route.controller.signal]);
         onOffPeakAccepted?.({

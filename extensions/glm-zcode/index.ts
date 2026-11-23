@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from "@code-yeongyu/senpi";
-import { createAssistantMessageEventStream, createProvider, hasApi, type AssistantMessage, type Model, type OAuthAuth, type ProviderStreams, type RefreshModelsContext } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, createProvider, hasApi, type AssistantMessage, type Model, type OAuthAuth, type Provider, type ProviderStreams, type RefreshModelsContext } from "@earendil-works/pi-ai";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/compat";
 import { CATALOG_REFRESH_INTERVAL_MS, ULTRA_BASE_URL, ZCODE_PROVIDER_ID, buildZCodeSourceHeaders, resolveZCodeAnthropicBaseUrl } from "./models.js";
 import { CATALOG_TRIGGER_TIMEOUT_MS, createZCodeCatalog, type AcceptedOffPeakRoute } from "./catalog.js";
@@ -306,24 +306,12 @@ function catalogRefreshes(catalog: ReturnType<typeof createZCodeCatalog>) {
   // The registry's result only reports caller aborts. The provider sees generation aborts.
   type Outcome = "ok" | "superseded" | "failed";
   type Attempt = { readonly deadline: number; providerSignal?: AbortSignal; sourceUnavailable?: boolean };
-  const trigger = new AsyncLocalStorage<Attempt | "fence">();
+  const trigger = new AsyncLocalStorage<Attempt>();
   let latestPhase: { signal: AbortSignal; done: Promise<"ok" | "failed"> } | undefined;
   let latestIssued: { session: AbortSignal; done: Promise<Outcome>; settled: boolean } | undefined;
-  let handoff: Promise<void> | undefined;
   return {
     async provider(context: RefreshModelsContext) {
       const owner = trigger.getStore();
-      if (owner === "fence") return;
-      // The host aborts old generations at the fence; newer generations can
-      // continue once the new session is active. Never block the fence itself.
-      if (handoff) {
-        try {
-          await waitFor(handoff, context.signal);
-        } catch (error) {
-          if (context.signal.aborted) return;
-          throw error;
-        }
-      }
       if (context.signal.aborted) return;
       if (owner) owner.providerSignal = context.signal;
       const work = catalog.refresh(context, owner?.deadline);
@@ -332,22 +320,6 @@ function catalogRefreshes(catalog: ReturnType<typeof createZCodeCatalog>) {
       // supersession for extension callers deciding whether to retry.
       if (await work === "source-unavailable" && owner) owner.sourceUnavailable = true;
     },
-    fence(ctx: ExtensionContext, resume: () => void): Promise<void> {
-      if (handoff) return handoff;
-      // A host generation may still be reading credentials or the store before
-      // its first provider callback. Supersede it in the host, without restoring
-      // any rows or permitting network access during the handoff.
-      const pending = trigger.run("fence", async () => ctx.modelRegistry.refresh({
-        providers: [ZCODE_PROVIDER_ID], allowNetwork: false, signal: AbortSignal.timeout(CATALOG_TRIGGER_TIMEOUT_MS),
-      })).then(result => {
-        if (handoff === pending && !result.aborted) resume();
-      }, () => {
-        // A failed host call is not evidence that its old generation was fenced.
-      }).finally(() => { if (handoff === pending) handoff = undefined; });
-      handoff = pending;
-      return pending;
-    },
-    endHandoff() { handoff = undefined; },
     async run(ctx: ExtensionContext, force: boolean, session: AbortSignal, recover = false): Promise<boolean> {
       const signal = AbortSignal.any([session, AbortSignal.timeout(CATALOG_TRIGGER_TIMEOUT_MS)]);
       const deadline = Date.now() + CATALOG_TRIGGER_TIMEOUT_MS;
@@ -415,9 +387,9 @@ function catalogRefreshes(catalog: ReturnType<typeof createZCodeCatalog>) {
 
 type GlmExtensionAPI = Pick<ExtensionAPI, "on" | "registerProvider" | "registerCommand">;
 
-function registerCatalogTriggers(pi: GlmExtensionAPI, catalog: ReturnType<typeof createZCodeCatalog>, session: { controller: AbortController }, refreshes: ReturnType<typeof catalogRefreshes>): void {
+function registerCatalogTriggers(pi: GlmExtensionAPI, catalog: ReturnType<typeof createZCodeCatalog>, session: { controller: AbortController }, refreshes: ReturnType<typeof catalogRefreshes>, provider: Provider): void {
   let polling: { resume: () => void; rearm: () => void; stop: () => void } | undefined;
-  function startPolling(ctx: ExtensionContext, afterHandoff = false) {
+  function startPolling(ctx: ExtensionContext) {
     if (polling) return polling.resume();
     const signal = session.controller.signal;
     let cancelTimer: (() => void) | undefined;
@@ -456,26 +428,32 @@ function registerCatalogTriggers(pi: GlmExtensionAPI, catalog: ReturnType<typeof
       else if (!running && !cancelTimer) tick();
     }
     polling = { resume, rearm: () => { if (!running) schedule(); }, stop: disarm };
-    if (afterHandoff && process.env.OFFLINE === undefined && !catalog.isFresh()) {
-      // Give host callbacks released by the fence their turn to restore before
-      // a new polling generation can supersede them.
-      const timer = setImmediate(() => { disarm(); resume(); }).unref();
-      cancelTimer = () => clearImmediate(timer);
-    } else resume();
+    resume();
   }
   pi.on("session_start", (_event, ctx) => {
-    if (!session.controller.signal.aborted) return startPolling(ctx);
-    return refreshes.fence(ctx, () => {
+    if (session.controller.signal.aborted) {
       session.controller = new AbortController();
-      startPolling(ctx, true);
-    });
+    }
+    startPolling(ctx);
   });
-  pi.on("session_shutdown", () => {
-    refreshes.endHandoff();
+  pi.on("session_shutdown", (_event, ctx) => {
     session.controller.abort();
     catalog.clearSessionRoute();
     polling?.stop();
     polling = undefined;
+    // Let a session-bound publication finish persisting without updating the
+    // picker. Otherwise retire any unseen first store read without starting I/O.
+    if (catalog.hasPendingWrite()) return;
+    const runtime = ctx?.modelRegistry?.modelRuntime;
+    if (runtime) {
+      const registered = runtime.getRegisteredNativeProvider(provider.id);
+      if (registered && registered.refreshModels === provider.refreshModels) return runtime.registerNativeProvider(registered, {
+        refresh: false, extensionPath: runtime.getProviderOrigin(provider.id)?.extensionPath,
+      }).then(() => undefined);
+    } else {
+      // A direct pi-ai registry installs native providers via setProvider.
+      pi.registerProvider(provider);
+    }
   });
   pi.registerCommand("glm-models", {
     description: "Refresh and list GLM ZCode models", argumentHint: "[--force]",
@@ -545,7 +523,8 @@ export default function glmZcodeExtension(pi: GlmExtensionAPI): void {
   };
   const base = createProvider({ id: ZCODE_PROVIDER_ID, name: "GLM ZCode", baseUrl: resolveZCodeAnthropicBaseUrl(),
     auth: { oauth: auth }, models: catalog.getModels(), api: streams(session, routeFor) });
-  pi.registerProvider({ ...base, getModels: catalog.getModels, getAllModels: catalog.getModels,
-    refreshModels: refreshes.provider });
-  registerCatalogTriggers(pi, catalog, session, refreshes);
+  const provider = { ...base, getModels: catalog.getModels, getAllModels: catalog.getModels,
+    refreshModels: refreshes.provider };
+  pi.registerProvider(provider);
+  registerCatalogTriggers(pi, catalog, session, refreshes, provider);
 }

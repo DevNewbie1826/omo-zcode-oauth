@@ -94,6 +94,44 @@ test("cold start exposes complete emergency models; offline restore replaces the
   expect(c.officialGlmModelId("old")).toBe("OLD");
 });
 
+test.each([undefined, now - 1, now, now + 1])("restore at %s cannot replace a catalog at an equal or newer time", async checkedAt => {
+  const c = createZCodeCatalog();
+  await c.refresh(host({ allowNetwork: false, stored: { models: [old], checkedAt: now } }).ctx);
+  const replacement = { ...old, id: "new", name: "NEW" };
+  const h = host({ allowNetwork: false, stored: { models: [replacement], checkedAt } });
+
+  await c.refresh(h.ctx);
+
+  const advances = checkedAt === now + 1;
+  expect(ids(c)).toEqual([advances ? "new" : "old"]);
+  expect(c.checkedAt).toBe(advances ? now + 1 : now);
+  expect(c.officialGlmModelId("new")).toBe(advances ? "NEW" : "new");
+});
+
+test("a queued restore compares checkedAt when it becomes visible, not when it is read", async () => {
+  const c = createZCodeCatalog();
+  const updateEntered = deferred();
+  const release = deferred();
+  const slow = host({ allowNetwork: false, stored: stale });
+  const pending = c.refresh({ ...slow.ctx, publish: async publication => {
+    updateEntered.resolve();
+    await release.promise;
+    return slow.ctx.publish(publication);
+  } });
+  await updateEntered.promise;
+  try {
+    await c.refresh(host({ allowNetwork: false, stored: {
+      checkedAt: now, models: [{ ...old, id: "new", name: "NEW" }],
+    } }).ctx);
+  } finally {
+    release.resolve();
+    await pending;
+  }
+  expect(ids(c)).toEqual(["new"]);
+  expect(c.checkedAt).toBe(now);
+  expect(c.officialGlmModelId("old")).toBe("old");
+});
+
 const invalidStores: Record<string, ModelsStoreEntry["models"]> = {
   empty: [], foreign: [{ ...old, provider: "foreign" }],
   image: [{ ...old, type: "image", output: ["image"] }], invalid: [{ ...old, maxTokens: 0 }],
@@ -428,6 +466,7 @@ test("same-instance fresh check keeps the accepted route only for unchanged rows
     if (change === "account") await c.refresh({ ...check, credential: { ...credential, access: "other" } });
     else await c.refresh({ ...check, stored: { ...stored, models: [{ ...stored.models[0], name: "Changed" }] } });
     expect(c.getModels()[0].baseUrl).toBe(ULTRA_BASE_URL);
+    expect(c.getModels()[0].name).toBe("glm-flash");
   }
 });
 
