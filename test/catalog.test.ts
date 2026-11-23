@@ -26,7 +26,7 @@ const metadata = {
   zai: { models: { "glm-5.4": { ...devRow, limit: { context: 3000 } }, "zai-only": devRow } },
 };
 const reject = () => { throw new Error("source unavailable"); };
-type Reply = () => Response;
+type Reply = (init?: RequestInit) => Response | Promise<Response>;
 const requests: { url: string; bearer: string | null }[] = [];
 const unexpected: string[] = [];
 function sources(liveReply?: Reply, devReply?: Reply) {
@@ -34,7 +34,7 @@ function sources(liveReply?: Reply, devReply?: Reply) {
     const url = String(input);
     requests.push({ url, bearer: new Headers(init?.headers).get("Authorization") });
     const reply = url === LIVE_MODELS_URL ? liveReply : url === MODELS_DEV_API_URL ? devReply : undefined;
-    if (reply) return reply();
+    if (reply) return reply(init);
     unexpected.push(url);
     throw new Error(`unexpected request: ${url}`);
   }));
@@ -262,4 +262,58 @@ test("registry reports a rejected write once and retains the restored snapshot",
   expect(c.checkedAt).toBe(stale.checkedAt);
   expect(c.officialGlmModelId("glm-5.4")).toBe("glm-5.4");
   expect(await modelsStore.read(provider)).toEqual(stale);
+});
+
+test("same-instance fresh check keeps the accepted route only for unchanged rows and account", async () => {
+  const credential = { ...oauth, zcodeJwtToken: "fixture-jwt" };
+  for (const change of ["account", "snapshot"]) {
+    const c = createZCodeCatalog(async () => true);
+    const h = host({ credential });
+    sources(() => Response.json([{ id: "glm-flash" }]), reject);
+    await c.refresh(h.ctx);
+    const stored = h.stored();
+    if (!stored) throw new Error("Missing publication");
+    expect(stored.models[0].baseUrl).toBe(ULTRA_BASE_URL);
+    sources();
+    const check = { ...h.ctx, stored };
+    await c.refresh({ ...check, allowNetwork: false });
+    await c.refresh({ ...check, force: false });
+    expect(c.getModels()[0].baseUrl).toBe(OFFPEAK_BASE_URL);
+
+    if (change === "account") await c.refresh({ ...check, credential: { ...credential, access: "other" } });
+    else await c.refresh({ ...check, stored: { ...stored, models: [{ ...stored.models[0], name: "Changed" }] } });
+    expect(c.getModels()[0].baseUrl).toBe(ULTRA_BASE_URL);
+  }
+});
+
+test.each([true, false])("slow live read gets one metadata attempt before the trigger deadline: available=%s", async available => {
+  vi.useRealTimers(); // Replace the suite's Date-only clock with fake timers as well.
+  vi.useFakeTimers();
+  vi.setSystemTime(now);
+  // Node's native AbortSignal.timeout uses an internal clock, not the fake setTimeout.
+  const timeout = vi.spyOn(AbortSignal, "timeout").mockImplementation(ms => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), ms);
+    return controller.signal;
+  });
+  try {
+    const signal = AbortSignal.timeout(15_000);
+    sources(() => new Promise(resolve => setTimeout(() => resolve(Response.json(live)), 10_500)), init => {
+      if (available) return Response.json(metadata);
+      const child = init?.signal;
+      if (!child) throw new Error("Missing metadata signal");
+      return new Promise<Response>((_, reject) => child.addEventListener("abort", () => reject(child.reason), { once: true }));
+    });
+    const h = host({ signal });
+    const c = createZCodeCatalog();
+    const refresh = c.refresh(h.ctx);
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(requests.map(r => r.url)).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
+    expect(signal.aborted).toBe(false);
+    expect(h.stored()?.models).toMatchObject([{ id: "new" }, { id: "glm-5.4", input: available ? ["text", "image"] : ["text"] }]);
+    await refresh;
+  } finally {
+    vi.clearAllTimers();
+    timeout.mockRestore();
+  }
 });

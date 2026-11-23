@@ -1,4 +1,5 @@
-import type { Model, RefreshModelsContext } from "@earendil-works/pi-ai";
+import { isDeepStrictEqual } from "node:util";
+import type { Model, ModelsStoreEntry, RefreshModelsContext } from "@earendil-works/pi-ai";
 import { fetchLiveModels, isSafeToken as safeToken } from "./live-catalog.js";
 import {
   CATALOG_PROVIDER, CATALOG_REFRESH_INTERVAL_MS, ZCODE_PROVIDER_ID,
@@ -7,6 +8,8 @@ import {
   storedToConfig, zcodeFallbackChatModels, type ZCodeChatModelConfig,
 } from "./models.js";
 import { applyOffPeakRouting } from "./offpeak.js";
+
+export const CATALOG_TRIGGER_TIMEOUT_MS = 15_000;
 
 // ZCode 4.0.0 app spellings, not catalog membership. New models come from discovery.
 const appWireNames = new Map([
@@ -21,6 +24,7 @@ interface Snapshot {
   readonly current: readonly Model<"anthropic-messages">[];
   readonly wireNames: ReadonlyMap<string, string>;
   readonly checkedAt?: number;
+  readonly route?: { access: string; jwt: string; canonical: ModelsStoreEntry };
 }
 
 function nativeModels(rows: ZCodeChatModelConfig[], offPeak: boolean): Snapshot["current"] {
@@ -58,15 +62,13 @@ function codingPlanRows(payload: unknown): ZCodeChatModelConfig[] {
     }));
 }
 
-async function discover({ credential, signal }: RefreshModelsContext): Promise<ZCodeChatModelConfig[]> {
-  // Start the optional enrichment budget BEFORE live discovery, leaving room for
-  // publication within the trigger's 15s deadline even if live is slow.
-  const enrichmentDeadline = AbortSignal.timeout(10_000);
+async function discover({ credential, signal }: RefreshModelsContext, deadline: number): Promise<ZCodeChatModelConfig[]> {
   const key = credential?.type === "oauth" ? credential.access : credential?.key;
   const live = key?.trim() ? await fetchLiveModels(key, signal).catch(() => []) : [];
   if (signal.aborted) return [];
-  const devSignal = live.length ? AbortSignal.any([signal, enrichmentDeadline]) : signal;
-  if (devSignal.aborted) return live;
+  // Spend at most half the remaining trigger time on optional metadata; keep time to publish live rows.
+  const remaining = Math.max(0, deadline - Date.now());
+  const devSignal = live.length ? AbortSignal.any([signal, AbortSignal.timeout(Math.floor(remaining / 2))]) : signal;
   let payload: unknown;
   try {
     payload = await fetchModelsDevPayload(devSignal);
@@ -81,12 +83,15 @@ export function createZCodeCatalog(offPeakActiveFor?: (context: RefreshModelsCon
   return {
     getModels: () => state.current,
     get checkedAt() { return state.checkedAt; },
+    clearSessionRoute() {
+      if (state.route) state = snapshot(storedToConfig(state.route.canonical), state.checkedAt);
+    },
     isFresh: () => isFresh(state.checkedAt),
     officialGlmModelId(id: string): string {
       const lower = id.toLowerCase();
       return appWireNames.get(lower) ?? state.wireNames.get(lower) ?? id;
     },
-    async refresh(context: RefreshModelsContext): Promise<void> {
+    async refresh(context: RefreshModelsContext, deadline = Date.now() + CATALOG_TRIGGER_TIMEOUT_MS): Promise<void> {
       const { stored, signal } = context;
       if (signal.aborted) return;
       const restored = stored && Array.isArray(stored.models)
@@ -96,22 +101,32 @@ export function createZCodeCatalog(offPeakActiveFor?: (context: RefreshModelsCon
         : [];
       const checkedAt = Number.isFinite(stored?.checkedAt) ? stored?.checkedAt : undefined;
       if (restored.length) {
-        const candidate = snapshot(restored, checkedAt);
+        // The host restores a clone even on the same instance before each online check.
+        const route = state.route;
+        const credential = context.credential;
+        const sameRoute = route && credential?.type === "oauth" && credential.access === route.access &&
+          credential.zcodeJwtToken === route.jwt && isFresh(checkedAt) && checkedAt === state.checkedAt &&
+          isDeepStrictEqual(stored?.models, route.canonical.models);
+        const candidate = sameRoute ? state : snapshot(restored, checkedAt);
         if (!(await context.publish({ update: () => { state = candidate; } }))) return;
       }
       if (!context.allowNetwork || signal.aborted || process.env.OFFLINE !== undefined) return;
       if (!context.force && restored.length && isFresh(checkedAt)) return;
 
-      const rows = await discover(context);
+      const rows = await discover(context, deadline);
       if (!rows.length || signal.aborted) return;
       const offPeak = await offPeakActiveFor?.(context) ?? false;
       if (signal.aborted) return;
       const now = Date.now();
-      const candidate = snapshot(rows, now, offPeak);
+      const persist = { models: catalogToPersistedModels(rows), checkedAt: now };
+      const credential = context.credential;
+      const route = offPeak && credential?.type === "oauth" && typeof credential.zcodeJwtToken === "string"
+        ? { access: credential.access, jwt: credential.zcodeJwtToken, canonical: persist } : undefined;
+      const candidate = { ...snapshot(rows, now, offPeak), route };
       // The host owns generation/abort checks and writes before invoking update.
       // Do not catch a failed write as a source failure or retry with different rows.
       await context.publish({
-        persist: { models: catalogToPersistedModels(rows), checkedAt: now },
+        persist,
         update: () => { state = candidate; },
       });
     },

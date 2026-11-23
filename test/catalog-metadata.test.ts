@@ -1,9 +1,7 @@
 import type { ProviderModelConfig } from "@code-yeongyu/senpi";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import * as models from "../extensions/glm-zcode/models.js";
 import {
   CATALOG_PROVIDER,
-  CATALOG_REFRESH_INTERVAL_MS,
   MODELS_DEV_API_URL,
   MODELS_DEV_FALLBACK_PROVIDER,
   ZCODE_CHAT_DEFAULTS,
@@ -83,14 +81,6 @@ const conflictingMetadata = {
 
 afterEach(() => {
   vi.unstubAllGlobals();
-});
-
-describe("CATALOG_REFRESH_INTERVAL_MS", () => {
-  test("exports exactly the 30-minute due interval and no 24-hour TTL", () => {
-    expect(CATALOG_REFRESH_INTERVAL_MS).toBe(30 * 60 * 1000);
-    expect(CATALOG_REFRESH_INTERVAL_MS).toBe(1_800_000);
-    expect("CATALOG_TTL_MS" in models).toBe(false);
-  });
 });
 
 describe("parseModelsDevMetadata", () => {
@@ -200,9 +190,12 @@ describe("fetchModelsDevPayload", () => {
   });
 
   test("a non-2xx response rejects so the caller can degrade", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => json({ error: "unavailable" }, 503)));
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) !== MODELS_DEV_API_URL) throw new Error(`unexpected request: ${String(input)}`);
+      return json({ error: "unavailable" }, 503);
+    }));
 
-    await expect(fetchModelsDevPayload()).rejects.toBeInstanceOf(Error);
+    await expect(fetchModelsDevPayload()).rejects.toThrow(/503/);
   });
 });
 

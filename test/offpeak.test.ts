@@ -90,6 +90,33 @@ describe("fetchOffPeakAvailability", () => {
 });
 
 describe("ensureOffPeakTicket", () => {
+  test("a status response delivered after cancellation cannot yield a ready ticket", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-11-23T18:00:00Z"));
+    const controller = new AbortController();
+    const ticket = "https://zcode.z.ai/api/v1/off-peak/ticket";
+    let statusSignal: AbortSignal | null | undefined;
+    const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === ticket) return json({ state: "queued", ticket_id: "late", next_poll_after: 2 });
+      if (String(input) === `${ticket}/status`) {
+        statusSignal = init?.signal;
+        controller.abort();
+        return json({ tickets: [{ ticket_id: "late", state: "ready" }] });
+      }
+      throw new Error(`Unexpected request: ${String(input)}`);
+    });
+    vi.stubGlobal("fetch", fetch);
+    try {
+      const result = ensureOffPeakTicket("jwt", "key", "task", controller.signal);
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(await result).toBeUndefined();
+      expect(statusSignal?.aborted).toBe(true);
+      expect(fetch.mock.calls.map(([url]) => url)).toEqual([ticket, `${ticket}/status`]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("take returns a ready ticket id and posts the task_id", async () => {
     const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       const url = String(_input);

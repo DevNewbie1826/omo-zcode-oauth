@@ -50,7 +50,7 @@ async function host(checkedAt?: number) {
   const modelsStore = new InMemoryModelsStore();
   const credentials = new InMemoryCredentialStore();
   await credentials.modify(providerId, async () => ({
-    type: "oauth", access: "fixture-key", refresh: "fixture-refresh", expires: now + 10 * period,
+    type: "oauth", access: "fixture-key", refresh: "fixture-refresh", zcodeJwtToken: "fixture-jwt", expires: now + 10 * period,
   }));
   const models = createModels({ modelsStore, credentials });
   const seed = provider.getModels()[0];
@@ -156,6 +156,33 @@ test("shutdown clears an alignment timeout and ignores late startup completion",
   expect(vi.getTimerCount()).toBe(0);
   expect(h.refresh).toHaveBeenCalledTimes(1);
   expect(fresh.refresh).not.toHaveBeenCalled();
+});
+
+test("shutdown cancels every queued ticket warm-up before it can poll", async () => {
+  vi.setSystemTime(Date.UTC(2026, 10, 23, 0)); // 09:00 KST
+  vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+  vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
+  const h = await host();
+  const ticket = "https://zcode.z.ai/api/v1/off-peak/ticket";
+  let takes = 0, polls = 0;
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+    switch (String(input)) {
+      case LIVE_MODELS_URL: return reply("glm-5.3-flash");
+      case MODELS_DEV_API_URL: return Response.json({});
+      case `${ticket}/availability`: return Response.json({ can_take_number: true });
+      case ticket: return Response.json({ state: "queued", ticket_id: String(++takes), next_poll_after: 2 });
+      case `${ticket}/status`: polls++; return Response.json({ tickets: [] });
+      default: unexpected.push(String(input)); throw new Error("Unexpected request");
+    }
+  });
+  h.start();
+  await h.refresh.mock.results[0].value;
+  await h.command("--force");
+  expect(takes).toBe(2);
+  h.shutdown();
+  expect(vi.getTimerCount()).toBe(0);
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(polls).toBe(0);
 });
 
 test("OFFLINE even when empty prevents startup polling and forced online refresh", async () => {
