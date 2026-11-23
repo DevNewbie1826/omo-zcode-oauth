@@ -30,7 +30,7 @@ function isIndented(line) {
 // which nested scalar belongs to the root is how a nested "version" used to
 // win. Such documents are refused rather than interpreted.
 function isPlainRootEntry(line) {
-  if (/^(?:[-?][ \t]|[{}\[\]%]|['"])/.test(line)) return false;
+  if (/^(?:---|\.\.\.|[-?][ \t]|[{}\[\]%]|['"])/.test(line)) return false;
   return !/^[^#:]+:[ \t]*[\[{]/.test(line);
 }
 
@@ -48,16 +48,23 @@ function readVersionField(yml) {
     if (line === "---" || line === "...") continue;
     if (!isPlainRootEntry(line)) return null;
     if (VERSION_KEY_LINE.test(line)) keyIndexes.push(index);
+    // A quoted root value must close, or the document was cut and is not one readable mapping.
+    const quoted = /^[^#:]+:[ \t]*(['"])/.exec(line);
+    if (quoted && readScalarValue(entryParts(lines, index, line.indexOf(quoted[1]))) === null) return null;
   }
   if (keyIndexes.length !== 1) return null;
-  const keyIndex = keyIndexes[0];
-  const parts = [lines[keyIndex].slice("version:".length)];
+  return readScalarValue(entryParts(lines, keyIndexes[0], "version:".length));
+}
+
+// The value text of the root entry at keyIndex plus its indented continuation lines.
+function entryParts(lines, keyIndex, valueStart) {
+  const parts = [lines[keyIndex].slice(valueStart)];
   for (let index = keyIndex + 1; index < lines.length; index++) {
     const line = lines[index];
     if (line !== "" && !isIndented(line)) break;
     parts.push(line);
   }
-  return readScalarValue(parts);
+  return parts;
 }
 
 function readScalarValue(parts) {
