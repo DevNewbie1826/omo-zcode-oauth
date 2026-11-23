@@ -18,6 +18,50 @@ function normalizeVersion(raw) {
   return VERSION_PATTERN.test(value) ? value : null;
 }
 
+// Reads a YAML scalar the way the CDN file writes it: an optional single- or
+// double-quoted value followed only by an optional comment. Plain scalars end at
+// a comment that starts after whitespace; any other trailing text stays in the
+// value so a version with a suffix ("4.0.0 beta") fails validation instead of
+// silently matching its numeric prefix. Returns null when the field is absent or
+// its scalar cannot be read unambiguously.
+function parseYamlScalar(rawLine) {
+  if (typeof rawLine !== "string") return null;
+  const text = rawLine.trim();
+  if (text.startsWith('"') || text.startsWith("'")) {
+    const quote = text[0];
+    let value = "";
+    let index = 1;
+    for (; index < text.length; index++) {
+      const char = text[index];
+      if (quote === '"' && char === "\\") {
+        const escaped = text[index + 1];
+        if (escaped === '"' || escaped === "\\") value += escaped;
+        else if (escaped === "n") value += "\n";
+        else if (escaped === "t") value += "\t";
+        else return null;
+        index += 1;
+        continue;
+      }
+      if (char === quote) {
+        if (quote === "'" && text[index + 1] === "'") {
+          value += "'";
+          index += 1;
+          continue;
+        }
+        break;
+      }
+      value += char;
+    }
+    if (index >= text.length) return null;
+    const rest = text.slice(index + 1);
+    if (rest.trim() === "") return value;
+    return /^[ \t]+#/.test(rest) ? value : null;
+  }
+  const commentStart = text.search(/[ \t]#/);
+  const value = (commentStart === -1 ? text : text.slice(0, commentStart)).trim();
+  return value === "" ? null : value;
+}
+
 function compareVersions(a, b) {
   const pa = a.split(".").map(Number);
   const pb = b.split(".").map(Number);
@@ -52,9 +96,12 @@ async function cdnRelease(version) {
   const res = await fetch(CDN_LATEST_YML(version), { signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`CDN latest.yml for ${version}: HTTP ${res.status}`);
   const yml = await res.text();
-  const rawVersion = yml.match(/^version:\s*(\S+)/m)?.[1];
+  const versionField = yml.match(/^version:[ \t]*(.*)$/m)?.[1];
+  const rawVersion = parseYamlScalar(versionField);
   const cdnVersion = normalizeVersion(rawVersion);
-  if (!cdnVersion) throw new Error(`CDN latest.yml for ${version}: missing or invalid version ${JSON.stringify(rawVersion)}`);
+  if (!cdnVersion) {
+    throw new Error(`CDN latest.yml for ${version}: missing or invalid version ${JSON.stringify(versionField?.trim() ?? null)}`);
+  }
   return {
     version: cdnVersion,
     releaseDate: yml.match(/^releaseDate:\s*'?([^'\n]+)'?/m)?.[1],
