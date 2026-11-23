@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { hasApi, normalizeContext, type Model, type Provider } from "@earendil-works/pi-ai";
+import { normalizeContext, type Model, type Provider } from "@earendil-works/pi-ai";
 import glmZcodeExtension from "../extensions/glm-zcode/index.js";
+import { ULTRA_BASE_URL } from "../extensions/glm-zcode/models.js";
 import { resetZCodeSigningState } from "../extensions/glm-zcode/signing.js";
 
 // Opt-in live check: LIVE_ZCODE_WIRE=1 LIVE_ZCODE_KEY="<id>.<secret>" npx vitest run test/live-wire.test.ts
@@ -26,17 +27,29 @@ function captureProvider(): { provider: Provider; signingHook: HeadersHook } {
   return { provider, signingHook: hook as HeadersHook };
 }
 
-function flashModel(provider: Provider): Model<"anthropic-messages"> {
-  const model = provider.getModels().find((entry) => entry.id === "glm-5.3-flash");
-  if (!model || !hasApi(model, "anthropic-messages")) throw new Error("Missing glm-5.3-flash model");
-  return model;
-}
+// The diagnostic needs a flash model without a restore/discovery round trip: the
+// cold catalog carries only glm-5.3 and glm-5.4. This fixture is the catalog row
+// shape, constructed here rather than selected from the provider.
+const flashModel: Model<"anthropic-messages"> = {
+  provider: "glm-zcode",
+  api: "anthropic-messages",
+  baseUrl: ULTRA_BASE_URL,
+  id: "glm-5.3-flash",
+  name: "GLM-5.3-Flash",
+  reasoning: true,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 1_000_000,
+  maxTokens: 131_072,
+  thinkingLevelMap: { minimal: "low", low: "low", medium: "low", high: "high", xhigh: "max", max: "max" },
+  compat: { supportsDisabledThinking: false, forceAdaptiveThinking: true },
+};
 
 const context = normalizeContext({
   messages: [
     {
-      role: "user" as const,
-      content: [{ type: "text" as const, text: "Reply with OK only." }],
+      role: "user",
+      content: [{ type: "text", text: "Reply with OK only." }],
       timestamp: Date.now(),
     },
   ],
@@ -64,7 +77,7 @@ describe.skipIf(process.env.LIVE_ZCODE_WIRE !== "1")("live wire against the ultr
     expect(signed["X-Client-Sig"]).toMatch(/^\S+$/);
     expect(signed["X-Session-Id"]).toMatch(/^\S+$/);
 
-    const stream = provider.streamSimple(flashModel(provider), context, {
+    const stream = provider.streamSimple(flashModel, context, {
       apiKey,
       headers: signed,
       maxTokens: 256,

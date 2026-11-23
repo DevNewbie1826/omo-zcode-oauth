@@ -1,63 +1,49 @@
-import { webcrypto as nodeWebcrypto } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import type { Model, Provider, RefreshModelsContext, SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { normalizeContext } from "@earendil-works/pi-ai";
-import { resetZCodeSigningState, zcodeSessionId } from "../extensions/glm-zcode/signing.js";
-import glmZcodeExtension, {
+import { buildZCodeSourceHeaders } from "../extensions/glm-zcode/models.js";
+import { MODELS_DEV_API_URL, ULTRA_BASE_URL } from "../extensions/glm-zcode/models.js";
+import {
+  resetZCodeSigningState,
+  resolveZCodeSigningHeaders,
+  SIGNING_GATE_URL,
+  SIGNING_HANDSHAKE_URL,
+  zcodeSessionId,
+} from "../extensions/glm-zcode/signing.js";
+import {
   resetOffPeakStateForTests,
   setOffPeakClockForTests,
   setOffPeakTransportForTests,
 } from "../extensions/glm-zcode/index.js";
-import { MODELS_DEV_API_URL, ULTRA_BASE_URL } from "../extensions/glm-zcode/models.js";
 import { OFFPEAK_BASE_URL } from "../extensions/glm-zcode/offpeak.js";
 import { LIVE_MODELS_URL } from "../extensions/glm-zcode/live-catalog.js";
+import {
+  captureExtension,
+  cipherFixture,
+  jsonResponse,
+  registeredHook,
+  signingRoutes,
+  type HeadersHook,
+  type RequestHook,
+} from "./support/wire-fixture.js";
 
-// The runtime posts to `<baseUrl>/v1/messages?beta=true`; assertions split origin+path from query.
-const subtle = nodeWebcrypto.subtle;
 const KEY = "wire-key-id.wire-secret";
 const JWT = "wire-jwt";
 const TICKET_BASE = "https://zcode.z.ai/api/v1/off-peak/ticket";
+const TICKET_AVAILABILITY = `${TICKET_BASE}/availability`;
 const IN_WINDOW = new Date("2026-09-09T18:00:00Z");
 const WINDOW_EDGE = new Date("2026-09-09T00:59:59.500Z");
 const OUT_WINDOW = new Date("2026-09-09T08:00:00Z");
 const FAKE_HOST = "https://fake-glm-host.example/anthropic";
+const MESSAGE_ENDPOINTS = new Set([
+  `${OFFPEAK_BASE_URL}/v1/messages`,
+  `${ULTRA_BASE_URL}/v1/messages`,
+  `${FAKE_HOST}/v1/messages`,
+]);
 
-type RequestHook = (event: { payload: unknown; model: { provider: string } }) => unknown;
-type HeadersHook = (event: { headers: Record<string, string | null> }) => Promise<void>;
-
-function captureExtension() {
-  const on = vi.fn();
-  let provider: Provider | undefined;
-  glmZcodeExtension({
-    on,
-    registerCommand: vi.fn(),
-    registerProvider(p: Provider | string) {
-      if (typeof p === "string") throw new Error("Expected native provider registration");
-      provider = p;
-    },
-  });
-  if (!provider) throw new Error("provider not registered");
-  return { provider, on };
-}
-
-function registeredHook<T>(on: ReturnType<typeof vi.fn>, event: string): T {
-  const handler: unknown = on.mock.calls.find(([name]) => name === event)?.[1];
-  if (typeof handler !== "function") throw new Error(`${event} not registered`);
-  return handler as T;
-}
-
-async function signedHeaders(provider: Provider, on: ReturnType<typeof vi.fn>): Promise<Record<string, string | null>> {
-  const oauth = provider.auth.oauth;
-  if (!oauth) throw new Error("OAuth auth not registered");
-  const auth = await oauth.toAuth({ type: "oauth", access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
-  const headers = auth.headers ?? {};
-  await registeredHook<HeadersHook>(on, "before_provider_headers")({ headers });
-  return headers;
-}
-
-function json(payload: unknown, status = 200): Response {
-  return new Response(JSON.stringify(payload), { status, headers: { "Content-Type": "application/json" } });
-}
+const transcript = normalizeContext({
+  messages: [{ role: "user", content: [{ type: "text", text: "Say OK" }], timestamp: 0 }],
+});
 
 function sseResponse(): Response {
   const frames = [
@@ -70,25 +56,6 @@ function sseResponse(): Response {
   ];
   const body = frames.map(([event, data]) => "event: " + event + "\n" + "data: " + JSON.stringify(data) + "\n\n").join("");
   return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
-}
-
-async function hkdf(secret: string, info: string): Promise<Uint8Array> {
-  const key = await subtle.importKey("raw", new TextEncoder().encode(secret), "HKDF", false, ["deriveBits"]);
-  const bits = await subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode("WD_CLIENT_SIGN_KDF_SALT"), info: new TextEncoder().encode(info) }, key, 256);
-  return new Uint8Array(bits);
-}
-
-async function cipherFixture(): Promise<string> {
-  const pair = (await subtle.generateKey("Ed25519", true, ["sign", "verify"])) as CryptoKeyPair;
-  const pkcs8 = await subtle.exportKey("pkcs8", pair.privateKey);
-  const aes = await subtle.importKey("raw", await hkdf("wire-secret", "ed25519_priv"), "AES-GCM", false, ["encrypt"]);
-  const iv = new Uint8Array(12);
-  nodeWebcrypto.getRandomValues(iv);
-  const sealed = new Uint8Array(await subtle.encrypt({ additionalData: new TextEncoder().encode("wire-key-id"), iv, name: "AES-GCM", tagLength: 128 } as unknown as Algorithm, aes, new TextEncoder().encode(Buffer.from(pkcs8).toString("base64"))));
-  const out = new Uint8Array(iv.length + sealed.length);
-  out.set(iv);
-  out.set(sealed, iv.length);
-  return Buffer.from(out).toString("base64");
 }
 
 function wireModel(baseUrl: string, id = "glm-5.3-flash"): Model<"anthropic-messages"> {
@@ -108,24 +75,22 @@ function wireModel(baseUrl: string, id = "glm-5.3-flash"): Model<"anthropic-mess
   };
 }
 
-const transcript = normalizeContext({
-  messages: [{ role: "user", content: [{ type: "text", text: "Say OK" }], timestamp: 0 }],
-});
-
 type WireEntry = { url: string; pathname: string; query: string; headers: Record<string, string>; body: string };
-type Route = (url: string) => Response | undefined | Promise<Response | undefined>;
+type Route = (url: string, init?: RequestInit) => Response | undefined | Promise<Response | undefined>;
 
 function wireFetch(wire: WireEntry[], route: Route = () => undefined) {
   return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
-    const routed = await route(url);
+    const routed = await route(url, init);
     if (routed) return routed;
     const parsed = new URL(url);
-    if (!parsed.pathname.endsWith("/v1/messages")) throw new Error(`unexpected request: ${url}`);
+    const endpoint = parsed.origin + parsed.pathname;
+    if (!MESSAGE_ENDPOINTS.has(endpoint)) throw new Error(`unexpected request: ${url}`);
+    if (parsed.search !== "?beta=true") throw new Error(`unexpected message query: ${url}`);
     const raw = init?.body;
     wire.push({
       url,
-      pathname: parsed.origin + parsed.pathname,
+      pathname: endpoint,
       query: parsed.search,
       headers: Object.fromEntries(new Headers(init?.headers).entries()),
       body: typeof raw === "string" ? raw : raw == null ? "" : String(raw),
@@ -154,21 +119,71 @@ function refreshHost(overrides: Partial<RefreshModelsContext> = {}): RefreshMode
   };
 }
 
-function signingRoutes(cipher: string) {
-  return (url: string): Response | undefined => {
-    if (url.endsWith("/agent/configs")) return json({ code: 0, data: { codingPlanSignature: { enable: true } } });
-    if (url.endsWith("/api/paas/c1f3a7e2/v2/client")) return json({ code: 200, data: { privateCipher: cipher } });
-    return undefined;
-  };
+async function signedHeaders(
+  provider: Provider,
+  on: ReturnType<typeof vi.fn>,
+  credential: { access: string; jwt?: string } = { access: KEY, jwt: JWT },
+): Promise<Record<string, string | null>> {
+  const oauth = provider.auth.oauth;
+  if (!oauth) throw new Error("OAuth auth not registered");
+  const auth = await oauth.toAuth({
+    type: "oauth",
+    access: credential.access,
+    refresh: "r",
+    expires: 1,
+    ...(credential.jwt === undefined ? {} : { zcodeJwtToken: credential.jwt }),
+  });
+  const headers = auth.headers ?? {};
+  await registeredHook<HeadersHook>(on, "before_provider_headers")({ headers });
+  return headers;
 }
 
-async function runStream(provider: Provider, auth: Record<string, string | null>, options: Partial<SimpleStreamOptions> = {}) {
-  return provider.streamSimple(wireModel(OFFPEAK_BASE_URL), transcript, { apiKey: KEY, headers: auth, maxRetries: 0, ...options }).result();
+async function assembledHeaders(access: string): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {
+    ...buildZCodeSourceHeaders(),
+    "X-ZCode-Agent": "glm",
+    Authorization: `Bearer ${access}`,
+  };
+  return { ...headers, ...(await resolveZCodeSigningHeaders(headers)) };
+}
+
+async function runStream(
+  provider: Provider,
+  auth: Record<string, string | null>,
+  options: Partial<SimpleStreamOptions> = {},
+  apiKey = KEY,
+) {
+  return provider.streamSimple(wireModel(OFFPEAK_BASE_URL), transcript, { apiKey, headers: auth, maxRetries: 0, ...options }).result();
+}
+
+async function within<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function expectSignedUltra(model: WireEntry, bearer: string): void {
+  expect(model.pathname).toBe(`${ULTRA_BASE_URL}/v1/messages`);
+  expect(model.query).toBe("?beta=true");
+  expect(model.headers.authorization).toBe(`Bearer ${bearer}`);
+  expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
+  expect(model.headers["x-session-id"]).toBe(zcodeSessionId());
+  expect(model.headers["x-off-peak-ticket-id"]).toBeUndefined();
+  expect(model.headers["x-coding-plan-api-key"]).toBeUndefined();
 }
 
 beforeEach(() => {
   vi.stubEnv("OFFLINE", undefined);
   vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
+  vi.stubEnv("ZCODE_DEVICE_ID", "wire-device-fixture");
 });
 
 afterEach(() => {
@@ -192,7 +207,7 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
       wireFetch(wire, (url) => {
         if (url === TICKET_BASE) {
           takes += 1;
-          return json({ ticket_id: "t-1", state: "ready" });
+          return jsonResponse({ ticket_id: "t-1", state: "ready" });
         }
         return signingRoutes(cipher)(url);
       }),
@@ -239,8 +254,8 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
       vi.stubGlobal(
         "fetch",
         wireFetch(wire, (url) => {
-          if (url === TICKET_BASE) return json({ code: 3103, msg: "limit" }, takeStatus);
-          if (url.endsWith("/agent/configs")) gate.push(url);
+          if (url === TICKET_BASE) return jsonResponse({ code: 3103, msg: "limit" }, takeStatus);
+          if (url === SIGNING_GATE_URL) gate.push(url);
           return signingRoutes(cipher)(url);
         }),
       );
@@ -256,15 +271,8 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
 
       expect(message.content, `${label} content`).toEqual([{ type: "text", text: "OK" }]);
       expect(gate, `${label} signing gate consulted`).toHaveLength(1);
-      const model = messageUrl(wire);
-      expect(model.pathname, `${label} origin/path`).toBe(`${ULTRA_BASE_URL}/v1/messages`);
-      expect(model.query, `${label} beta transport`).toBe("?beta=true");
-      expect(model.headers.authorization).toBe(`Bearer ${KEY}`);
-      expect(model.headers["x-off-peak-ticket-id"]).toBeUndefined();
-      expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
-      expect(model.headers["x-zcode-agent"]).toBe("glm");
-      expect(model.headers["x-session-id"]).toBe(zcodeSessionId());
-      expect(JSON.parse(model.body).model).toBe("glm-5.3-flash");
+      expectSignedUltra(messageUrl(wire), KEY);
+      expect(JSON.parse(messageUrl(wire).body).model).toBe("glm-5.3-flash");
     }
   });
 
@@ -318,7 +326,7 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
         await new Promise<void>((resolve) => {
           releaseTake = resolve;
         });
-        return json({ ticket_id: "t-late", state: "ready" });
+        return jsonResponse({ ticket_id: "t-late", state: "ready" });
       }),
     );
     const { provider, on } = captureExtension();
@@ -329,18 +337,13 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
       headers: auth,
       maxRetries: 0,
     }).result();
-    await Promise.race([takeStartedPromise, new Promise((_, reject) => setTimeout(() => reject(new Error("take never started")), 2_000))]);
+    await within(takeStartedPromise, 2_000, "take never started");
     setOffPeakClockForTests(new Date("2026-09-09T01:00:01Z"));
     releaseTake?.();
     const message = await pending;
 
     expect(message.content).toEqual([{ type: "text", text: "OK" }]);
-    const model = messageUrl(wire);
-    expect(model.pathname).toBe(`${ULTRA_BASE_URL}/v1/messages`);
-    expect(model.query).toBe("?beta=true");
-    expect(model.headers.authorization).toBe(`Bearer ${KEY}`);
-    expect(model.headers["x-off-peak-ticket-id"]).toBeUndefined();
-    expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
+    expectSignedUltra(messageUrl(wire), KEY);
   });
 
   test("full stream keeps an off-peak-routed model on the signed ultra path", async () => {
@@ -351,7 +354,7 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
     vi.stubGlobal(
       "fetch",
       wireFetch(wire, (url) => {
-        if (url === TICKET_BASE) return json({ ticket_id: "t-full", state: "ready" });
+        if (url === TICKET_BASE) return jsonResponse({ ticket_id: "t-full", state: "ready" });
         return signingRoutes(cipher)(url);
       }),
     );
@@ -366,15 +369,10 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
     }).result();
 
     expect(message.content).toEqual([{ type: "text", text: "OK" }]);
-    const model = messageUrl(wire);
-    expect(model.pathname).toBe(`${ULTRA_BASE_URL}/v1/messages`);
-    expect(model.query).toBe("?beta=true");
-    expect(model.headers.authorization).toBe(`Bearer ${KEY}`);
-    expect(model.headers["x-off-peak-ticket-id"]).toBeUndefined();
-    expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
+    expectSignedUltra(messageUrl(wire), KEY);
   });
 
-  test("transport failure: refreshModels never routes flash off-peak despite a valid window", async () => {
+  test("transport disabled: refreshModels never routes flash off-peak despite a valid window", async () => {
     setOffPeakTransportForTests(false);
     setOffPeakClockForTests(IN_WINDOW);
     const { provider } = captureExtension();
@@ -385,9 +383,9 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
         const url = String(input);
         requests.push(url);
         if (url === LIVE_MODELS_URL) {
-          return json({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
+          return jsonResponse({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
         }
-        if (url === MODELS_DEV_API_URL) return json({});
+        if (url === MODELS_DEV_API_URL) return jsonResponse({});
         throw new Error(`unexpected request: ${url}`);
       }),
     );
@@ -408,11 +406,11 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
       vi.fn(async (input: string | URL | Request) => {
         const url = String(input);
         if (url === LIVE_MODELS_URL) {
-          return json({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
+          return jsonResponse({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
         }
-        if (url === MODELS_DEV_API_URL) return json({});
-        if (url === `${TICKET_BASE}/availability`) return json({ code: 0, data: { can_take_number: true } });
-        if (url === TICKET_BASE) return json({ ticket_id: "t-refresh", state: "ready" });
+        if (url === MODELS_DEV_API_URL) return jsonResponse({});
+        if (url === TICKET_AVAILABILITY) return jsonResponse({ code: 0, data: { can_take_number: true } });
+        if (url === TICKET_BASE) return jsonResponse({ ticket_id: "t-refresh", state: "ready" });
         throw new Error(`unexpected request: ${url}`);
       }),
     );
@@ -421,6 +419,144 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
 
     expect(provider.getModels().find((model) => model.id === "glm-5.3-flash")?.baseUrl).toBe(OFFPEAK_BASE_URL);
     expect(provider.getModels().find((model) => model.id === "glm-5.3")?.baseUrl).toBe(ULTRA_BASE_URL);
+  });
+});
+
+describe("negative wire fallbacks (native transport)", () => {
+  test("missing JWT: signed ultra, no ticket or coding-plan headers, no ticket traffic", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakClockForTests(IN_WINDOW);
+    const cipher = await cipherFixture();
+    const wire: WireEntry[] = [];
+    const auxiliary: string[] = [];
+    const ticketCalls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      wireFetch(wire, (url) => {
+        if (url === TICKET_BASE || url === TICKET_AVAILABILITY) {
+          ticketCalls.push(url);
+          return jsonResponse({ ticket_id: "unexpected", state: "ready" });
+        }
+        return signingRoutes(cipher, auxiliary)(url);
+      }),
+    );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on, { access: KEY });
+
+    const message = await runStream(provider, auth);
+
+    expect(message.content).toEqual([{ type: "text", text: "OK" }]);
+    const model = messageUrl(wire);
+    expectSignedUltra(model, KEY);
+    expect(model.headers.authorization).not.toBe(`Bearer ${JWT}`);
+    expect(ticketCalls).toEqual([]);
+    expect(auxiliary).toEqual([SIGNING_GATE_URL, SIGNING_HANDSHAKE_URL]);
+  });
+
+  test("mismatched credential: another account's key never reuses the ticket owner's request", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakClockForTests(IN_WINDOW);
+    const accountA = "account-a-key.account-a-secret";
+    const accountB = "account-b-key.account-b-secret";
+    const jwtA = "jwt-account-a";
+    const cipherA = await cipherFixture({ apiKeyId: "account-a-key", apiKeySecret: "account-a-secret" });
+    const cipherB = await cipherFixture({ apiKeyId: "account-b-key", apiKeySecret: "account-b-secret" });
+    const wire: WireEntry[] = [];
+    const tickets: WireEntry[] = [];
+    let takes = 0;
+    vi.stubGlobal(
+      "fetch",
+      wireFetch(wire, (url, init) => {
+        if (url === TICKET_BASE) {
+          takes += 1;
+          tickets.push({
+            url,
+            pathname: url,
+            query: "",
+            headers: Object.fromEntries(new Headers(init?.headers).entries()),
+            body: typeof init?.body === "string" ? init.body : "",
+          });
+          return jsonResponse({ ticket_id: "t-account-a", state: "ready" });
+        }
+        return signingRoutes((apiKey) => (apiKey === accountB ? cipherB : cipherA))(url, init);
+      }),
+    );
+    const { provider, on } = captureExtension();
+    const authA = await signedHeaders(provider, on, { access: accountA, jwt: jwtA });
+    await runStream(provider, authA, {}, accountA);
+    const authB = await assembledHeaders(accountB);
+    const message = await runStream(provider, authB, {}, accountB);
+
+    expect(message.content).toEqual([{ type: "text", text: "OK" }]);
+    expect(wire).toHaveLength(2);
+    expect(wire[0].pathname).toBe(`${OFFPEAK_BASE_URL}/v1/messages`);
+    expect(wire[0].headers.authorization).toBe(`Bearer ${jwtA}`);
+    expect(wire[0].headers["x-off-peak-ticket-id"]).toBe("t-account-a");
+    expect(wire[0].headers["x-coding-plan-api-key"]).toBe(accountA);
+    expectSignedUltra(wire[1], accountB);
+    expect(wire[1].headers.authorization).not.toBe(`Bearer ${jwtA}`);
+    expect(takes).toBe(1);
+    expect(tickets[0].headers.authorization).toBe(`Bearer ${jwtA}`);
+    expect(tickets[0].headers["x-coding-plan-api-key"]).toBe(accountA);
+  });
+
+  test("expired ticket with no usable replacement: signed ultra", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakClockForTests(IN_WINDOW);
+    const cipher = await cipherFixture();
+    const wire: WireEntry[] = [];
+    let takes = 0;
+    vi.stubGlobal(
+      "fetch",
+      wireFetch(wire, (url) => {
+        if (url === TICKET_BASE) {
+          takes += 1;
+          return takes === 1
+            ? jsonResponse({ ticket_id: "t-expiring", state: "ready" })
+            : jsonResponse({ code: 3103, msg: "limit" }, 429);
+        }
+        return signingRoutes(cipher)(url);
+      }),
+    );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+    await runStream(provider, auth);
+    expect(wire[0].headers["x-off-peak-ticket-id"]).toBe("t-expiring");
+
+    setOffPeakClockForTests(new Date(IN_WINDOW.getTime() + 11 * 60_000));
+    const message = await runStream(provider, auth);
+
+    expect(message.content).toEqual([{ type: "text", text: "OK" }]);
+    expectSignedUltra(wire[1], KEY);
+    expect(wire[1].headers.authorization).not.toBe(`Bearer ${JWT}`);
+    expect(takes).toBe(2);
+  });
+
+  test("transport disabled while eligible and opted in: signed ultra, no ticket traffic", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakTransportForTests(false);
+    setOffPeakClockForTests(IN_WINDOW);
+    const cipher = await cipherFixture();
+    const wire: WireEntry[] = [];
+    const ticketCalls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      wireFetch(wire, (url) => {
+        if (url === TICKET_BASE || url === TICKET_AVAILABILITY) {
+          ticketCalls.push(url);
+          return jsonResponse({ ticket_id: "unexpected", state: "ready" });
+        }
+        return signingRoutes(cipher)(url);
+      }),
+    );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+
+    const message = await runStream(provider, auth);
+
+    expect(message.content).toEqual([{ type: "text", text: "OK" }]);
+    expectSignedUltra(messageUrl(wire), KEY);
+    expect(ticketCalls).toEqual([]);
   });
 });
 
@@ -438,7 +574,7 @@ describe("pending ticket lifecycle (retry and reacquisition)", () => {
       wireFetch(wire, (url) => {
         if (url === TICKET_BASE) {
           takes += 1;
-          return takes === 1 ? json({ code: 3103, msg: "limit" }, 429) : json({ ticket_id: "t-retry", state: "ready" });
+          return takes === 1 ? jsonResponse({ code: 3103, msg: "limit" }, 429) : jsonResponse({ ticket_id: "t-retry", state: "ready" });
         }
         return signingRoutes(cipher)(url);
       }),
@@ -462,13 +598,13 @@ describe("pending ticket lifecycle (retry and reacquisition)", () => {
       "fetch",
       wireFetch(wire, (url) => {
         if (url === LIVE_MODELS_URL) {
-          return json({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
+          return jsonResponse({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
         }
-        if (url === MODELS_DEV_API_URL) return json({});
-        if (url === `${TICKET_BASE}/availability`) return json({ code: 0, data: { can_take_number: true } });
+        if (url === MODELS_DEV_API_URL) return jsonResponse({});
+        if (url === TICKET_AVAILABILITY) return jsonResponse({ code: 0, data: { can_take_number: true } });
         if (url === TICKET_BASE) {
           takes += 1;
-          return json({ ticket_id: `t-warm-${takes}`, state: "ready" });
+          return jsonResponse({ ticket_id: `t-warm-${takes}`, state: "ready" });
         }
         return signingRoutes(cipher)(url);
       }),
@@ -498,7 +634,7 @@ describe("pending ticket lifecycle (retry and reacquisition)", () => {
       wireFetch([], (url) => {
         if (url === TICKET_BASE) {
           takes += 1;
-          return json({ ticket_id: `t-${takes}`, state: "ready" });
+          return jsonResponse({ ticket_id: `t-${takes}`, state: "ready" });
         }
         return signingRoutes(cipher)(url);
       }),
@@ -510,6 +646,33 @@ describe("pending ticket lifecycle (retry and reacquisition)", () => {
     await runStream(provider, auth);
 
     expect(takes).toBe(2);
+  });
+
+  test("a valid ticket is reacquired after expiry when the server grants another", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakClockForTests(IN_WINDOW);
+    const cipher = await cipherFixture();
+    let takes = 0;
+    const wire: WireEntry[] = [];
+    vi.stubGlobal(
+      "fetch",
+      wireFetch(wire, (url) => {
+        if (url === TICKET_BASE) {
+          takes += 1;
+          return jsonResponse({ ticket_id: `t-reacquired-${takes}`, state: "ready" });
+        }
+        return signingRoutes(cipher)(url);
+      }),
+    );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+    await runStream(provider, auth);
+    setOffPeakClockForTests(new Date(IN_WINDOW.getTime() + 11 * 60_000));
+    await runStream(provider, auth);
+
+    expect(takes).toBe(2);
+    expect(pathnames(wire)).toEqual([`${OFFPEAK_BASE_URL}/v1/messages`, `${OFFPEAK_BASE_URL}/v1/messages`]);
+    expect(wire[1].headers["x-off-peak-ticket-id"]).toBe("t-reacquired-2");
   });
 });
 
@@ -552,8 +715,8 @@ describe("device identity metadata (PR10)", () => {
       "fetch",
       vi.fn(async (input: string | URL | Request) => {
         const url = String(input);
-        if (url === LIVE_MODELS_URL) return json({ data: [{ id: "glm-5.3-flash" }] });
-        if (url === MODELS_DEV_API_URL) return json({});
+        if (url === LIVE_MODELS_URL) return jsonResponse({ data: [{ id: "glm-5.3-flash" }] });
+        if (url === MODELS_DEV_API_URL) return jsonResponse({});
         throw new Error(`unexpected request: ${url}`);
       }),
     );
@@ -574,12 +737,7 @@ describe("stale off-peak routing guard", () => {
     const message = await runStream(provider, auth);
 
     expect(message.content).toEqual([{ type: "text", text: "OK" }]);
-    const model = messageUrl(wire);
-    expect(model.pathname).toBe(`${ULTRA_BASE_URL}/v1/messages`);
-    expect(model.query).toBe("?beta=true");
-    expect(model.headers.authorization).toBe(`Bearer ${KEY}`);
-    expect(model.headers["x-off-peak-ticket-id"]).toBeUndefined();
-    expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
+    expectSignedUltra(messageUrl(wire), KEY);
   });
 });
 
@@ -595,7 +753,7 @@ describe("off-peak flag gates cached tickets too", () => {
       wireFetch(wire, (url) => {
         if (url === TICKET_BASE) {
           takes += 1;
-          return json({ ticket_id: "t-c", state: "ready" });
+          return jsonResponse({ ticket_id: "t-c", state: "ready" });
         }
         return signingRoutes(cipher)(url);
       }),
@@ -631,25 +789,20 @@ describe("flag drops mid-acquisition", () => {
         await new Promise<void>((resolve) => {
           releaseTake = resolve;
         });
-        return json({ ticket_id: "t-midflight", state: "ready" });
+        return jsonResponse({ ticket_id: "t-midflight", state: "ready" });
       }),
     );
     const { provider, on } = captureExtension();
     const auth = await signedHeaders(provider, on);
 
     const pending = runStream(provider, auth);
-    await Promise.race([takeStartedPromise, new Promise((_, reject) => setTimeout(() => reject(new Error("take never started")), 2_000))]);
+    await within(takeStartedPromise, 2_000, "take never started");
     vi.unstubAllEnvs();
     releaseTake?.();
     const message = await pending;
 
     expect(message.content).toEqual([{ type: "text", text: "OK" }]);
-    const model = messageUrl(wire);
-    expect(model.pathname).toBe(`${ULTRA_BASE_URL}/v1/messages`);
-    expect(model.query).toBe("?beta=true");
-    expect(model.headers.authorization).toBe(`Bearer ${KEY}`);
-    expect(model.headers["x-off-peak-ticket-id"]).toBeUndefined();
-    expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
+    expectSignedUltra(messageUrl(wire), KEY);
   });
 });
 
@@ -658,7 +811,14 @@ describe("non-routed passthrough wire", () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
     const cipher = await cipherFixture();
     const wire: WireEntry[] = [];
-    vi.stubGlobal("fetch", wireFetch(wire, signingRoutes(cipher)));
+    const auxiliary: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      wireFetch(wire, (url) => {
+        if (url.startsWith(TICKET_BASE)) throw new Error(`unexpected ticket request: ${url}`);
+        return signingRoutes(cipher, auxiliary)(url);
+      }),
+    );
     const { provider, on } = captureExtension();
     const auth = await signedHeaders(provider, on);
 
@@ -673,6 +833,8 @@ describe("non-routed passthrough wire", () => {
     expect(wire[0].pathname).toBe(`${FAKE_HOST}/v1/messages`);
     expect(wire[0].query).toBe("?beta=true");
     expect(JSON.parse(wire[0].body).model).toBe("glm-5.3-flash");
-    expect(wire.some((entry) => /\/off-peak\/ticket|\/agent\/configs|\/api\/paas\//.test(entry.url))).toBe(false);
+    expect(wire[0].headers["x-off-peak-ticket-id"]).toBeUndefined();
+    expect(wire[0].headers["x-coding-plan-api-key"]).toBeUndefined();
+    expect(auxiliary).toEqual([SIGNING_GATE_URL, SIGNING_HANDSHAKE_URL]);
   });
 });
