@@ -24,15 +24,15 @@ function isIndented(line) {
   return line.startsWith(" ") || line.startsWith("\t");
 }
 
-// latest.yml is a plain block mapping: keys at column 0, values in block
-// scalars. A root flow collection, a quoted root key, a flow value, a root
-// sequence entry or a directive is a different document shape, and guessing
-// which nested scalar belongs to the root is how a nested "version" used to
-// win. Such documents are refused rather than interpreted.
-function isPlainRootEntry(line) {
-  if (/^(?:---|\.\.\.|[-?][ \t]|[{}\[\]%]|['"])/.test(line)) return false;
-  return !/^[^#:]+:[ \t]*[\[{]/.test(line);
-}
+// electron-builder writes latest.yml as one plain block mapping: identifier
+// keys at column 0, plain or quoted scalars, nested block collections and
+// `|`/`>` block scalars. Any other shape (a flow collection, an anchor, alias
+// or tag, a quoted or non-identifier root key, content on a document marker)
+// is refused rather than interpreted: guessing which nested scalar belongs to
+// the root is how a nested file "version" used to win.
+const ROOT_KEY_LINE = /^[A-Za-z_][A-Za-z0-9_-]*:(?:[ \t]|$)/;
+const BLOCK_SCALAR_START = /:[ \t]*[|>][-+0-9]*[ \t]*(?:#.*)?$/;
+const UNSUPPORTED_SYNTAX = /[{}\[\]&*!]/;
 
 // Reads the document's top-level "version" entry as one YAML scalar: the text
 // after the key, then every indented continuation line, folded the way YAML
@@ -42,15 +42,27 @@ function isPlainRootEntry(line) {
 function readVersionField(yml) {
   const lines = yml.split(/\r?\n/);
   const keyIndexes = [];
+  let blockScalarIndent = -1;
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
-    if (line.trim() === "" || line.startsWith("#") || isIndented(line)) continue;
+    if (line.trim() === "") continue;
+    const indent = line.length - line.trimStart().length;
+    if (blockScalarIndent >= 0) {
+      if (indent > blockScalarIndent) continue; // block scalar text is opaque
+      blockScalarIndent = -1;
+    }
+    if (line.trimStart().startsWith("#")) continue;
+    if (UNSUPPORTED_SYNTAX.test(line.replace(/[ \t]#.*$/, ""))) return null;
+    if (BLOCK_SCALAR_START.test(line)) blockScalarIndent = indent;
+    if (isIndented(line)) continue;
     if (line === "---" || line === "...") continue;
-    if (!isPlainRootEntry(line)) return null;
+    if (!ROOT_KEY_LINE.test(line)) return null;
     if (VERSION_KEY_LINE.test(line)) keyIndexes.push(index);
-    // A quoted root value must close, or the document was cut and is not one readable mapping.
-    const quoted = /^[^#:]+:[ \t]*(['"])/.exec(line);
-    if (quoted && readScalarValue(entryParts(lines, index, line.indexOf(quoted[1]))) === null) return null;
+    // A quoted root value, on the key line or the next one, must close; otherwise
+    // the document was cut and is not one readable mapping.
+    const parts = entryParts(lines, index, line.indexOf(":") + 1);
+    const first = parts.find((part) => part.trim() !== "")?.trim() ?? "";
+    if ((first.startsWith("'") || first.startsWith('"')) && readScalarValue(parts) === null) return null;
   }
   if (keyIndexes.length !== 1) return null;
   return readScalarValue(entryParts(lines, keyIndexes[0], "version:".length));
