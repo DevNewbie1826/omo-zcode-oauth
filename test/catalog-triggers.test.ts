@@ -168,6 +168,105 @@ test.each([
   },
 );
 
+test("startup recovery leaves a newer force alone while its first store read is pending", async () => {
+  const h = await host();
+  const startupEntered = deferred<void>();
+  const startup = deferred<Response>();
+  const live = vi.fn<() => Response | Promise<Response>>(() => reply("forced")).mockImplementationOnce(() => {
+    startupEntered.resolve();
+    return startup.promise;
+  });
+  sources(live);
+  const readEntered = deferred<void>();
+  const releaseRead = deferred<void>();
+  let forceSignal: AbortSignal | undefined;
+  try {
+    h.start();
+    await startupEntered.promise;
+    const read = h.modelsStore.read.bind(h.modelsStore);
+    vi.spyOn(h.modelsStore, "read").mockImplementationOnce(async (id, options) => {
+      forceSignal = options?.signal;
+      readEntered.resolve();
+      await releaseRead.promise;
+      return read(id, options);
+    });
+    const command = h.command("--force");
+    await readEntered.promise;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(forceSignal?.aborted).toBe(false);
+    expect(h.refresh.mock.calls.map(([options]) => options.force)).toEqual([false, true]);
+    releaseRead.resolve();
+    await command;
+    expect(h.phases.mock.calls.filter(([ctx]) => ctx.allowNetwork).map(([ctx]) => ctx.force)).toEqual([false, true]);
+    expect((await h.modelsStore.read(providerId))?.models.map(row => row.id)).toEqual(["forced"]);
+    expect(h.notify.mock.calls).toEqual([[expect.stringContaining("\nforced"), "info"]]);
+  } finally {
+    h.shutdown();
+    releaseRead.resolve();
+    startup.resolve(reply("discarded"));
+  }
+});
+
+test.each(["before provider entry", "during online phase"])("force never reports success when superseded %s", async boundary => {
+  const h = await host(now);
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  if (boundary === "before provider entry") {
+    const read = h.modelsStore.read.bind(h.modelsStore);
+    vi.spyOn(h.modelsStore, "read").mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return read(...args);
+    });
+  } else {
+    sources(async () => {
+      entered.resolve();
+      await release.promise;
+      return reply("discarded");
+    });
+  }
+  try {
+    const command = h.command("--force");
+    await entered.promise;
+    await h.models.refresh({ providers: [providerId], allowNetwork: false });
+    await command;
+    expect(h.notify.mock.calls).toEqual([[expect.stringContaining("\ncached"), "error"]]);
+    expect(h.models.getModels(providerId).map(model => model.id)).toEqual(["cached"]);
+  } finally {
+    h.shutdown();
+    release.resolve();
+  }
+});
+
+test.each(["shutdown", "restart"])("an old host refresh's online phase cannot publish after %s", async mode => {
+  const h = await host(now);
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  const read = h.modelsStore.read.bind(h.modelsStore);
+  vi.spyOn(h.modelsStore, "read").mockImplementationOnce(read).mockImplementationOnce(async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return read(...args);
+  });
+  const fetch = sources(() => reply("old-account-only"));
+  const pending = h.models.refresh({ providers: [providerId], allowNetwork: true, force: true });
+  try {
+    await entered.promise;
+    h.shutdown();
+    await h.credentials.modify(providerId, async () => otherAccount);
+    if (mode === "restart") h.start();
+    release.resolve();
+    await pending;
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(h.models.getModels(providerId).map(model => model.id)).toEqual(["cached"]);
+    expect((await h.modelsStore.read(providerId))?.models.map(model => model.id)).toEqual(["cached"]);
+  } finally {
+    release.resolve();
+    h.shutdown();
+  }
+});
+
 test("fresh start aligns to remaining freshness; a slow check moves the next due time", async () => {
   const h = await host(now - period + 500);
   const timeout = vi.spyOn(globalThis, "setTimeout");
@@ -219,30 +318,45 @@ test("shutdown clears an alignment timeout and ignores late startup completion",
   expect(fresh.refresh).not.toHaveBeenCalled();
 });
 
-test("shutdown cancels every queued ticket warm-up before it can poll", async () => {
+test.each(["withdrawal", "replacement", "shutdown"])("a queued warm-up stops polling after route %s", async change => {
   vi.setSystemTime(inWindow);
   vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
   vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
   const h = await host();
-  let takes = 0, polls = 0;
-  vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+  let id = flash;
+  const takes: (AbortSignal | null | undefined)[] = [];
+  const polls: unknown[] = [];
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
     switch (String(input)) {
-      case LIVE_MODELS_URL: return reply("glm-5.3-flash");
+      case LIVE_MODELS_URL: return reply(id);
       case MODELS_DEV_API_URL: return Response.json({});
       case `${ticket}/availability`: return Response.json({ can_take_number: true });
-      case ticket: return Response.json({ state: "queued", ticket_id: String(++takes), next_poll_after: 2 });
-      case `${ticket}/status`: polls++; return Response.json({ tickets: [] });
+      case ticket:
+        takes.push(init?.signal);
+        return Response.json({ state: "queued", ticket_id: String(takes.length), next_poll_after: 2 });
+      case `${ticket}/status`:
+        polls.push(JSON.parse(String(init?.body)));
+        return Response.json({ tickets: [] });
       default: unexpected.push(String(input)); throw new Error("Unexpected request");
     }
   });
-  h.start();
-  await h.refresh.mock.results[0].value;
-  await h.command("--force");
-  expect(takes).toBe(2);
-  h.shutdown();
+  try {
+    h.start();
+    await h.refresh.mock.results[0].value;
+    await vi.advanceTimersByTimeAsync(0);
+    if (change === "shutdown") h.shutdown();
+    else {
+      id = change === "withdrawal" ? "ordinary" : "replacement-flash";
+      await h.command("--force");
+      expect(h.models.getModels(providerId).map(model => model.id)).toEqual([id]);
+    }
+    expect(takes.map(signal => signal?.aborted)).toEqual(change === "replacement" ? [true, false] : [true]);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(polls).toEqual(change === "replacement" ? [{ ticket_ids: ["2"] }] : []);
+  } finally {
+    h.shutdown();
+  }
   expect(vi.getTimerCount()).toBe(0);
-  await vi.advanceTimersByTimeAsync(2000);
-  expect(polls).toBe(0);
 });
 
 function offPeakSources(take: (init?: RequestInit) => Response | Promise<Response>) {
@@ -270,6 +384,56 @@ function offPeakSources(take: (init?: RequestInit) => Response | Promise<Respons
 
 const ready = () => Response.json({ state: "ready", ticket_id: "fixture-ticket" });
 const refreshOnline = { providers: [providerId], force: true, allowNetwork: true };
+
+test.each(["neither", "first", "both"])("concurrent streams share one on-demand take with independent cancellation: %s", async cancel => {
+  const entered = deferred<void>();
+  const release = deferred<Response>();
+  let acquireSignal: AbortSignal | null | undefined;
+  let takes = 0;
+  const { calls, sent } = offPeakSources(init => {
+    if (++takes === 1) return new Response(null, { status: 429 }); // Warm-up refused.
+    if (takes > 2) return new Response(null, { status: 429 });
+    acquireSignal = init?.signal;
+    entered.resolve();
+    return release.promise;
+  });
+  const h = await host();
+  try {
+    await h.models.refresh(refreshOnline);
+    await vi.advanceTimersByTimeAsync(0);
+    const model = h.models.getModel(providerId, flash);
+    if (!model) throw new Error("Missing accepted flash model");
+    const auth = await h.oauth.toAuth(account);
+    const first = new AbortController(), second = new AbortController();
+    const start = (signal: AbortSignal) => h.provider.streamSimple(model, transcript, {
+      ...auth, headers: { ...auth.headers, "X-Client-Sig": "fixture" }, signal, maxRetries: 0,
+    }).result();
+    const firstResult = start(first.signal);
+    await entered.promise;
+    const secondResult = start(second.signal);
+    if (cancel !== "neither") {
+      first.abort();
+      expect(await firstResult).toMatchObject({ stopReason: "aborted" });
+      expect(acquireSignal?.aborted).toBe(false);
+    }
+    if (cancel === "both") {
+      second.abort();
+      expect(await secondResult).toMatchObject({ stopReason: "aborted" });
+      expect(acquireSignal?.aborted).toBe(true);
+      expect(await start(second.signal)).toMatchObject({ stopReason: "aborted" });
+    }
+    release.resolve(ready());
+    await Promise.all([firstResult, secondResult]);
+    expect(takes).toBe(2);
+    expect(calls.filter(url => url.includes("/v1/messages"))).toEqual(
+      Array.from({ length: cancel === "neither" ? 2 : cancel === "first" ? 1 : 0 }, () => `${OFFPEAK_BASE_URL}/v1/messages?beta=true`),
+    );
+    expect(sent.every(headers => headers.get("X-Off-Peak-Ticket-ID") === "fixture-ticket")).toBe(true);
+  } finally {
+    release.resolve(ready());
+    h.shutdown();
+  }
+});
 
 test.each(["caller", "shutdown", "on-demand caller"] as const)(
   "stream cancellation ends the foreground wait without dispatching inference: %s", async mode => {

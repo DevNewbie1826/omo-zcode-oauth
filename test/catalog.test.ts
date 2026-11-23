@@ -396,13 +396,15 @@ test.each(["accepted", "non-flash", "refused", "write-failure"] as const)(
     }
     expect(onAccepted).toHaveBeenCalledExactlyOnceWith({
       access: offPeakCredential.access, jwt: offPeakCredential.zcodeJwtToken, session: session.signal,
-      isCurrent: expect.any(Function),
+      signal: expect.any(AbortSignal), isCurrent: expect.any(Function),
     });
     expect(c.getModels()).toMatchObject([{ id, baseUrl: OFFPEAK_BASE_URL }]);
     const route = onAccepted.mock.calls[0]?.[0];
     expect(route?.isCurrent()).toBe(true);
+    expect(route?.signal.aborted).toBe(false);
     c.clearSessionRoute();
     expect(route?.isCurrent()).toBe(false);
+    expect(route?.signal.aborted).toBe(true);
   },
 );
 
@@ -438,7 +440,7 @@ test("a fresh restore does not reuse an identical snapshot's route under a diffe
 
   session = new AbortController().signal;
   sources();
-  await c.refresh({ ...h.ctx, stored: h.stored(), force: false });
+  await c.refresh({ ...h.ctx, signal: new AbortController().signal, stored: h.stored(), force: false });
   expect(c.getModels()[0].baseUrl).toBe(ULTRA_BASE_URL);
 });
 

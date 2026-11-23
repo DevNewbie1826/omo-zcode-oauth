@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@code-yeongyu/senpi";
 import { createAssistantMessageEventStream, createProvider, hasApi, type AssistantMessage, type Model, type OAuthAuth, type ProviderStreams, type RefreshModelsContext } from "@earendil-works/pi-ai";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/compat";
-import { CATALOG_REFRESH_INTERVAL_MS, ZCODE_PROVIDER_ID, buildZCodeSourceHeaders, resolveZCodeAnthropicBaseUrl } from "./models.js";
+import { CATALOG_REFRESH_INTERVAL_MS, ULTRA_BASE_URL, ZCODE_PROVIDER_ID, buildZCodeSourceHeaders, resolveZCodeAnthropicBaseUrl } from "./models.js";
 import { CATALOG_TRIGGER_TIMEOUT_MS, createZCodeCatalog, type AcceptedOffPeakRoute } from "./catalog.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { loginGlmZcode, refreshGlmZcode } from "./oauth.js";
@@ -29,9 +29,19 @@ const anthropic = anthropicMessagesApi();
 let cachedCredential: { apiKey: string; jwt: string } | undefined;
 const TICKET_REQUEST_WAIT_MS = 60_000;
 let offPeakTaskId: string | undefined;
-let preTakenTicket: { route: AcceptedOffPeakRoute; ticket: OffPeakTicketState } | undefined;
-let pendingTicket: { route: AcceptedOffPeakRoute; promise: Promise<string | undefined> } | undefined;
 let offPeakTestClock: Date | undefined;
+
+interface PendingTicket {
+  readonly controller: AbortController;
+  readonly promise: Promise<string | undefined>;
+  readonly background: boolean;
+  waiters: number;
+}
+
+interface TicketRoute extends AcceptedOffPeakRoute {
+  ticket?: OffPeakTicketState;
+  pending?: PendingTicket;
+}
 
 function currentOffPeakTaskId(): string {
   offPeakTaskId ??= `omo-offpeak-${crypto.randomUUID()}`;
@@ -67,23 +77,24 @@ function routeUsable(route: AcceptedOffPeakRoute): boolean {
   return route.isCurrent() && ticketRouteEnabled() && isOffPeakWindow(offPeakTestClock ?? new Date());
 }
 
-function retainTicket(route: AcceptedOffPeakRoute, id: string): void {
-  if (routeUsable(route)) {
-    preTakenTicket = { route, ticket: takeTicketState(route.jwt, route.access, id, offPeakTestClock ?? new Date()) };
-  }
-}
-
-function warmTicket(route: AcceptedOffPeakRoute): void {
-  if (!routeUsable(route)) return;
-  const promise = ensureOffPeakTicket(route.jwt, route.access, currentOffPeakTaskId(), route.session, { background: true });
-  const pending = { route, promise };
-  pendingTicket = pending;
-  const clear = () => { if (pendingTicket === pending) pendingTicket = undefined; };
-  void promise.then(id => {
-    if (pendingTicket !== pending) return;
-    clear();
-    if (id) retainTicket(route, id);
-  }, clear);
+function startTicket(route: TicketRoute, background: boolean): PendingTicket {
+  const controller = new AbortController();
+  const signal = AbortSignal.any([route.signal, controller.signal]);
+  const work = ensureOffPeakTicket(route.jwt, route.access, currentOffPeakTaskId(), signal, { background });
+  const pending: PendingTicket = {
+    controller, background, waiters: 0,
+    promise: waitFor(work, signal).catch(error => {
+      if (signal.aborted) return undefined;
+      throw error;
+    }).then(id => {
+      if (id && route.pending === pending && routeUsable(route) && (background || credentialMatches(route, route.access))) {
+        route.ticket = takeTicketState(route.jwt, route.access, id, offPeakTestClock ?? new Date());
+      }
+      return id;
+    }).finally(() => { if (route.pending === pending) route.pending = undefined; }),
+  };
+  route.pending = pending;
+  return pending;
 }
 
 async function waitFor<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
@@ -100,21 +111,20 @@ async function waitFor<T>(operation: Promise<T>, signal: AbortSignal): Promise<T
   }
 }
 
-async function requestTicket(route: AcceptedOffPeakRoute, signal: AbortSignal): Promise<string | undefined> {
+async function requestTicket(route: TicketRoute, signal: AbortSignal): Promise<string | undefined> {
   signal.throwIfAborted();
   const now = offPeakTestClock ?? new Date();
-  if (preTakenTicket?.route === route && isTicketFresh(preTakenTicket.ticket, now, route.access, route.jwt)) {
-    return preTakenTicket.ticket.ticketId;
-  }
-  // A shared warm-up stays session-owned. An on-demand take belongs only to this request.
+  if (route.ticket && isTicketFresh(route.ticket, now, route.access, route.jwt)) return route.ticket.ticketId;
+  const pending = route.pending ?? startTicket(route, false);
+  pending.waiters++;
+  // Each foreground wait has its own deadline and referenced timer, even when
+  // the acquisition is a background warm-up with unref'd poll timers.
   const deadline = new AbortController();
   const timer = setTimeout(() => deadline.abort(), TICKET_REQUEST_WAIT_MS);
   const waitSignal = AbortSignal.any([signal, deadline.signal]);
   try {
-    const shared = pendingTicket?.route === route ? pendingTicket.promise : undefined;
-    const id = await waitFor(shared ?? ensureOffPeakTicket(route.jwt, route.access, currentOffPeakTaskId(), waitSignal), waitSignal);
+    const id = await waitFor(pending.promise, waitSignal);
     signal.throwIfAborted();
-    if (id && !shared && credentialMatches(route, route.access)) retainTicket(route, id);
     return id;
   } catch (error) {
     signal.throwIfAborted();
@@ -122,6 +132,11 @@ async function requestTicket(route: AcceptedOffPeakRoute, signal: AbortSignal): 
     throw error;
   } finally {
     clearTimeout(timer);
+    pending.waiters--;
+    if (pending.waiters === 0 && !pending.background && route.pending === pending) {
+      route.pending = undefined;
+      pending.controller.abort();
+    }
   }
 }
 
@@ -152,7 +167,7 @@ function normalBaseUrl(model: Model<"anthropic-messages">): string {
     (isOffPeakRouted(model) ? resolveZCodeAnthropicBaseUrl() : model.baseUrl);
 }
 
-const streams = (session: { controller: AbortController }, routeFor: (id: string, key: string) => AcceptedOffPeakRoute | undefined): ProviderStreams => ({
+const streams = (session: { controller: AbortController }, routeFor: (id: string, key: string) => TicketRoute | undefined): ProviderStreams => ({
   stream(model, context, options) {
     if (!hasApi(model, "anthropic-messages")) throw new Error("Expected an Anthropic chat model");
     const signal = requestSignal(session.controller.signal, options?.signal);
@@ -165,7 +180,9 @@ const streams = (session: { controller: AbortController }, routeFor: (id: string
     const signal = requestSignal(session.controller.signal, options?.signal);
     if (signal.aborted) return abortedStream(model);
     const key = options?.apiKey ?? "";
-    const route = routeFor(model.id, key);
+    // A host-selected non-canonical URL (e.g. models.json) is an explicit
+    // destination. Canonical ultra and the catalog marker are not overrides.
+    const route = model.baseUrl === ULTRA_BASE_URL || isOffPeakRouted(model) ? routeFor(model.id, key) : undefined;
     if (!route) return anthropic.streamSimple({ ...model, baseUrl: normalBaseUrl(model) }, context, { ...options, signal });
     const outer = createAssistantMessageEventStream();
     void (async () => {
@@ -180,7 +197,7 @@ const streams = (session: { controller: AbortController }, routeFor: (id: string
         Object.assign(headers, await waitFor(resolveZCodeSigningHeaders({ ...headers, Authorization: "Bearer " + key }), signal));
       }
       signal.throwIfAborted();
-      const baseUrl = offPeak ? OFFPEAK_BASE_URL : resolveZCodeAnthropicBaseUrl();
+      const baseUrl = offPeak ? OFFPEAK_BASE_URL : normalBaseUrl(model);
       const inner = anthropic.streamSimple({ ...model, baseUrl }, context, { ...options, headers, signal });
       for await (const event of inner) outer.push(event);
       outer.end(await inner.result());
@@ -200,8 +217,6 @@ export function setOffPeakClockForTests(clock: Date | undefined): void {
 /** Test hook: clear credential/ticket caches between cases. */
 export function resetOffPeakStateForTests(): void {
   cachedCredential = undefined;
-  preTakenTicket = undefined;
-  pendingTicket = undefined;
   offPeakTaskId = undefined;
 }
 
@@ -270,7 +285,7 @@ function deviceIdentityMetadata(): { user_id: string } | undefined {
   return { user_id: JSON.stringify({ device_id: deviceId, account_uuid: "", session_id: zcodeSessionId() }) };
 }
 
-const oauth: OAuthAuth = {
+const oauth: Omit<OAuthAuth, "toAuth"> = {
   name: "GLM ZCode",
   async login(interaction) {
     const credential = await loginGlmZcode({
@@ -285,59 +300,69 @@ const oauth: OAuthAuth = {
     return { ...credential, type: "oauth" };
   },
   refresh: async (credential, signal) => ({ ...await refreshGlmZcode(credential, signal), type: "oauth" }),
-  async toAuth({ access, zcodeJwtToken }) {
-    const jwt = typeof zcodeJwtToken === "string" && zcodeJwtToken ? zcodeJwtToken : undefined;
-    cachedCredential = jwt ? { apiKey: access, jwt } : undefined;
-    if (preTakenTicket && (preTakenTicket.ticket.apiKey !== access || preTakenTicket.ticket.jwt !== jwt)) preTakenTicket = undefined;
-    if (pendingTicket && (pendingTicket.route.access !== access || pendingTicket.route.jwt !== jwt)) pendingTicket = undefined;
-    return { apiKey: access, headers: { ...buildZCodeSourceHeaders(), Authorization: "Bearer " + access } };
-  },
 };
 
 function catalogRefreshes(catalog: ReturnType<typeof createZCodeCatalog>) {
   // The registry's result only reports caller aborts. The provider sees generation aborts.
-  const trigger = new AsyncLocalStorage<{ deadline: number; providerSignal?: AbortSignal }>();
-  let latest: { signal: AbortSignal; done: Promise<void> } | undefined;
+  type Attempt = { readonly deadline: number; providerSignal?: AbortSignal };
+  const trigger = new AsyncLocalStorage<Attempt>();
+  let latestPhase: { signal: AbortSignal; done: Promise<void> } | undefined;
+  let latestIssued: { session: AbortSignal; done: Promise<boolean>; settled: boolean } | undefined;
   return {
     provider(context: RefreshModelsContext) {
       const owner = trigger.getStore();
       if (owner) owner.providerSignal = context.signal;
       const work = catalog.refresh(context, owner?.deadline);
-      latest = { signal: context.signal, done: work.then(() => {}, () => {}) };
+      if (!context.signal.aborted) latestPhase = { signal: context.signal, done: work.then(() => {}, () => {}) };
       return work;
     },
     async run(ctx: ExtensionContext, force: boolean, session: AbortSignal, retrySuperseded = false): Promise<boolean> {
+      // Register the whole call before the host starts its credential/store reads.
+      if (retrySuperseded && latestIssued?.session === session && !latestIssued.settled) return latestIssued.done;
+      let complete: ((ok: boolean) => void) | undefined;
+      const done = new Promise<boolean>(resolve => { complete = resolve; });
+      const issued = { session, done, settled: false };
+      latestIssued = issued;
+      let ok = false;
       try {
         const signal = AbortSignal.any([session, AbortSignal.timeout(CATALOG_TRIGGER_TIMEOUT_MS)]);
         const deadline = Date.now() + CATALOG_TRIGGER_TIMEOUT_MS;
-        const first: { deadline: number; providerSignal?: AbortSignal } = { deadline };
-        const run = () => ctx.modelRegistry.refresh({
+        const run = (attempt: Attempt) => trigger.run(attempt, () => ctx.modelRegistry.refresh({
           providers: [ZCODE_PROVIDER_ID], force, allowNetwork: process.env.OFFLINE === undefined, signal,
-        });
-        let result = await trigger.run(first, run);
-        // Even without credentials the registry calls the restore phase, unless
-        // this generation was superseded before it reached the provider.
-        const superseded = first.providerSignal?.aborted ?? true;
-        if (retrySuperseded && superseded && !signal.aborted && !result.aborted && result.errors.size === 0) {
-          // Give a cache phase a turn to hand off to the host's online phase, and
-          // don't interrupt an observed replacement publication. Recovery is one-shot.
-          let replacement: typeof latest;
+        }));
+        // Even without credentials a completed generation reaches the restore phase.
+        let attempt: Attempt = { deadline };
+        let result = await run(attempt);
+        if (retrySuperseded && attempt.providerSignal?.aborted !== false &&
+            !signal.aborted && !result.aborted && result.errors.size === 0) {
+          const newerIssued = () => latestIssued !== issued && latestIssued?.session === session ? latestIssued : undefined;
+          // Keep one-shot recovery for unsolicited host refreshes. Unlike extension
+          // calls, their pre-provider lifetime is not observable here.
+          let replacement: typeof latestPhase;
           do {
-            replacement = latest;
-            if (replacement && replacement.signal !== first.providerSignal && !replacement.signal.aborted) {
+            if (newerIssued()) break;
+            replacement = latestPhase;
+            if (replacement && replacement.signal !== attempt.providerSignal && !replacement.signal.aborted) {
               await waitFor(replacement.done, AbortSignal.any([signal, replacement.signal])).catch(() => {});
             }
-            if (signal.aborted || catalog.isFresh()) break;
+            if (newerIssued() || signal.aborted || catalog.isFresh()) break;
             await new Promise<void>(resolve => { setImmediate(resolve).unref(); });
-          } while (replacement !== latest && !signal.aborted);
+          } while (replacement !== latestPhase && !signal.aborted);
+          const newer = newerIssued();
+          if (newer) return ok = await waitFor(newer.done, signal);
+          if (catalog.isFresh()) return ok = !signal.aborted;
           if (!signal.aborted && process.env.OFFLINE === undefined && !catalog.isFresh()) {
-            result = await trigger.run({ deadline }, run);
+            attempt = { deadline };
+            result = await run(attempt);
           }
         }
-        return !signal.aborted && !result.aborted && result.errors.size === 0;
+        return ok = !signal.aborted && !result.aborted && result.errors.size === 0 && attempt.providerSignal?.aborted === false;
       } catch {
         // Registry errors may contain credentials. Never forward their messages to the UI.
         return false;
+      } finally {
+        issued.settled = true;
+        complete?.(ok);
       }
     },
   };
@@ -416,10 +441,11 @@ function registerCatalogTriggers(pi: GlmExtensionAPI, catalog: ReturnType<typeof
 export default function glmZcodeExtension(pi: GlmExtensionAPI): void {
   if (!printableAsciiEnv("ZCODE_DEVICE_ID")) defaultDeviceId ??= getOrCreateDeviceMid();
   const session = { controller: new AbortController() };
-  let acceptedRoute: AcceptedOffPeakRoute | undefined;
+  let acceptedRoute: TicketRoute | undefined;
   const catalog = createZCodeCatalog(offPeakActiveFor, () => session.controller.signal, route => {
-    acceptedRoute = route;
-    warmTicket(route);
+    const tickets: TicketRoute = { ...route };
+    acceptedRoute = tickets;
+    if (routeUsable(tickets)) void startTicket(tickets, true).promise.catch(() => {});
   });
   const refreshes = catalogRefreshes(catalog);
   const routeFor = (id: string, key: string) => {
@@ -440,8 +466,23 @@ export default function glmZcodeExtension(pi: GlmExtensionAPI): void {
   pi.on("before_provider_headers", async (event) => {
     Object.assign(event.headers, await resolveZCodeSigningHeaders(event.headers));
   });
+  const auth: OAuthAuth = {
+    ...oauth,
+    async toAuth({ access, zcodeJwtToken }) {
+      const jwt = typeof zcodeJwtToken === "string" && zcodeJwtToken ? zcodeJwtToken : undefined;
+      cachedCredential = jwt ? { apiKey: access, jwt } : undefined;
+      const route = acceptedRoute;
+      if (route && (route.access !== access || route.jwt !== jwt)) {
+        route.ticket = undefined;
+        const pending = route.pending;
+        route.pending = undefined;
+        pending?.controller.abort();
+      }
+      return { apiKey: access, headers: { ...buildZCodeSourceHeaders(), Authorization: "Bearer " + access } };
+    },
+  };
   const base = createProvider({ id: ZCODE_PROVIDER_ID, name: "GLM ZCode", baseUrl: resolveZCodeAnthropicBaseUrl(),
-    auth: { oauth }, models: catalog.getModels(), api: streams(session, routeFor) });
+    auth: { oauth: auth }, models: catalog.getModels(), api: streams(session, routeFor) });
   pi.registerProvider({ ...base, getModels: catalog.getModels, getAllModels: catalog.getModels,
     refreshModels: refreshes.provider });
   registerCatalogTriggers(pi, catalog, session, refreshes.run);

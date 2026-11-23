@@ -82,6 +82,7 @@ export async function fetchOffPeakAvailability(jwt: string, apiKey: string, sign
 }
 
 function sleep(ms: number, signal: AbortSignal | undefined, background: boolean): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
   return new Promise(resolve => {
     const timer = setTimeout(done, ms);
     if (background) timer.unref();
@@ -130,6 +131,7 @@ export async function ensureOffPeakTicket(
     if (state !== "queued") return undefined;
     if (Date.now() + pollIntervalMs > deadline) return undefined;
     await sleep(pollIntervalMs, signal, background);
+    if (signal?.aborted) return undefined;
     const status = await ticketFetch(`${TICKET_BASE_URL}/status`, {
       method: "POST", signal,
       headers: { ...ticketHeaders(jwt, apiKey), "Content-Type": "application/json" },

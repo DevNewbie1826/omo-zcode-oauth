@@ -27,8 +27,15 @@ interface OffPeakOwner {
 }
 
 export interface AcceptedOffPeakRoute extends OffPeakOwner {
+  /** Cancelled on withdrawal/replacement as well as session shutdown. */
+  readonly signal: AbortSignal;
   /** False once this publication's route is replaced or its session ends. */
   readonly isCurrent: () => boolean;
+}
+
+interface PublishedRoute extends OffPeakOwner {
+  readonly canonical: ModelsStoreEntry;
+  readonly controller: AbortController;
 }
 
 interface Snapshot {
@@ -36,7 +43,7 @@ interface Snapshot {
   readonly wireNames: ReadonlyMap<string, string>;
   readonly foldedWireNames: ReadonlyMap<string, string | undefined>;
   readonly checkedAt?: number;
-  readonly route?: OffPeakOwner & { readonly canonical: ModelsStoreEntry };
+  readonly route?: PublishedRoute;
 }
 
 function nativeModels(rows: ZCodeChatModelConfig[], offPeak: boolean): Snapshot["current"] {
@@ -128,14 +135,20 @@ export function createZCodeCatalog(
 ) {
   const standaloneSession = new AbortController().signal;
   const currentSession = getSessionSignal ?? (() => standaloneSession);
+  const generationSessions = new WeakMap<AbortSignal, AbortSignal>();
   let state: Snapshot = {
     current: nativeModels(zcodeFallbackChatModels(), false), wireNames: new Map(), foldedWireNames: new Map(),
   };
+  function install(candidate: Snapshot): void {
+    const old = state.route;
+    state = candidate;
+    if (old !== candidate.route) old?.controller.abort();
+  }
   return {
     getModels: () => state.current,
     get checkedAt() { return state.checkedAt; },
     clearSessionRoute() {
-      if (state.route) state = snapshot(storedToConfig(state.route.canonical), state.checkedAt);
+      if (state.route) install(snapshot(storedToConfig(state.route.canonical), state.checkedAt));
     },
     isFresh: () => isFresh(state.checkedAt),
     officialGlmModelId(id: string): string {
@@ -143,8 +156,13 @@ export function createZCodeCatalog(
       return appWireNames.get(lower) ?? state.wireNames.get(id) ?? state.foldedWireNames.get(lower) ?? id;
     },
     async refresh(ctx: RefreshModelsContext, deadline = Date.now() + CATALOG_TRIGGER_TIMEOUT_MS): Promise<void> {
-      // Capture the session once; this signal's identity is also the route's generation token.
-      const session = currentSession();
+      // The host uses one generation signal for restore and online phases.
+      let session = generationSessions.get(ctx.signal);
+      if (!session) {
+        session = currentSession();
+        generationSessions.set(ctx.signal, session);
+      }
+      if (session !== currentSession()) return;
       const context = { ...ctx, signal: AbortSignal.any([ctx.signal, session]) };
       const { stored, signal } = context;
       const isCurrent = () => !signal.aborted && currentSession() === session;
@@ -164,7 +182,7 @@ export function createZCodeCatalog(
           isDeepStrictEqual(stored?.models, route.canonical.models);
         const canonical = snapshot(restored, checkedAt);
         const candidate = sameRoute ? state : canonical;
-        if (!(await context.publish({ update: () => { if (isCurrent()) state = candidate; } }))) return;
+        if (!(await context.publish({ update: () => { if (isCurrent()) install(candidate); } }))) return;
       }
       if (!context.allowNetwork || !isCurrent() || process.env.OFFLINE !== undefined) return;
       if (!context.force && restored.length && isFresh(checkedAt)) return;
@@ -183,18 +201,19 @@ export function createZCodeCatalog(
         checkedAt: now,
       };
       const route = discovery.offPeak && owner && !process.env.ZCODE_ANTHROPIC_BASE_URL?.trim()
-        ? { ...owner, canonical: persist } : undefined;
+        ? { ...owner, canonical: persist, controller: new AbortController() } : undefined;
       const canonical = snapshot(rows, now);
       const candidate = route ? { ...canonical, current: nativeModels(rows, true), route } : canonical;
       // A host-started write may finish after shutdown. Only a current session may use its update.
       const accepted = await context.publish({
         persist,
-        update: () => { if (isCurrent()) state = candidate; },
+        update: () => { if (isCurrent()) install(candidate); },
       });
       if (accepted && route && isCurrent() && state.route === route) {
+        const routeSignal = AbortSignal.any([session, route.controller.signal]);
         onOffPeakAccepted?.({
-          session: route.session, access: route.access, jwt: route.jwt,
-          isCurrent: () => !session.aborted && currentSession() === session && state.route === route,
+          session, access: route.access, jwt: route.jwt, signal: routeSignal,
+          isCurrent: () => !routeSignal.aborted && currentSession() === session && state.route === route,
         });
       }
     },

@@ -239,6 +239,7 @@ function expectSignedUltra(model: WireEntry, bearer: string): void {
 beforeEach(() => {
   // Explicit preconditions: an operator's ambient ZCODE_* settings must not reach the assertions.
   vi.stubEnv("OFFLINE", undefined);
+  vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
   vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
   vi.stubEnv("ZCODE_APP_VERSION", "4.0.0");
   vi.stubEnv("ZCODE_RELEASE_CHANNEL", "production");
@@ -436,6 +437,7 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
   });
 
   test("transport disabled: refreshModels never routes flash off-peak despite a valid window", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakTransportForTests(false);
     setOffPeakClockForTests(IN_WINDOW);
     const { provider } = captureExtension();
@@ -759,10 +761,12 @@ describe("device identity metadata (PR10)", () => {
   test("off-peak routing requires ZCODE_OFFPEAK_ENABLE=1", async () => {
     setOffPeakClockForTests(IN_WINDOW);
     const { provider } = captureExtension();
+    const requests: string[] = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: string | URL | Request) => {
         const url = String(input);
+        requests.push(url);
         if (url === LIVE_MODELS_URL) return jsonResponse({ data: [{ id: "glm-5.3-flash" }] });
         if (url === MODELS_DEV_API_URL) return jsonResponse({});
         throw new Error(`unexpected request: ${url}`);
@@ -770,6 +774,7 @@ describe("device identity metadata (PR10)", () => {
     );
     await provider.refreshModels!(refreshHost());
     expect(provider.getModels().find((model) => model.id === "glm-5.3-flash")?.baseUrl).toBe(ULTRA_BASE_URL);
+    expect(requests).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]); // No availability/take, even if a failure would be swallowed.
   });
 });
 
@@ -847,6 +852,43 @@ describe("flag drops mid-acquisition", () => {
 });
 
 describe("non-routed passthrough wire", () => {
+  test.each(["ready", "refused"])("host-selected URL beats the accepted route with warm-up %s", async outcome => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakClockForTests(IN_WINDOW);
+    const cipher = await cipherFixture();
+    const wire: WireEntry[] = [];
+    const unexpected: string[] = [];
+    const sequence = ticketSequence([outcome === "ready" ? "warm" : undefined]);
+    vi.stubGlobal("fetch", wireFetch(wire, withCatalog((url, init) => {
+      if (url === TICKET_BASE) {
+        if (sequence.takes !== 0) {
+          unexpected.push(url);
+          throw new Error(`unexpected request-time take: ${url}`);
+        }
+        return sequence.take();
+      }
+      const signing = signingRoutes(cipher)(url, init);
+      if (signing || MESSAGE_ENDPOINTS.has(new URL(url).origin + new URL(url).pathname)) return signing;
+      unexpected.push(url);
+      throw new Error(`unexpected request: ${url}`);
+    })));
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
+
+    const result = await provider.streamSimple(wireModel(FAKE_HOST), transcript, {
+      apiKey: KEY, headers: auth, maxRetries: 0,
+    }).result();
+
+    expect(result.content).toEqual([{ type: "text", text: "OK" }]);
+    expect(wire.map(entry => entry.pathname)).toEqual([`${FAKE_HOST}/v1/messages`]);
+    expect(wire[0].headers.authorization).toBe(`Bearer ${KEY}`);
+    expect(wire[0].headers["x-client-sig"]).toMatch(/^\S+$/);
+    expect(wire[0].headers["x-off-peak-ticket-id"]).toBeUndefined();
+    expect(sequence.takes).toBe(1);
+    expect(unexpected).toEqual([]);
+  });
+
   test("plain glm-zcode model hits only the model baseUrl /v1/messages", async () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
     const cipher = await cipherFixture();
