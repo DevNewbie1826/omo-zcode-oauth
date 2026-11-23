@@ -41,6 +41,15 @@ function json(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), { status, headers: { "Content-Type": "application/json" } });
 }
 
+/** Exact-target double for the models.dev reader: any other URL rejects instead of answering. */
+function modelsDevOnly(payload: unknown): ReturnType<typeof vi.fn> {
+  return vi.fn(async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url !== MODELS_DEV_API_URL) throw new Error(`unexpected transport URL: ${url}`);
+    return json(payload);
+  });
+}
+
 function registeredModel(): Model<"anthropic-messages"> {
   const model = captureProvider().getModels().find(m => m.id === "glm-5.3");
   if (!model || !hasApi(model, "anthropic-messages")) throw new Error("Missing fallback model");
@@ -141,6 +150,8 @@ beforeEach(() => {
   vi.stubEnv("OFFLINE", undefined);
   vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
   vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
+  vi.stubEnv("ZCODE_APP_VERSION", "4.0.0");
+  vi.stubEnv("ZCODE_RELEASE_CHANNEL", "production");
   vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("Unexpected fetch"); }));
 });
 afterEach(() => {
@@ -589,9 +600,11 @@ describe("dynamic model catalog", () => {
 
 
   test("maps valid catalog models and skips malformed entries", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => json(catalogPayload)));
+    const fetch = modelsDevOnly(catalogPayload);
+    vi.stubGlobal("fetch", fetch);
 
     const models = catalogRowsFromModelsDev(await fetchModelsDevPayload());
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([MODELS_DEV_API_URL]);
 
     expect(models).toEqual([
       {
@@ -634,7 +647,7 @@ describe("dynamic model catalog", () => {
   });
 
   test("persists and restores thinking configuration", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => json(catalogPayload)));
+    vi.stubGlobal("fetch", modelsDevOnly(catalogPayload));
     const models = catalogRowsFromModelsDev(await fetchModelsDevPayload());
 
     const persisted = catalogToPersistedModels(models);
@@ -662,11 +675,12 @@ describe("dynamic model catalog", () => {
   });
 
   test("refreshModels publishes valid models to the registered getters", async () => {
-    const fetch = vi.fn(async () => json(catalogPayload));
+    const fetch = modelsDevOnly(catalogPayload);
     const publish = publisher();
     vi.stubGlobal("fetch", fetch);
 
     const models = await visibleAfterRefresh(context({ publish }));
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([MODELS_DEV_API_URL]);
 
     expect(models).toHaveLength(3);
     expect(models.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal", "glm-noname"]);
@@ -692,7 +706,7 @@ describe("dynamic model catalog", () => {
   });
 
   test("offline without stored models keeps both emergency models without fetching", async () => {
-    const fetch = vi.fn(async () => json(catalogPayload));
+    const fetch = modelsDevOnly(catalogPayload);
     vi.stubGlobal("fetch", fetch);
 
     const models = await visibleAfterRefresh(context({ allowNetwork: false, stored: undefined }));
@@ -702,7 +716,7 @@ describe("dynamic model catalog", () => {
   });
 
   test("offline with stored models restores them without fetching", async () => {
-    const fetch = vi.fn(async () => json(catalogPayload));
+    const fetch = modelsDevOnly(catalogPayload);
     vi.stubGlobal("fetch", fetch);
 
     const models = await visibleAfterRefresh(
@@ -733,13 +747,13 @@ describe("dynamic model catalog", () => {
   });
 
   test("malformed api.json without zai-coding-plan retains the fallback", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => json({ anotherProvider: { models: {} } })));
+    vi.stubGlobal("fetch", modelsDevOnly({ anotherProvider: { models: {} } }));
 
     expect((await visibleAfterRefresh(context())).map(m => m.id).sort()).toEqual(fallbackIds);
   });
 
   test("fresh stored models skip the catalog fetch", async () => {
-    const fetch = vi.fn(async () => json(catalogPayload));
+    const fetch = modelsDevOnly(catalogPayload);
     vi.stubGlobal("fetch", fetch);
 
     const models = await visibleAfterRefresh(
@@ -751,26 +765,26 @@ describe("dynamic model catalog", () => {
   });
 
   test("expired stored models trigger a catalog re-fetch", async () => {
-    const fetch = vi.fn(async () => json(catalogPayload));
+    const fetch = modelsDevOnly(catalogPayload);
     vi.stubGlobal("fetch", fetch);
 
     const models = await visibleAfterRefresh(
       context({ stored: { models: [persistedModel], checkedAt: Date.now() - 25 * 60 * 60 * 1_000 } }),
     );
 
-    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([MODELS_DEV_API_URL]);
     expect(models?.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal", "glm-noname"]);
   });
 
   test("force bypasses the stored-model TTL", async () => {
-    const fetch = vi.fn(async () => json(catalogPayload));
+    const fetch = modelsDevOnly(catalogPayload);
     vi.stubGlobal("fetch", fetch);
 
     const models = await visibleAfterRefresh(
       context({ force: true, stored: { models: [persistedModel], checkedAt: Date.now() } }),
     );
 
-    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([MODELS_DEV_API_URL]);
     expect(models?.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal", "glm-noname"]);
   });
 

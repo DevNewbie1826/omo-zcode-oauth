@@ -9,6 +9,9 @@ beforeEach(() => {
   vi.setSystemTime(Date.UTC(2026, 10, 23));
   vi.stubEnv("OFFLINE", undefined);
   vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
+  vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
+  vi.stubEnv("ZCODE_APP_VERSION", "4.0.0");
+  vi.stubEnv("ZCODE_RELEASE_CHANNEL", "production");
   vi.stubEnv("ZCODE_DEVICE_ID", "test-device-1234");
   vi.stubGlobal(
     "fetch",

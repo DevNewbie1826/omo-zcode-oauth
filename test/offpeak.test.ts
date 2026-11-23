@@ -12,6 +12,8 @@ import {
   offPeakRequestHeaders,
 } from "../extensions/glm-zcode/offpeak.js";
 
+const ticketUrl = "https://zcode.z.ai/api/v1/off-peak/ticket";
+
 function json(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), { status, headers: { "Content-Type": "application/json" } });
 }
@@ -34,7 +36,9 @@ function plainModel(): ProviderModelConfig {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 describe("isOffPeakWindow", () => {
@@ -61,15 +65,18 @@ describe("isFlashModelId / isOffPeakRouted", () => {
 
 describe("fetchOffPeakAvailability", () => {
   test("availability request authenticates with the jwt and coding-plan key", async () => {
-    const fetch = vi.fn(async () => json({ code: 0, data: { can_take_number: true } }));
+    const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) !== `${ticketUrl}/availability`) throw new Error(`Unexpected request: ${String(input)}`);
+      return json({ code: 0, data: { can_take_number: true } });
+    });
     vi.stubGlobal("fetch", fetch);
 
     expect(await fetchOffPeakAvailability("jwt-tok", "key-id.secret")).toBe(true);
     expect(fetch).toHaveBeenCalledOnce();
-    const [url, init] = fetch.mock.calls[0] as unknown as [string, RequestInit];
-    expect(String(url)).toBe("https://zcode.z.ai/api/v1/off-peak/ticket/availability");
-    expect(init.method).toBe("GET");
-    const headers = new Headers(init.headers);
+    const [url, init] = fetch.mock.calls[0];
+    expect(String(url)).toBe(`${ticketUrl}/availability`);
+    expect(init?.method).toBe("GET");
+    const headers = new Headers(init?.headers);
     expect(headers.get("Authorization")).toBe("Bearer jwt-tok");
     expect(headers.get("X-Coding-Plan-Api-Key")).toBe("key-id.secret");
   });
@@ -90,6 +97,30 @@ describe("fetchOffPeakAvailability", () => {
 });
 
 describe("ensureOffPeakTicket", () => {
+  test.each([false, true])("poll timer only permits idle exit for background work: %s", async background => {
+    vi.useFakeTimers();
+    const clock = vi.spyOn(globalThis, "setTimeout");
+    const controller = new AbortController();
+    const fetch = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) !== ticketUrl) throw new Error(`Unexpected request: ${String(input)}`);
+      return json({ state: "queued", ticket_id: "fixture", next_poll_after: 2 });
+    });
+    vi.stubGlobal("fetch", fetch);
+    try {
+      const pending = ensureOffPeakTicket("jwt", "key", "task", controller.signal, { background });
+      await vi.advanceTimersByTimeAsync(0);
+      const poll = clock.mock.calls.findIndex(([, ms]) => ms === 2000);
+      expect(clock.mock.results[poll]?.value.hasRef()).toBe(!background);
+      controller.abort();
+      expect(await pending).toBeUndefined();
+      expect(fetch.mock.calls.map(([url]) => url)).toEqual([ticketUrl]);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      controller.abort();
+      vi.useRealTimers();
+    }
+  });
+
   test("a status response delivered after cancellation cannot yield a ready ticket", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-11-23T18:00:00Z"));

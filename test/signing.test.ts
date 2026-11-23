@@ -1,5 +1,5 @@
 import { webcrypto } from "node:crypto";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   SIGNING_GATE_URL,
   SIGNING_HANDSHAKE_URL,
@@ -102,6 +102,15 @@ afterEach(() => {
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
   resetZCodeSigningState();
+});
+
+beforeEach(() => {
+  // Explicit preconditions: an operator's ambient ZCODE_* settings must not reach the assertions.
+  vi.stubEnv("ZCODE_APP_VERSION", "4.0.0");
+  vi.stubEnv("ZCODE_RELEASE_CHANNEL", "production");
+  vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
+  vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
+  vi.stubEnv("OFFLINE", undefined);
 });
 
 describe("parseZCodeApiKey", () => {

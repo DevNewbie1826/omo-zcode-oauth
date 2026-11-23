@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { normalizeContext, type Model, type Provider } from "@earendil-works/pi-ai";
 import glmZcodeExtension from "../extensions/glm-zcode/index.js";
-import { ULTRA_BASE_URL } from "../extensions/glm-zcode/models.js";
+import { resolveZCodeAnthropicBaseUrl } from "../extensions/glm-zcode/models.js";
 import { resetZCodeSigningState } from "../extensions/glm-zcode/signing.js";
 
 // Opt-in live check: LIVE_ZCODE_WIRE=1 LIVE_ZCODE_KEY="<id>.<secret>" npx vitest run test/live-wire.test.ts
@@ -29,11 +29,12 @@ function captureProvider(): { provider: Provider; signingHook: HeadersHook } {
 
 // The diagnostic needs a flash model without a restore/discovery round trip: the
 // cold catalog carries only glm-5.3 and glm-5.4. This fixture is the catalog row
-// shape, constructed here rather than selected from the provider.
+// shape, constructed here rather than selected from the provider. It resolves the
+// endpoint at run time so an explicit ZCODE_ANTHROPIC_BASE_URL governs the probe.
 const flashModel: Model<"anthropic-messages"> = {
   provider: "glm-zcode",
   api: "anthropic-messages",
-  baseUrl: ULTRA_BASE_URL,
+  baseUrl: resolveZCodeAnthropicBaseUrl(),
   id: "glm-5.3-flash",
   name: "GLM-5.3-Flash",
   reasoning: true,

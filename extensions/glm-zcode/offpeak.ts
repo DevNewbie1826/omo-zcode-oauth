@@ -20,7 +20,8 @@ import { buildZCodeSourceHeaders, resolveZCodeAnthropicBaseUrl } from "./models.
  *   POST /ticket/{id}/settle             -> {state:"settled"}
  * Requests carry Authorization: Bearer <jwt>, X-Coding-Plan-Api-Key, and
  * X-Off-Peak-Ticket-ID; error codes 3102 (wrong ticket), 3103 (take limit),
- * 3105 (not ready). Every failure degrades to the normal signed ultra path.
+ * 3105 (not ready). Unavailability degrades to the normal signed ultra path;
+ * cancellation ends the request.
  */
 
 export const OFFPEAK_BASE_URL = "https://zcode.z.ai/api/v1/off-peak/anthropic";
@@ -80,9 +81,10 @@ export async function fetchOffPeakAvailability(jwt: string, apiKey: string, sign
   return isRecord(record) && record.can_take_number === true;
 }
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+function sleep(ms: number, signal: AbortSignal | undefined, background: boolean): Promise<void> {
   return new Promise(resolve => {
-    const timer = setTimeout(done, ms).unref();
+    const timer = setTimeout(done, ms);
+    if (background) timer.unref();
     function done() {
       clearTimeout(timer);
       signal?.removeEventListener("abort", done);
@@ -101,6 +103,7 @@ export async function ensureOffPeakTicket(
   apiKey: string,
   taskId: string,
   signal?: AbortSignal,
+  { background = false }: { readonly background?: boolean } = {},
 ): Promise<string | undefined> {
   const take = await ticketFetch(TICKET_BASE_URL, {
     method: "POST", signal,
@@ -126,7 +129,7 @@ export async function ensureOffPeakTicket(
     if (state === "ready" || state === "active") return ticketId;
     if (state !== "queued") return undefined;
     if (Date.now() + pollIntervalMs > deadline) return undefined;
-    await sleep(pollIntervalMs, signal);
+    await sleep(pollIntervalMs, signal, background);
     const status = await ticketFetch(`${TICKET_BASE_URL}/status`, {
       method: "POST", signal,
       headers: { ...ticketHeaders(jwt, apiKey), "Content-Type": "application/json" },
@@ -217,9 +220,8 @@ export function offPeakRequestHeaders(jwt: string, apiKey: string, ticketId: str
 }
 
 /**
- * Routed-model detector. The provider composer clears model.headers when it
- * projects extension models, so baseUrl — which it preserves — is the only
- * reliable routing signal at request time.
+ * Identifies a routed row in the current catalog. A caller holding a model
+ * from a previous catalog cannot use this marker as routing authority.
  */
 export function isOffPeakRouted(model: { baseUrl?: string }): boolean {
   return model.baseUrl === OFFPEAK_BASE_URL;

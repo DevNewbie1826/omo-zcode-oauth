@@ -21,6 +21,8 @@ import {
   captureExtension,
   cipherFixture,
   jsonResponse,
+  offPeakCatalogRoutes,
+  publishOffPeakCatalog,
   registeredHook,
   signingRoutes,
   type HeadersHook,
@@ -30,10 +32,10 @@ import {
 const KEY = "wire-key-id.wire-secret";
 const JWT = "wire-jwt";
 const TICKET_BASE = "https://zcode.z.ai/api/v1/off-peak/ticket";
-const TICKET_AVAILABILITY = `${TICKET_BASE}/availability`;
 const IN_WINDOW = new Date("2026-09-09T18:00:00Z");
 const WINDOW_EDGE = new Date("2026-09-09T00:59:59.500Z");
 const OUT_WINDOW = new Date("2026-09-09T08:00:00Z");
+const AFTER_TICKET_TTL = new Date(IN_WINDOW.getTime() + 11 * 60_000);
 const FAKE_HOST = "https://fake-glm-host.example/anthropic";
 const MESSAGE_ENDPOINTS = new Set([
   `${OFFPEAK_BASE_URL}/v1/messages`,
@@ -99,6 +101,11 @@ function wireFetch(wire: WireEntry[], route: Route = () => undefined) {
   });
 }
 
+function withCatalog(route: Route): Route {
+  const catalog = offPeakCatalogRoutes();
+  return (url, init) => catalog(url, init) ?? route(url, init);
+}
+
 function messageUrl(wire: WireEntry[]): WireEntry {
   const entry = wire.find((item) => item.pathname.endsWith("/v1/messages"));
   if (!entry) throw new Error("no /v1/messages request was recorded");
@@ -147,6 +154,18 @@ async function assembledHeaders(access: string): Promise<Record<string, string>>
   return { ...headers, ...(await resolveZCodeSigningHeaders(headers)) };
 }
 
+/**
+ * Publishes the live catalog so the extension accepts its own off-peak route:
+ * a caller-held model URL is no longer routing authority, and the publication's
+ * warm-up is the first ticket take.
+ */
+async function publishRoute(
+  provider: Provider,
+  credential: { readonly access: string; readonly jwt: string } = { access: KEY, jwt: JWT },
+): Promise<void> {
+  await publishOffPeakCatalog(provider, credential);
+}
+
 async function runStream(
   provider: Provider,
   auth: Record<string, string | null>,
@@ -170,6 +189,43 @@ async function within<T>(promise: Promise<T>, ms: number, label: string): Promis
   }
 }
 
+function deferredTake() {
+  const state: { started: () => void; startedPromise: Promise<void>; release: () => void } = {
+    started: () => {},
+    startedPromise: Promise.resolve(),
+    release: () => {},
+  };
+  state.startedPromise = new Promise<void>((resolve) => {
+    state.started = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    state.release = resolve;
+  });
+  return {
+    startedPromise: state.startedPromise,
+    started: state.started,
+    release: state.release,
+    async take(ticketId: string): Promise<Response> {
+      state.started();
+      await gate;
+      return jsonResponse({ ticket_id: ticketId, state: "ready" });
+    },
+  };
+}
+
+function ticketSequence(tickets: readonly (string | undefined)[]) {
+  let takes = 0;
+  return {
+    get takes() { return takes; },
+    take(): Response {
+      takes += 1;
+      const ticket = tickets[takes - 1];
+      if (!ticket) return jsonResponse({ code: 3103, msg: "limit" }, 429);
+      return jsonResponse({ ticket_id: ticket, state: "ready" });
+    },
+  };
+}
+
 function expectSignedUltra(model: WireEntry, bearer: string): void {
   expect(model.pathname).toBe(`${ULTRA_BASE_URL}/v1/messages`);
   expect(model.query).toBe("?beta=true");
@@ -181,8 +237,11 @@ function expectSignedUltra(model: WireEntry, bearer: string): void {
 }
 
 beforeEach(() => {
+  // Explicit preconditions: an operator's ambient ZCODE_* settings must not reach the assertions.
   vi.stubEnv("OFFLINE", undefined);
   vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
+  vi.stubEnv("ZCODE_APP_VERSION", "4.0.0");
+  vi.stubEnv("ZCODE_RELEASE_CHANNEL", "production");
   vi.stubEnv("ZCODE_DEVICE_ID", "wire-device-fixture");
 });
 
@@ -201,19 +260,17 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
     setOffPeakClockForTests(IN_WINDOW);
     const cipher = await cipherFixture();
     const wire: WireEntry[] = [];
-    let takes = 0;
+    const tickets = ticketSequence(["t-1"]);
     vi.stubGlobal(
       "fetch",
-      wireFetch(wire, (url) => {
-        if (url === TICKET_BASE) {
-          takes += 1;
-          return jsonResponse({ ticket_id: "t-1", state: "ready" });
-        }
+      wireFetch(wire, withCatalog((url) => {
+        if (url === TICKET_BASE) return tickets.take();
         return signingRoutes(cipher)(url);
-      }),
+      })),
     );
     const { provider, on } = captureExtension();
     const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
     expect(auth.Authorization).toBe(`Bearer ${KEY}`);
     expect(auth["X-Client-Sig"]).toMatch(/^\S+$/);
 
@@ -233,7 +290,7 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
     expect(model.headers["x-coding-plan-api-key"]).toBe(KEY);
     expect(model.headers["x-client-sig"]).toBeUndefined();
     expect(model.headers["x-zcode-agent"]).toBe("glm");
-    expect(takes).toBe(1);
+    expect(tickets.takes).toBe(1);
     const body = JSON.parse(model.body) as { model: string; stream: boolean };
     expect(body.model).toBe("glm-5.3-flash");
     expect(body.stream).toBe(true);
@@ -248,19 +305,26 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
     ] as const) {
       resetZCodeSigningState();
       resetOffPeakStateForTests();
-      setOffPeakClockForTests(clock);
+      setOffPeakClockForTests(IN_WINDOW);
       const wire: WireEntry[] = [];
       const gate: string[] = [];
+      const tickets = ticketSequence(["t-route"]);
       vi.stubGlobal(
         "fetch",
-        wireFetch(wire, (url) => {
-          if (url === TICKET_BASE) return jsonResponse({ code: 3103, msg: "limit" }, takeStatus);
+        wireFetch(wire, withCatalog((url) => {
+          if (url === TICKET_BASE) {
+            return takeStatus === 429
+              ? jsonResponse({ code: 3103, msg: "limit" }, 429)
+              : tickets.take();
+          }
           if (url === SIGNING_GATE_URL) gate.push(url);
           return signingRoutes(cipher)(url);
-        }),
+        })),
       );
       const { provider, on } = captureExtension();
       const auth = await signedHeaders(provider, on);
+      await publishRoute(provider);
+      setOffPeakClockForTests(clock);
 
       const stream = provider.streamSimple(wireModel(OFFPEAK_BASE_URL), transcript, {
         apiKey: KEY,
@@ -310,36 +374,33 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
 
   test("window closing during ticket acquisition falls back to signed ultra", async () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
-    setOffPeakClockForTests(WINDOW_EDGE);
+    setOffPeakClockForTests(IN_WINDOW);
     const cipher = await cipherFixture();
     const wire: WireEntry[] = [];
-    let releaseTake: (() => void) | undefined;
-    let takeStarted: (() => void) | undefined;
-    const takeStartedPromise = new Promise<void>((resolve) => {
-      takeStarted = resolve;
-    });
+    const deferred = deferredTake();
+    let takes = 0;
     vi.stubGlobal(
       "fetch",
-      wireFetch(wire, async (url) => {
+      wireFetch(wire, withCatalog(async (url) => {
         if (url !== TICKET_BASE) return signingRoutes(cipher)(url);
-        takeStarted?.();
-        await new Promise<void>((resolve) => {
-          releaseTake = resolve;
-        });
-        return jsonResponse({ ticket_id: "t-late", state: "ready" });
-      }),
+        takes += 1;
+        if (takes > 1) throw new Error(`unexpected extra ticket take ${takes}`);
+        return deferred.take("t-late");
+      })),
     );
     const { provider, on } = captureExtension();
     const auth = await signedHeaders(provider, on);
+    // Acceptance starts the session-owned warm-up take, which this request then waits on.
+    await publishRoute(provider);
+    await within(deferred.startedPromise, 2_000, "take never started");
 
     const pending = provider.streamSimple(wireModel(OFFPEAK_BASE_URL), transcript, {
       apiKey: KEY,
       headers: auth,
       maxRetries: 0,
     }).result();
-    await within(takeStartedPromise, 2_000, "take never started");
     setOffPeakClockForTests(new Date("2026-09-09T01:00:01Z"));
-    releaseTake?.();
+    deferred.release();
     const message = await pending;
 
     expect(message.content).toEqual([{ type: "text", text: "OK" }]);
@@ -351,15 +412,17 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
     setOffPeakClockForTests(IN_WINDOW);
     const cipher = await cipherFixture();
     const wire: WireEntry[] = [];
+    const tickets = ticketSequence(["t-full"]);
     vi.stubGlobal(
       "fetch",
-      wireFetch(wire, (url) => {
-        if (url === TICKET_BASE) return jsonResponse({ ticket_id: "t-full", state: "ready" });
+      wireFetch(wire, withCatalog((url) => {
+        if (url === TICKET_BASE) return tickets.take();
         return signingRoutes(cipher)(url);
-      }),
+      })),
     );
     const { provider, on } = captureExtension();
     const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
 
     const message = await provider.stream(wireModel(OFFPEAK_BASE_URL), transcript, {
       apiKey: KEY,
@@ -403,13 +466,11 @@ describe("off-peak wire routing (native provider, signed request path)", () => {
     const { provider } = captureExtension();
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: string | URL | Request) => {
+      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
         const url = String(input);
-        if (url === LIVE_MODELS_URL) {
-          return jsonResponse({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
-        }
-        if (url === MODELS_DEV_API_URL) return jsonResponse({});
-        if (url === TICKET_AVAILABILITY) return jsonResponse({ code: 0, data: { can_take_number: true } });
+        const catalog = offPeakCatalogRoutes();
+        const routed = catalog(url, init);
+        if (routed) return routed;
         if (url === TICKET_BASE) return jsonResponse({ ticket_id: "t-refresh", state: "ready" });
         throw new Error(`unexpected request: ${url}`);
       }),
@@ -433,7 +494,7 @@ describe("negative wire fallbacks (native transport)", () => {
     vi.stubGlobal(
       "fetch",
       wireFetch(wire, (url) => {
-        if (url === TICKET_BASE || url === TICKET_AVAILABILITY) {
+        if (url === TICKET_BASE || url === `${TICKET_BASE}/availability`) {
           ticketCalls.push(url);
           return jsonResponse({ ticket_id: "unexpected", state: "ready" });
         }
@@ -463,12 +524,11 @@ describe("negative wire fallbacks (native transport)", () => {
     const cipherB = await cipherFixture({ apiKeyId: "account-b-key", apiKeySecret: "account-b-secret" });
     const wire: WireEntry[] = [];
     const tickets: WireEntry[] = [];
-    let takes = 0;
+    const sequence = ticketSequence(["t-account-a"]);
     vi.stubGlobal(
       "fetch",
-      wireFetch(wire, (url, init) => {
+      wireFetch(wire, withCatalog((url, init) => {
         if (url === TICKET_BASE) {
-          takes += 1;
           tickets.push({
             url,
             pathname: url,
@@ -476,13 +536,14 @@ describe("negative wire fallbacks (native transport)", () => {
             headers: Object.fromEntries(new Headers(init?.headers).entries()),
             body: typeof init?.body === "string" ? init.body : "",
           });
-          return jsonResponse({ ticket_id: "t-account-a", state: "ready" });
+          return sequence.take();
         }
         return signingRoutes((apiKey) => (apiKey === accountB ? cipherB : cipherA))(url, init);
-      }),
+      })),
     );
     const { provider, on } = captureExtension();
     const authA = await signedHeaders(provider, on, { access: accountA, jwt: jwtA });
+    await publishRoute(provider, { access: accountA, jwt: jwtA });
     await runStream(provider, authA, {}, accountA);
     const authB = await assembledHeaders(accountB);
     const message = await runStream(provider, authB, {}, accountB);
@@ -495,7 +556,7 @@ describe("negative wire fallbacks (native transport)", () => {
     expect(wire[0].headers["x-coding-plan-api-key"]).toBe(accountA);
     expectSignedUltra(wire[1], accountB);
     expect(wire[1].headers.authorization).not.toBe(`Bearer ${jwtA}`);
-    expect(takes).toBe(1);
+    expect(sequence.takes).toBe(1);
     expect(tickets[0].headers.authorization).toBe(`Bearer ${jwtA}`);
     expect(tickets[0].headers["x-coding-plan-api-key"]).toBe(accountA);
   });
@@ -505,31 +566,27 @@ describe("negative wire fallbacks (native transport)", () => {
     setOffPeakClockForTests(IN_WINDOW);
     const cipher = await cipherFixture();
     const wire: WireEntry[] = [];
-    let takes = 0;
+    const sequence = ticketSequence(["t-expiring", undefined]);
     vi.stubGlobal(
       "fetch",
-      wireFetch(wire, (url) => {
-        if (url === TICKET_BASE) {
-          takes += 1;
-          return takes === 1
-            ? jsonResponse({ ticket_id: "t-expiring", state: "ready" })
-            : jsonResponse({ code: 3103, msg: "limit" }, 429);
-        }
+      wireFetch(wire, withCatalog((url) => {
+        if (url === TICKET_BASE) return sequence.take();
         return signingRoutes(cipher)(url);
-      }),
+      })),
     );
     const { provider, on } = captureExtension();
     const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
     await runStream(provider, auth);
     expect(wire[0].headers["x-off-peak-ticket-id"]).toBe("t-expiring");
 
-    setOffPeakClockForTests(new Date(IN_WINDOW.getTime() + 11 * 60_000));
+    setOffPeakClockForTests(AFTER_TICKET_TTL);
     const message = await runStream(provider, auth);
 
     expect(message.content).toEqual([{ type: "text", text: "OK" }]);
     expectSignedUltra(wire[1], KEY);
     expect(wire[1].headers.authorization).not.toBe(`Bearer ${JWT}`);
-    expect(takes).toBe(2);
+    expect(sequence.takes).toBe(2);
   });
 
   test("transport disabled while eligible and opted in: signed ultra, no ticket traffic", async () => {
@@ -542,7 +599,7 @@ describe("negative wire fallbacks (native transport)", () => {
     vi.stubGlobal(
       "fetch",
       wireFetch(wire, (url) => {
-        if (url === TICKET_BASE || url === TICKET_AVAILABILITY) {
+        if (url === TICKET_BASE || url === `${TICKET_BASE}/availability`) {
           ticketCalls.push(url);
           return jsonResponse({ ticket_id: "unexpected", state: "ready" });
         }
@@ -567,58 +624,53 @@ describe("pending ticket lifecycle (retry and reacquisition)", () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakClockForTests(IN_WINDOW);
     const cipher = await cipherFixture();
-    let takes = 0;
+    const sequence = ticketSequence(["t-warm", undefined, "t-retry"]);
     const wire: WireEntry[] = [];
     vi.stubGlobal(
       "fetch",
-      wireFetch(wire, (url) => {
-        if (url === TICKET_BASE) {
-          takes += 1;
-          return takes === 1 ? jsonResponse({ code: 3103, msg: "limit" }, 429) : jsonResponse({ ticket_id: "t-retry", state: "ready" });
-        }
+      wireFetch(wire, withCatalog((url) => {
+        if (url === TICKET_BASE) return sequence.take();
         return signingRoutes(cipher)(url);
-      }),
+      })),
     );
     const { provider, on } = captureExtension();
     const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
+    await runStream(provider, auth);
+    setOffPeakClockForTests(AFTER_TICKET_TTL);
     await runStream(provider, auth);
     await runStream(provider, auth);
 
-    expect(takes).toBe(2);
-    expect(pathnames(wire)).toEqual([`${ULTRA_BASE_URL}/v1/messages`, `${OFFPEAK_BASE_URL}/v1/messages`]);
+    expect(sequence.takes).toBe(3);
+    expect(pathnames(wire)).toEqual([
+      `${OFFPEAK_BASE_URL}/v1/messages`,
+      `${ULTRA_BASE_URL}/v1/messages`,
+      `${OFFPEAK_BASE_URL}/v1/messages`,
+    ]);
   });
 
   test("a refresh warm-up does not bypass ticket expiry (refresh-first flow)", async () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakClockForTests(IN_WINDOW);
     const cipher = await cipherFixture();
-    let takes = 0;
+    const sequence = ticketSequence(["t-warm-1", "t-warm-2"]);
     const wire: WireEntry[] = [];
     vi.stubGlobal(
       "fetch",
-      wireFetch(wire, (url) => {
-        if (url === LIVE_MODELS_URL) {
-          return jsonResponse({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
-        }
-        if (url === MODELS_DEV_API_URL) return jsonResponse({});
-        if (url === TICKET_AVAILABILITY) return jsonResponse({ code: 0, data: { can_take_number: true } });
-        if (url === TICKET_BASE) {
-          takes += 1;
-          return jsonResponse({ ticket_id: `t-warm-${takes}`, state: "ready" });
-        }
+      wireFetch(wire, withCatalog((url) => {
+        if (url === TICKET_BASE) return sequence.take();
         return signingRoutes(cipher)(url);
-      }),
+      })),
     );
     const { provider, on } = captureExtension();
     const auth = await signedHeaders(provider, on);
     await provider.refreshModels!(refreshHost());
     expect(provider.getModels().find((model) => model.id === "glm-5.3-flash")?.baseUrl).toBe(OFFPEAK_BASE_URL);
-    expect(takes).toBe(1);
     await runStream(provider, auth);
-    setOffPeakClockForTests(new Date(IN_WINDOW.getTime() + 11 * 60_000));
+    setOffPeakClockForTests(AFTER_TICKET_TTL);
     await runStream(provider, auth);
 
-    expect(takes).toBe(2);
+    expect(sequence.takes).toBe(2);
     expect(pathnames(wire)).toEqual([`${OFFPEAK_BASE_URL}/v1/messages`, `${OFFPEAK_BASE_URL}/v1/messages`]);
     expect(wire[0].headers["x-off-peak-ticket-id"]).toBe("t-warm-1");
     expect(wire[1].headers["x-off-peak-ticket-id"]).toBe("t-warm-2");
@@ -628,49 +680,45 @@ describe("pending ticket lifecycle (retry and reacquisition)", () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakClockForTests(IN_WINDOW);
     const cipher = await cipherFixture();
-    let takes = 0;
+    const sequence = ticketSequence(["t-1", "t-2"]);
     vi.stubGlobal(
       "fetch",
-      wireFetch([], (url) => {
-        if (url === TICKET_BASE) {
-          takes += 1;
-          return jsonResponse({ ticket_id: `t-${takes}`, state: "ready" });
-        }
+      wireFetch([], withCatalog((url) => {
+        if (url === TICKET_BASE) return sequence.take();
         return signingRoutes(cipher)(url);
-      }),
+      })),
     );
     const { provider, on } = captureExtension();
     const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
     await runStream(provider, auth);
-    setOffPeakClockForTests(new Date(IN_WINDOW.getTime() + 11 * 60_000));
+    setOffPeakClockForTests(AFTER_TICKET_TTL);
     await runStream(provider, auth);
 
-    expect(takes).toBe(2);
+    expect(sequence.takes).toBe(2);
   });
 
   test("a valid ticket is reacquired after expiry when the server grants another", async () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakClockForTests(IN_WINDOW);
     const cipher = await cipherFixture();
-    let takes = 0;
+    const sequence = ticketSequence(["t-reacquired-1", "t-reacquired-2"]);
     const wire: WireEntry[] = [];
     vi.stubGlobal(
       "fetch",
-      wireFetch(wire, (url) => {
-        if (url === TICKET_BASE) {
-          takes += 1;
-          return jsonResponse({ ticket_id: `t-reacquired-${takes}`, state: "ready" });
-        }
+      wireFetch(wire, withCatalog((url) => {
+        if (url === TICKET_BASE) return sequence.take();
         return signingRoutes(cipher)(url);
-      }),
+      })),
     );
     const { provider, on } = captureExtension();
     const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
     await runStream(provider, auth);
-    setOffPeakClockForTests(new Date(IN_WINDOW.getTime() + 11 * 60_000));
+    setOffPeakClockForTests(AFTER_TICKET_TTL);
     await runStream(provider, auth);
 
-    expect(takes).toBe(2);
+    expect(sequence.takes).toBe(2);
     expect(pathnames(wire)).toEqual([`${OFFPEAK_BASE_URL}/v1/messages`, `${OFFPEAK_BASE_URL}/v1/messages`]);
     expect(wire[1].headers["x-off-peak-ticket-id"]).toBe("t-reacquired-2");
   });
@@ -746,27 +794,26 @@ describe("off-peak flag gates cached tickets too", () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakClockForTests(IN_WINDOW);
     const cipher = await cipherFixture();
-    let takes = 0;
+    const sequence = ticketSequence(["t-c"]);
     const wire: WireEntry[] = [];
     vi.stubGlobal(
       "fetch",
-      wireFetch(wire, (url) => {
-        if (url === TICKET_BASE) {
-          takes += 1;
-          return jsonResponse({ ticket_id: "t-c", state: "ready" });
-        }
+      wireFetch(wire, withCatalog((url) => {
+        if (url === TICKET_BASE) return sequence.take();
         return signingRoutes(cipher)(url);
-      }),
+      })),
     );
     const { provider, on } = captureExtension();
     const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
     await runStream(provider, auth);
     expect(wire[0]?.pathname).toBe(`${OFFPEAK_BASE_URL}/v1/messages`);
 
-    vi.unstubAllEnvs();
+    // Only the flag changes: un-stubbing would restore an operator's ambient value.
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
     await runStream(provider, auth);
     expect(wire[1]?.pathname).toBe(`${ULTRA_BASE_URL}/v1/messages`);
-    expect(takes).toBe(1);
+    expect(sequence.takes).toBe(1);
   });
 });
 
@@ -776,29 +823,22 @@ describe("flag drops mid-acquisition", () => {
     setOffPeakClockForTests(IN_WINDOW);
     const cipher = await cipherFixture();
     const wire: WireEntry[] = [];
-    let releaseTake: (() => void) | undefined;
-    let takeStarted: (() => void) | undefined;
-    const takeStartedPromise = new Promise<void>((resolve) => {
-      takeStarted = resolve;
-    });
+    const deferred = deferredTake();
     vi.stubGlobal(
       "fetch",
-      wireFetch(wire, async (url) => {
+      wireFetch(wire, withCatalog(async (url) => {
         if (url !== TICKET_BASE) return signingRoutes(cipher)(url);
-        takeStarted?.();
-        await new Promise<void>((resolve) => {
-          releaseTake = resolve;
-        });
-        return jsonResponse({ ticket_id: "t-midflight", state: "ready" });
-      }),
+        return deferred.take("t-midflight");
+      })),
     );
     const { provider, on } = captureExtension();
     const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
+    await within(deferred.startedPromise, 2_000, "take never started");
 
     const pending = runStream(provider, auth);
-    await within(takeStartedPromise, 2_000, "take never started");
-    vi.unstubAllEnvs();
-    releaseTake?.();
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
+    deferred.release();
     const message = await pending;
 
     expect(message.content).toEqual([{ type: "text", text: "OK" }]);

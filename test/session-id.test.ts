@@ -14,6 +14,11 @@ const KEY = "session-key-id.session-secret";
 
 beforeEach(() => {
   vi.stubEnv("ZCODE_DEVICE_ID", "session-device-fixture");
+  vi.stubEnv("ZCODE_APP_VERSION", "4.0.0");
+  vi.stubEnv("ZCODE_RELEASE_CHANNEL", "production");
+  vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
+  vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
+  vi.stubEnv("OFFLINE", undefined);
 });
 
 afterEach(() => {

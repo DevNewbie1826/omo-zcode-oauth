@@ -2,12 +2,12 @@ import { isDeepStrictEqual } from "node:util";
 import type { Model, ModelsStoreEntry, RefreshModelsContext } from "@earendil-works/pi-ai";
 import { fetchLiveModels, isSafeToken as safeToken } from "./live-catalog.js";
 import {
-  CATALOG_PROVIDER, CATALOG_REFRESH_INTERVAL_MS, ZCODE_PROVIDER_ID,
+  CATALOG_PROVIDER, CATALOG_REFRESH_INTERVAL_MS, ULTRA_BASE_URL, ZCODE_PROVIDER_ID,
   catalogRowsFromModelsDev, catalogToPersistedModels, catalogWireName, chatModelConfig,
   chatThinkingConfig, fetchModelsDevPayload, mergeChatMetadata, parseModelsDevMetadata, resolveZCodeAnthropicBaseUrl,
   storedToConfig, zcodeFallbackChatModels, type ZCodeChatModelConfig,
 } from "./models.js";
-import { applyOffPeakRouting } from "./offpeak.js";
+import { applyOffPeakRouting, isFlashModelId } from "./offpeak.js";
 
 export const CATALOG_TRIGGER_TIMEOUT_MS = 15_000;
 
@@ -20,11 +20,23 @@ const appWireNames = new Map([
   "GLM-4.1V-Thinking-Flash", "GLM-4-FlashX-250414", "GLM-4-Flash-250414", "GLM-4V-Flash",
 ].map(id => [id.toLowerCase(), id]));
 
+interface OffPeakOwner {
+  readonly access: string;
+  readonly jwt: string;
+  readonly session: AbortSignal;
+}
+
+export interface AcceptedOffPeakRoute extends OffPeakOwner {
+  /** False once this publication's route is replaced or its session ends. */
+  readonly isCurrent: () => boolean;
+}
+
 interface Snapshot {
   readonly current: readonly Model<"anthropic-messages">[];
   readonly wireNames: ReadonlyMap<string, string>;
+  readonly foldedWireNames: ReadonlyMap<string, string | undefined>;
   readonly checkedAt?: number;
-  readonly route?: { session: AbortSignal; access: string; jwt: string; canonical: ModelsStoreEntry };
+  readonly route?: OffPeakOwner & { readonly canonical: ModelsStoreEntry };
 }
 
 function nativeModels(rows: ZCodeChatModelConfig[], offPeak: boolean): Snapshot["current"] {
@@ -36,12 +48,23 @@ function nativeModels(rows: ZCodeChatModelConfig[], offPeak: boolean): Snapshot[
   }));
 }
 
-function snapshot(rows: ZCodeChatModelConfig[], checkedAt: number | undefined, offPeak = false): Snapshot {
+// Keep the first usable row for an exact ID; case-distinct IDs are separate selections.
+function uniqueRows(rows: ZCodeChatModelConfig[]): ZCodeChatModelConfig[] {
+  const byId = new Map<string, ZCodeChatModelConfig>();
+  for (const row of rows) if (!byId.has(row.id)) byId.set(row.id, row);
+  return [...byId.values()];
+}
+
+function snapshot(rows: ZCodeChatModelConfig[], checkedAt: number | undefined): Snapshot {
   const wireNames = new Map<string, string>();
+  const foldedWireNames = new Map<string, string | undefined>();
   for (const { id, name } of rows) {
-    if (id.toLowerCase() === name.toLowerCase()) wireNames.set(id.toLowerCase(), name);
+    const lower = id.toLowerCase();
+    wireNames.set(id, catalogWireName(id, name));
+    // Even a row with a friendly label makes a case-folded lookup ambiguous.
+    foldedWireNames.set(lower, !foldedWireNames.has(lower) && name.toLowerCase() === lower ? name : undefined);
   }
-  return { current: nativeModels(rows, offPeak), wireNames, checkedAt };
+  return { current: nativeModels(rows, false), wireNames, foldedWireNames, checkedAt };
 }
 
 function isFresh(checkedAt: number | undefined): boolean {
@@ -65,7 +88,7 @@ function codingPlanRows(payload: unknown): ZCodeChatModelConfig[] {
 async function discover(
   { credential, signal }: RefreshModelsContext,
   deadline: number,
-  checkOffPeak: (signal: AbortSignal) => Promise<boolean> | undefined,
+  checkOffPeak: ((signal: AbortSignal) => Promise<boolean>) | undefined,
 ): Promise<{ rows: ZCodeChatModelConfig[]; offPeak: boolean }> {
   const key = credential?.type === "oauth" ? credential.access : credential?.key;
   const live = key?.trim() ? await fetchLiveModels(key, signal).catch(() => []) : [];
@@ -89,7 +112,7 @@ async function discover(
     const metadata = live.length ? fetchModelsDevPayload(optionalSignal).catch(() => undefined) : undefined;
     const [payload, offPeak] = await Promise.all([
       Promise.race([metadata, cutoff]),
-      Promise.race([checkOffPeak(optionalSignal), cutoff]),
+      Promise.race([rows.some(row => isFlashModelId(row.id)) ? checkOffPeak?.(optionalSignal) : undefined, cutoff]),
     ]);
     return { rows: payload === undefined ? rows : mergeChatMetadata(rows, parseModelsDevMetadata(payload)), offPeak: offPeak ?? false };
   } finally {
@@ -101,9 +124,13 @@ async function discover(
 export function createZCodeCatalog(
   offPeakActiveFor?: (context: RefreshModelsContext, session: AbortSignal) => Promise<boolean>,
   getSessionSignal?: () => AbortSignal,
+  onOffPeakAccepted?: (route: AcceptedOffPeakRoute) => void,
 ) {
   const standaloneSession = new AbortController().signal;
-  let state: Snapshot = { current: nativeModels(zcodeFallbackChatModels(), false), wireNames: new Map() };
+  const currentSession = getSessionSignal ?? (() => standaloneSession);
+  let state: Snapshot = {
+    current: nativeModels(zcodeFallbackChatModels(), false), wireNames: new Map(), foldedWireNames: new Map(),
+  };
   return {
     getModels: () => state.current,
     get checkedAt() { return state.checkedAt; },
@@ -113,18 +140,19 @@ export function createZCodeCatalog(
     isFresh: () => isFresh(state.checkedAt),
     officialGlmModelId(id: string): string {
       const lower = id.toLowerCase();
-      return appWireNames.get(lower) ?? state.wireNames.get(lower) ?? id;
+      return appWireNames.get(lower) ?? state.wireNames.get(id) ?? state.foldedWireNames.get(lower) ?? id;
     },
     async refresh(ctx: RefreshModelsContext, deadline = Date.now() + CATALOG_TRIGGER_TIMEOUT_MS): Promise<void> {
       // Capture the session once; this signal's identity is also the route's generation token.
-      const session = getSessionSignal?.() ?? standaloneSession;
+      const session = currentSession();
       const context = { ...ctx, signal: AbortSignal.any([ctx.signal, session]) };
       const { stored, signal } = context;
+      const isCurrent = () => !signal.aborted && currentSession() === session;
       if (signal.aborted) return;
       const restored = stored && Array.isArray(stored.models)
-        ? storedToConfig({ models: stored.models.filter(row => row?.provider === ZCODE_PROVIDER_ID) })
+        ? uniqueRows(storedToConfig({ models: stored.models.filter(row => row?.provider === ZCODE_PROVIDER_ID) })
             .filter(row => safeToken(row.id))
-            .map(row => safeToken(row.name) ? row : { ...row, name: row.id })
+            .map(row => safeToken(row.name) ? row : { ...row, name: row.id }))
         : [];
       const checkedAt = Number.isFinite(stored?.checkedAt) ? stored?.checkedAt : undefined;
       if (restored.length) {
@@ -136,27 +164,39 @@ export function createZCodeCatalog(
           isDeepStrictEqual(stored?.models, route.canonical.models);
         const canonical = snapshot(restored, checkedAt);
         const candidate = sameRoute ? state : canonical;
-        if (!(await context.publish({ update: () => { state = session.aborted ? canonical : candidate; } }))) return;
+        if (!(await context.publish({ update: () => { if (isCurrent()) state = candidate; } }))) return;
       }
-      if (!context.allowNetwork || signal.aborted || process.env.OFFLINE !== undefined) return;
+      if (!context.allowNetwork || !isCurrent() || process.env.OFFLINE !== undefined) return;
       if (!context.force && restored.length && isFresh(checkedAt)) return;
 
-      const { rows, offPeak } = await discover(context, deadline,
-        optionalSignal => offPeakActiveFor?.({ ...context, signal: optionalSignal }, session));
-      if (!rows.length || signal.aborted) return;
-      const now = Date.now();
-      const persist = { models: catalogToPersistedModels(rows), checkedAt: now };
       const credential = context.credential;
-      const route = offPeak && credential?.type === "oauth" && typeof credential.zcodeJwtToken === "string"
-        ? { session, access: credential.access, jwt: credential.zcodeJwtToken, canonical: persist } : undefined;
+      const owner = credential?.type === "oauth" && credential.access &&
+        typeof credential.zcodeJwtToken === "string" && credential.zcodeJwtToken
+        ? { session, access: credential.access, jwt: credential.zcodeJwtToken } : undefined;
+      const discovery = await discover(context, deadline, owner && offPeakActiveFor
+        ? optionalSignal => offPeakActiveFor({ ...context, signal: optionalSignal }, session) : undefined);
+      if (!discovery.rows.length || !isCurrent()) return;
+      const rows = uniqueRows(discovery.rows);
+      const now = Date.now();
+      const persist: ModelsStoreEntry = {
+        models: catalogToPersistedModels(rows).map(row => ({ ...row, baseUrl: ULTRA_BASE_URL })),
+        checkedAt: now,
+      };
+      const route = discovery.offPeak && owner && !process.env.ZCODE_ANTHROPIC_BASE_URL?.trim()
+        ? { ...owner, canonical: persist } : undefined;
       const canonical = snapshot(rows, now);
-      const candidate = route ? { ...snapshot(rows, now, true), route } : canonical;
-      // A host-started publish checks its own signal after writing, not the session signal.
-      // Do not catch a failed write as a source failure or retry with different rows.
-      await context.publish({
+      const candidate = route ? { ...canonical, current: nativeModels(rows, true), route } : canonical;
+      // A host-started write may finish after shutdown. Only a current session may use its update.
+      const accepted = await context.publish({
         persist,
-        update: () => { state = session.aborted ? canonical : candidate; },
+        update: () => { if (isCurrent()) state = candidate; },
       });
+      if (accepted && route && isCurrent() && state.route === route) {
+        onOffPeakAccepted?.({
+          session: route.session, access: route.access, jwt: route.jwt,
+          isCurrent: () => !session.aborted && currentSession() === session && state.route === route,
+        });
+      }
     },
   };
 }

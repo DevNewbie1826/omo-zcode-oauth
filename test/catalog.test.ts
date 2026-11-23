@@ -3,7 +3,7 @@ import {
   createModels, createProvider, InMemoryCredentialStore, InMemoryModelsStore,
   type Model, type ModelsStoreEntry, type RefreshModelsContext,
 } from "@earendil-works/pi-ai";
-import { createZCodeCatalog } from "../extensions/glm-zcode/catalog.js";
+import { createZCodeCatalog, type AcceptedOffPeakRoute } from "../extensions/glm-zcode/catalog.js";
 import { LIVE_MODELS_MAX_BYTES, LIVE_MODELS_URL } from "../extensions/glm-zcode/live-catalog.js";
 import { MODELS_DEV_API_URL, ULTRA_BASE_URL, ZAI_THINKING_LEVEL_MAP } from "../extensions/glm-zcode/models.js";
 import { OFFPEAK_BASE_URL } from "../extensions/glm-zcode/offpeak.js";
@@ -18,6 +18,7 @@ const old: Model<"anthropic-messages"> = {
 const stale = { models: [old], checkedAt: now - 3_600_000 };
 const apiKey = { type: "api_key", key: "test-key" } as const;
 const oauth = { type: "oauth", access: "test-access", refresh: "test-refresh", expires: now + 60_000 } as const;
+const offPeakCredential = { ...oauth, zcodeJwtToken: "fixture-jwt" };
 const live = [{ id: "new", display_name: "Vision preview" }, { id: "glm-5.4", display_name: "GLM-5.4" }];
 const devRow = { name: "unused", modalities: { input: ["text", "image", "pdf", "video"] },
   limit: { context: 200000, output: 8192 }, reasoning: false };
@@ -44,6 +45,9 @@ beforeEach(() => {
   vi.setSystemTime(now);
   vi.stubEnv("OFFLINE", undefined);
   vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
+  vi.stubEnv("ZCODE_DEVICE_ID", "catalog-fixture-device");
+  vi.stubEnv("ZCODE_APP_VERSION", undefined);
+  vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
   requests.length = unexpected.length = 0;
   sources();
 });
@@ -64,6 +68,11 @@ function host(overrides: Partial<RefreshModelsContext> = {}) {
   const ctx: RefreshModelsContext = { publish, allowNetwork: true, credential: apiKey,
     signal: new AbortController().signal, ...overrides };
   return { ctx, publish, stored: () => entry };
+}
+function deferred() {
+  let resolve: () => void = () => { throw new Error("Uninitialized deferred"); };
+  const promise = new Promise<void>(accept => { resolve = accept; });
+  return { promise, resolve };
 }
 const ids = (catalog: ReturnType<typeof createZCodeCatalog>) => catalog.getModels().map(row => row.id);
 const regularSources = () => sources(() => Response.json(live), () => Response.json(metadata));
@@ -144,6 +153,26 @@ test.each([true, false])("live rows own identity, metadata available=%s", async 
   expect(c.officialGlmModelId("NEW")).toBe("NEW");
 });
 
+test("a credential-bearing endpoint override is visible but never persisted", async () => {
+  const override = "https://fixture:local-secret@gateway.invalid/anthropic?token=fixture-marker";
+  vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", override);
+  const c = createZCodeCatalog();
+  const h = host();
+  regularSources();
+
+  await c.refresh(h.ctx);
+
+  expect(c.getModels().map(row => row.baseUrl)).toEqual([override, override]);
+  expect(h.stored()?.models.map(row => row.baseUrl)).toEqual([ULTRA_BASE_URL, ULTRA_BASE_URL]);
+  expect(JSON.stringify(h.stored())).not.toContain("fixture-marker");
+  expect(JSON.stringify(h.stored())).not.toContain("local-secret");
+  const nextOverride = "https://other-gateway.invalid/anthropic";
+  vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", nextOverride);
+  sources();
+  await c.refresh(host({ stored: h.stored(), allowNetwork: false }).ctx);
+  expect(c.getModels().map(row => row.baseUrl)).toEqual([nextOverride, nextOverride]);
+});
+
 const failures: Record<string, Reply> = {
   http: () => new Response(null, { status: 503 }), throws: reject, invalid: () => new Response("{"),
   envelope: () => Response.json({ error: "bad" }), empty: () => Response.json([]),
@@ -207,6 +236,79 @@ test.each(["restore", "network", "abort-during-live", "abort-during-publication"
   },
 );
 
+test.each(["restore", "network"] as const)(
+  "an obsolete %s update leaves visible rows, wire spelling and freshness untouched", async mode => {
+    let session = new AbortController();
+    const onAccepted = vi.fn<(route: AcceptedOffPeakRoute) => void>();
+    const c = createZCodeCatalog(async () => true, () => session.signal, onAccepted);
+    await c.refresh(host({ stored: stale, allowNetwork: false }).ctx);
+    const next = { ...old, id: "new-flash", name: "New-Flash" };
+    const h = host(mode === "restore"
+      ? { stored: { models: [next], checkedAt: now }, allowNetwork: false }
+      : { credential: offPeakCredential });
+    if (mode === "network") sources(() => Response.json([{ id: next.id, display_name: next.name }]), reject);
+    const entered = deferred();
+    const release = deferred();
+    // Like a host-started publish, this publisher does not know the extension's session has ended.
+    const refresh = c.refresh({ ...h.ctx, publish: async publication => {
+      entered.resolve();
+      await release.promise;
+      return h.ctx.publish(publication);
+    } });
+
+    await entered.promise;
+    session.abort();
+    c.clearSessionRoute();
+    session = new AbortController();
+    release.resolve();
+    await refresh;
+
+    expect(ids(c)).toEqual(["old"]);
+    expect(c.officialGlmModelId("old")).toBe("OLD");
+    expect(c.officialGlmModelId(next.id)).toBe(next.id);
+    expect(c.checkedAt).toBe(stale.checkedAt);
+    expect(onAccepted).not.toHaveBeenCalled();
+    expect(h.stored()).toMatchObject({ models: [{ id: next.id, name: next.name }], checkedAt: now });
+
+    sources();
+    await c.refresh(host({ stored: h.stored(), allowNetwork: false }).ctx);
+    expect(ids(c)).toEqual([next.id]);
+    expect(c.officialGlmModelId(next.id)).toBe(next.name);
+    expect(c.checkedAt).toBe(now);
+    expect(c.getModels()[0].baseUrl).toBe(ULTRA_BASE_URL);
+    expect(onAccepted).not.toHaveBeenCalled();
+  },
+);
+
+test.each(["live", "restore"] as const)(
+  "%s keeps the first exact ID row and folds only unambiguous wire spellings", async mode => {
+    const rows = [
+      { id: "ModelX", name: "ModelX" }, { id: "modelx", name: "Friendly label" },
+      { id: "duplicate", name: "DUPLICATE" }, { id: "duplicate", name: "Duplicate" },
+      { id: "solo", name: "Solo" }, { id: "glm-5.3-flashx", name: "GLM-5.3-FlashX" },
+    ];
+    const c = createZCodeCatalog();
+    const h = host(mode === "restore"
+      ? { stored: { models: rows.map(row => ({ ...old, ...row })), checkedAt: now }, allowNetwork: false }
+      : {});
+    if (mode === "live") {
+      sources(() => Response.json(rows.map(({ id, name }) => ({ id, display_name: name }))), reject);
+    }
+
+    await c.refresh(h.ctx);
+
+    const expected = rows.filter(row => row.name !== "Duplicate");
+    expect(c.getModels().map(({ id, name }) => ({ id, name }))).toEqual(expected);
+    if (mode === "live") expect(h.stored()?.models.map(({ id, name }) => ({ id, name }))).toEqual(expected);
+    expect(c.officialGlmModelId("ModelX")).toBe("ModelX");
+    expect(c.officialGlmModelId("modelx")).toBe("modelx");
+    expect(c.officialGlmModelId("MODELX")).toBe("MODELX");
+    expect(c.officialGlmModelId("duplicate")).toBe("DUPLICATE");
+    expect(c.officialGlmModelId("SOLO")).toBe("Solo");
+    expect(c.officialGlmModelId("glm-5.3-flashx")).toBe("glm-5.3-flashx");
+  },
+);
+
 test("only update installs the routed snapshot; canonical names survive restart and disappear on replacement", async () => {
   const c = createZCodeCatalog(async () => true);
   const h = host({ credential: { ...oauth, zcodeJwtToken: "fixture-jwt" } });
@@ -263,6 +365,46 @@ test("registry reports a rejected write once and retains the restored snapshot",
   expect(c.officialGlmModelId("glm-5.4")).toBe("glm-5.4");
   expect(await modelsStore.read(provider)).toEqual(stale);
 });
+
+test.each(["accepted", "non-flash", "refused", "write-failure"] as const)(
+  "off-peak warm-up requires an eligible and accepted catalog publication: %s", async mode => {
+    const session = new AbortController();
+    const checkAvailability = vi.fn(async () => true);
+    const onAccepted = vi.fn<(route: AcceptedOffPeakRoute) => void>();
+    const c = createZCodeCatalog(checkAvailability, () => session.signal, onAccepted);
+    const h = host({ credential: offPeakCredential });
+    const id = mode === "non-flash" ? "glm-5.4" : "new-flash";
+    sources(() => Response.json([{ id }]), reject);
+    const failure = new Error("store write rejected");
+    const refresh = c.refresh({ ...h.ctx, publish: async publication => {
+      expect(onAccepted).not.toHaveBeenCalled();
+      if (mode === "refused") return false;
+      if (mode === "write-failure") throw failure;
+      const accepted = await h.ctx.publish(publication);
+      expect(onAccepted).not.toHaveBeenCalled();
+      return accepted;
+    } });
+
+    if (mode === "write-failure") await expect(refresh).rejects.toBe(failure);
+    else await refresh;
+
+    expect(checkAvailability).toHaveBeenCalledTimes(mode === "non-flash" ? 0 : 1);
+    if (mode !== "accepted") {
+      expect(onAccepted).not.toHaveBeenCalled();
+      expect(c.getModels().some(row => row.baseUrl === OFFPEAK_BASE_URL)).toBe(false);
+      return;
+    }
+    expect(onAccepted).toHaveBeenCalledExactlyOnceWith({
+      access: offPeakCredential.access, jwt: offPeakCredential.zcodeJwtToken, session: session.signal,
+      isCurrent: expect.any(Function),
+    });
+    expect(c.getModels()).toMatchObject([{ id, baseUrl: OFFPEAK_BASE_URL }]);
+    const route = onAccepted.mock.calls[0]?.[0];
+    expect(route?.isCurrent()).toBe(true);
+    c.clearSessionRoute();
+    expect(route?.isCurrent()).toBe(false);
+  },
+);
 
 test("same-instance fresh check keeps the accepted route only for unchanged rows and account", async () => {
   const credential = { ...oauth, zcodeJwtToken: "fixture-jwt" };
