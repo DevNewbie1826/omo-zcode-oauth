@@ -33,6 +33,38 @@ function isIndented(line) {
 const ROOT_KEY_LINE = /^[A-Za-z_][A-Za-z0-9_-]*:(?:[ \t]|$)/;
 const BLOCK_SCALAR_START = /:[ \t]*[|>][-+0-9]*[ \t]*(?:#.*)?$/;
 const UNSUPPORTED_SYNTAX = /[{}\[\]&*!]/;
+const INDENTED_ENTRY = /^[ \t]+(?:-(?:[ \t]|$)|[A-Za-z_][A-Za-z0-9_-]*:(?:[ \t]|$))/;
+
+// Accepts only the line shapes electron-builder writes, for the whole document:
+// comments, identifier keys at column 0, indented `key:` or `- ` entries, and
+// opaque `|`/`>` block-scalar text. Every quoted value must close on its own
+// line. A document that starts indented, has a document marker, a continued or
+// unterminated quoted value, or any other line is refused, so the checker never
+// reads a version out of a document a YAML parser would reject or read differently.
+function hasSupportedShape(lines) {
+  let blockScalarIndent = -1;
+  let seenEntry = false;
+  for (const line of lines) {
+    if (/^[ \t]*$/.test(line)) continue;
+    const indent = /^[ \t]*/.exec(line)[0].length;
+    if (blockScalarIndent >= 0) {
+      if (indent > blockScalarIndent) continue;
+      blockScalarIndent = -1;
+    }
+    if (/^[ \t]*#/.test(line)) continue;
+    if (!seenEntry && indent > 0) return false;
+    seenEntry = true;
+    if (UNSUPPORTED_SYNTAX.test(line.replace(/[ \t]#.*$/, ""))) return false;
+    if (indent === 0 ? !ROOT_KEY_LINE.test(line) : !INDENTED_ENTRY.test(line)) return false;
+    let rest = line.slice(indent);
+    if (rest.startsWith("-")) rest = rest.slice(1).replace(/^[ \t]+/, "");
+    const keyed = /^[A-Za-z_][A-Za-z0-9_-]*:(.*)$/.exec(rest);
+    const value = (keyed ? keyed[1] : rest).replace(/^[ \t]+/, "");
+    if ((value.startsWith("'") || value.startsWith('"')) && readQuotedScalar([value]) === null) return false;
+    if (BLOCK_SCALAR_START.test(line)) blockScalarIndent = indent;
+  }
+  return seenEntry;
+}
 
 // Reads the document's top-level "version" entry as one YAML scalar: the text
 // after the key, then every indented continuation line, folded the way YAML
@@ -41,28 +73,11 @@ const UNSUPPORTED_SYNTAX = /[{}\[\]&*!]/;
 // all: "version:4.0.0" and "version:\"4.0.0\"" are plain scalars, not mappings.
 function readVersionField(yml) {
   const lines = yml.split(/\r?\n/);
+  if (!hasSupportedShape(lines)) return null;
+  // In a supported document every column-0 line is a root key; block-scalar text is indented.
   const keyIndexes = [];
-  let blockScalarIndent = -1;
   for (let index = 0; index < lines.length; index++) {
-    const line = lines[index];
-    if (line.trim() === "") continue;
-    const indent = line.length - line.trimStart().length;
-    if (blockScalarIndent >= 0) {
-      if (indent > blockScalarIndent) continue; // block scalar text is opaque
-      blockScalarIndent = -1;
-    }
-    if (line.trimStart().startsWith("#")) continue;
-    if (UNSUPPORTED_SYNTAX.test(line.replace(/[ \t]#.*$/, ""))) return null;
-    if (BLOCK_SCALAR_START.test(line)) blockScalarIndent = indent;
-    if (isIndented(line)) continue;
-    if (line === "---" || line === "...") continue;
-    if (!ROOT_KEY_LINE.test(line)) return null;
-    if (VERSION_KEY_LINE.test(line)) keyIndexes.push(index);
-    // A quoted root value, on the key line or the next one, must close; otherwise
-    // the document was cut and is not one readable mapping.
-    const parts = entryParts(lines, index, line.indexOf(":") + 1);
-    const first = parts.find((part) => part.trim() !== "")?.trim() ?? "";
-    if ((first.startsWith("'") || first.startsWith('"')) && readScalarValue(parts) === null) return null;
+    if (VERSION_KEY_LINE.test(lines[index])) keyIndexes.push(index);
   }
   if (keyIndexes.length !== 1) return null;
   return readScalarValue(entryParts(lines, keyIndexes[0], "version:".length));
