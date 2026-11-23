@@ -18,20 +18,65 @@ function normalizeVersion(raw) {
   return VERSION_PATTERN.test(value) ? value : null;
 }
 
-// Reads a YAML scalar the way the CDN file writes it: an optional single- or
-// double-quoted value followed only by an optional comment. Plain scalars end at
-// a comment that starts after whitespace; any other trailing text stays in the
-// value so a version with a suffix ("4.0.0 beta") fails validation instead of
-// silently matching its numeric prefix. Returns null when the field is absent or
-// its scalar cannot be read unambiguously.
-function parseYamlScalar(rawLine) {
-  if (typeof rawLine !== "string") return null;
-  const text = rawLine.trim();
-  if (text.startsWith('"') || text.startsWith("'")) {
-    const quote = text[0];
-    let value = "";
-    let index = 1;
-    for (; index < text.length; index++) {
+const VERSION_KEY_LINE = /^version:(?:[ \t]|$)/;
+
+function isIndented(line) {
+  return line.startsWith(" ") || line.startsWith("\t");
+}
+
+// Reads the document's top-level "version" entry as one YAML scalar: the text
+// after the key, then every indented continuation line, folded the way YAML
+// folds it. Returns null when the document has no such key, has more than one
+// (ambiguous), or writes the entry so the checker cannot prove it is a key at
+// all: "version:4.0.0" and "version:\"4.0.0\"" are plain scalars, not mappings.
+function readVersionField(yml) {
+  const lines = yml.split(/\r?\n/);
+  const keyIndexes = [];
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (line === "" || line === "---" || line === "..." || isIndented(line)) continue;
+    if (VERSION_KEY_LINE.test(line)) keyIndexes.push(index);
+  }
+  if (keyIndexes.length !== 1) return null;
+  const keyIndex = keyIndexes[0];
+  const parts = [lines[keyIndex].slice("version:".length)];
+  for (let index = keyIndex + 1; index < lines.length; index++) {
+    const line = lines[index];
+    if (line !== "" && !isIndented(line)) break;
+    parts.push(line);
+  }
+  return readScalarValue(parts);
+}
+
+function readScalarValue(parts) {
+  let start = 0;
+  while (start < parts.length && parts[start].trim() === "") start++;
+  if (start === parts.length) return null;
+  const body = parts.slice(start);
+  const first = body[0].trim();
+  if (first.startsWith('"') || first.startsWith("'")) return readQuotedScalar(body);
+  return readPlainScalar(body);
+}
+
+// A quoted scalar runs to its closing quote; an indented line break inside it
+// folds to a space and a blank line inside it to a newline. Anything after the
+// closing quote other than a comment makes the field unreadable.
+function readQuotedScalar(parts) {
+  const quote = parts[0].trim()[0];
+  let value = null;
+  let fold = " ";
+  for (let lineIndex = 0; lineIndex < parts.length; lineIndex++) {
+    const text = lineIndex === 0 ? parts[0].trim() : parts[lineIndex].trim();
+    if (lineIndex > 0) {
+      if (text === "") {
+        if (value !== null) fold = "\n";
+        continue;
+      }
+      if (value !== null) value += fold;
+      fold = " ";
+    }
+    if (value === null) value = "";
+    for (let index = lineIndex === 0 ? 1 : 0; index < text.length; index++) {
       const char = text[index];
       if (quote === '"' && char === "\\") {
         const escaped = text[index + 1];
@@ -42,24 +87,48 @@ function parseYamlScalar(rawLine) {
         index += 1;
         continue;
       }
-      if (char === quote) {
-        if (quote === "'" && text[index + 1] === "'") {
-          value += "'";
-          index += 1;
-          continue;
-        }
-        break;
+      if (char !== quote) {
+        value += char;
+        continue;
       }
-      value += char;
+      if (quote === "'" && text[index + 1] === "'") {
+        value += "'";
+        index += 1;
+        continue;
+      }
+      const rest = text.slice(index + 1);
+      if (rest !== "" && !/^[ \t]+#/.test(rest)) return null;
+      for (let tail = lineIndex + 1; tail < parts.length; tail++) {
+        const extra = parts[tail].trim();
+        if (extra !== "" && !extra.startsWith("#")) return null;
+      }
+      return value;
     }
-    if (index >= text.length) return null;
-    const rest = text.slice(index + 1);
-    if (rest.trim() === "") return value;
-    return /^[ \t]+#/.test(rest) ? value : null;
   }
-  const commentStart = text.search(/[ \t]#/);
-  const value = (commentStart === -1 ? text : text.slice(0, commentStart)).trim();
-  return value === "" ? null : value;
+  return null;
+}
+
+// A plain scalar joins its indented continuation lines with a space and keeps a
+// blank line as a newline (so a value split over lines keeps its suffix and
+// fails validation). It ends at a comment that starts after whitespace;
+// "4.0.0#generated" is one token and fails too.
+function readPlainScalar(parts) {
+  let value = null;
+  let fold = " ";
+  for (const part of parts) {
+    const text = part.trim();
+    if (text === "" || text.startsWith("#")) {
+      if (value !== null) fold = "\n";
+      continue;
+    }
+    const commentStart = text.search(/[ \t]#/);
+    const content = (commentStart === -1 ? text : text.slice(0, commentStart)).trim();
+    if (content === "") break;
+    value = value === null ? content : value + fold + content;
+    fold = " ";
+    if (commentStart !== -1) break;
+  }
+  return value;
 }
 
 function compareVersions(a, b) {
@@ -96,11 +165,10 @@ async function cdnRelease(version) {
   const res = await fetch(CDN_LATEST_YML(version), { signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`CDN latest.yml for ${version}: HTTP ${res.status}`);
   const yml = await res.text();
-  const versionField = yml.match(/^version:[ \t]*(.*)$/m)?.[1];
-  const rawVersion = parseYamlScalar(versionField);
+  const rawVersion = readVersionField(yml);
   const cdnVersion = normalizeVersion(rawVersion);
   if (!cdnVersion) {
-    throw new Error(`CDN latest.yml for ${version}: missing or invalid version ${JSON.stringify(versionField?.trim() ?? null)}`);
+    throw new Error(`CDN latest.yml for ${version}: missing or invalid version ${JSON.stringify(rawVersion)}`);
   }
   return {
     version: cdnVersion,
