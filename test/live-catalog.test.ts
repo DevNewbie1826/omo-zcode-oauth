@@ -132,24 +132,40 @@ describe("fetchLiveModels", () => {
     }
   });
 
-  test("Given a 200 error envelope, when fetched, then no rows are returned and nothing throws", async () => {
+  test("Given a 200 error-only envelope, when fetched, then it rejects instead of returning rows", async () => {
     stubCatalog(() => json({ error: { code: 1210, message: "invalid api key" } }));
 
-    await expect(fetchLiveModels("key-123")).resolves.toEqual([]);
+    await expect(fetchLiveModels("key-123")).rejects.toThrow(/error envelope/);
   });
 
-  test("Given a 200 envelope with success:false and a data array, when fetched, then it rejects instead of trusting the rows", async () => {
-    stubCatalog(() => json({ success: false, code: 401, data: [{ id: "not-an-entitlement" }] }));
+  test("Given a recognized error envelope beside data rows, when fetched, then every error shape rejects instead of trusting the rows", async () => {
+    const rows = [{ id: "not-an-entitlement" }];
+    const error = { code: 1210, message: "invalid api key" };
+    const shapes: unknown[] = [
+      { success: false, code: 401, data: rows },
+      { type: "error", error, data: rows },
+      { type: "error", data: rows },
+      { error, data: rows },
+      { error: "invalid api key", data: rows },
+    ];
 
-    await expect(fetchLiveModels("key-123")).rejects.toThrow(/reported failure/);
+    for (const shape of shapes) {
+      stubCatalog(() => json(shape));
+
+      await expect(fetchLiveModels("key-123"), JSON.stringify(shape)).rejects.toThrow(/error envelope/);
+    }
   });
 
-  test("Given a 200 envelope with success:true and a data array, when fetched, then the rows are accepted", async () => {
-    stubCatalog(() => json({ success: true, data: [{ id: "entitled" }] }));
+  test("Given the success and bare-array shapes, when fetched, then their rows are still accepted", async () => {
+    const rows = [{ id: "entitled" }];
+    const shapes: unknown[] = [{ success: true, data: rows }, { type: "success", data: rows }, rows];
 
-    const models = await fetchLiveModels("key-123");
+    for (const shape of shapes) {
+      stubCatalog(() => json(shape));
 
-    expect(models.map((model) => model.id)).toEqual(["entitled"]);
+      const models = await fetchLiveModels("key-123");
+      expect(models.map((model) => model.id), JSON.stringify(shape)).toEqual(["entitled"]);
+    }
   });
 
   test("Given a response body over 1MB, when fetched, then reading stops once the cap is crossed", async () => {

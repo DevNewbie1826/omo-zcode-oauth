@@ -34,6 +34,18 @@ interface LiveCatalogEntry {
   name: string;
 }
 
+/**
+ * The error shapes the endpoint is observed to use: an Anthropic-style `type:"error"`
+ * envelope, or an `error` object/string carrying the failure. Any of them is an
+ * authoritative failure even at HTTP 200, so `data` rows beside it prove nothing.
+ */
+function isErrorEnvelope(payload: JsonRecord): boolean {
+  if (payload.success === false || payload.type === "error") return true;
+  const error = payload.error;
+  if (typeof error === "string") return error.trim() !== "";
+  return isRecord(error) && Object.keys(error).length > 0;
+}
+
 function usableEntry(entry: JsonRecord): LiveCatalogEntry | undefined {
   const id = entry.id;
   if (typeof id !== "string" || !isSafeToken(id)) return undefined;
@@ -80,8 +92,8 @@ async function readCappedUtf8(stream: ReadableStream<Uint8Array> | null, maxByte
  * back to the id. The live catalog supplies ids/names only, so rows carry the shared
  * ZCODE_CHAT_DEFAULTS through M's single chat builder (zero cost, 1M context,
  * 131072 max tokens, adaptive-thinking defaults, no image/video override for 5.4).
- * Non-2xx (with its body cancelled), explicit `success:false`, non-JSON, oversize bodies
- * and aborts reject; the caller decides how to degrade.
+ * Non-2xx (with its body cancelled), a recognized error envelope, non-JSON, oversize
+ * bodies and aborts reject; the caller decides how to degrade.
  */
 export async function fetchLiveModels(apiKey: string, signal?: AbortSignal): Promise<ZCodeChatModelConfig[]> {
   // Honor an already-aborted caller signal before touching the network; fetch only
@@ -117,10 +129,10 @@ export async function fetchLiveModels(apiKey: string, signal?: AbortSignal): Pro
     throw new Error("live models response was not valid JSON", { cause: error });
   }
 
-  // An explicit failure flag makes the envelope authoritative failure even at HTTP 200;
+  // Any recognized failure shape makes the envelope authoritative failure even at HTTP 200;
   // a `data` array inside it is not evidence of membership.
-  if (isRecord(payload) && payload.success === false) {
-    throw new Error("live models response reported failure");
+  if (isRecord(payload) && isErrorEnvelope(payload)) {
+    throw new Error("live models reported an error envelope");
   }
 
   const entries = Array.isArray(payload)

@@ -100,11 +100,20 @@ function filteredInput(value: unknown): ZCodeChatModelConfig["input"] | undefine
   return input.length > 0 ? input : ["text"];
 }
 
-/** Drops video/pdf from models.dev rows; the chat union here is text/image only. */
-function metadataInput(value: unknown): ZCodeInputModality[] {
-  if (!Array.isArray(value)) return [...ZCODE_CHAT_DEFAULTS.input];
+/**
+ * The modalities a models.dev row actually states: video/pdf dropped, duplicates folded.
+ * An array with no valid entry states nothing usable, so it is `undefined` rather than
+ * a manufactured default; a valid `["text"]` stays an authoritative text-only statement.
+ */
+function statedInput(value: unknown): ZCodeInputModality[] | undefined {
+  if (!Array.isArray(value)) return undefined;
   const input = [...new Set(value.filter((entry): entry is ZCodeInputModality => entry === "text" || entry === "image"))];
-  return input.length > 0 ? input : [...ZCODE_CHAT_DEFAULTS.input];
+  return input.length > 0 ? input : undefined;
+}
+
+/** Legacy/restore input: an unusable array falls back to the default text-only set. */
+function metadataInput(value: unknown): ZCodeInputModality[] {
+  return statedInput(value) ?? [...ZCODE_CHAT_DEFAULTS.input];
 }
 
 function finiteNumber(value: unknown): value is number {
@@ -294,10 +303,11 @@ function parseDevMetadataFields(model: unknown): ZCodeChatModelMetadataFields | 
   if (!isRecord(limit) || !finiteNumber(limit.context) || limit.context <= 0) return undefined;
 
   const modalities = isRecord(model.modalities) ? model.modalities : undefined;
+  const input = statedInput(modalities?.input);
   return {
     contextWindow: limit.context,
     ...(typeof model.reasoning === "boolean" ? { reasoning: model.reasoning } : {}),
-    ...(modalities !== undefined && Array.isArray(modalities.input) ? { input: metadataInput(modalities.input) } : {}),
+    ...(input !== undefined ? { input } : {}),
     ...(finiteNumber(limit.output) && limit.output > 0 ? { maxTokens: limit.output } : {}),
   };
 }

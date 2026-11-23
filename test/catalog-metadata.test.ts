@@ -135,6 +135,32 @@ describe("parseModelsDevMetadata", () => {
     });
   });
 
+  test("an input array with no valid modality counts as unstated, so the fallback section supplies it", () => {
+    const secondary = { limit: { context: 100, output: 10 }, modalities: { input: ["text", "image"] } };
+
+    for (const input of [[null, 42], [], ["video", "pdf"], "text", null]) {
+      const metadata = parseModelsDevMetadata({
+        [CATALOG_PROVIDER]: { models: { future: { limit: { context: 99 }, modalities: { input } } } },
+        [MODELS_DEV_FALLBACK_PROVIDER]: { models: { future: secondary } },
+      });
+
+      expect(metadata.get("future"), JSON.stringify(input)).toEqual({
+        contextWindow: 99,
+        maxTokens: 10,
+        input: ["text", "image"],
+      });
+    }
+  });
+
+  test("an explicit valid [\"text\"] in the primary row still wins over the fallback input", () => {
+    const metadata = parseModelsDevMetadata({
+      [CATALOG_PROVIDER]: { models: { future: { limit: { context: 99 }, modalities: { input: ["text"] } } } },
+      [MODELS_DEV_FALLBACK_PROVIDER]: { models: { future: { limit: { context: 100 }, modalities: { input: ["text", "image"] } } } },
+    });
+
+    expect(metadata.get("future")?.input).toEqual(["text"]);
+  });
+
   test("an explicit false in the primary row is not replaced by a fallback true", () => {
     const metadata = parseModelsDevMetadata({
       [CATALOG_PROVIDER]: { models: { future: { reasoning: false, limit: { context: 99 } } } },
@@ -218,6 +244,28 @@ describe("mergeChatMetadata", () => {
     const [merged] = mergeChatMetadata([liveRow("future", "Future")], metadata);
 
     expect(merged).toMatchObject({ reasoning: true, contextWindow: 99, maxTokens: 131_072, input: ["text"] });
+  });
+
+  test("an unusable primary input does not suppress a valid secondary input, while explicit text-only still does", () => {
+    const cases: Array<{ modalities?: { input: unknown }; expected: string[] }> = [
+      { modalities: { input: [null, 42] }, expected: ["text", "image"] },
+      { modalities: { input: ["video", "pdf"] }, expected: ["text", "image"] },
+      { expected: ["text", "image"] },
+      { modalities: { input: ["text"] }, expected: ["text"] },
+    ];
+
+    for (const { modalities, expected } of cases) {
+      const metadata = parseModelsDevMetadata({
+        [CATALOG_PROVIDER]: { models: { future: { limit: { context: 99 }, ...(modalities ? { modalities } : {}) } } },
+        [MODELS_DEV_FALLBACK_PROVIDER]: {
+          models: { future: { limit: { context: 100, output: 10 }, modalities: { input: ["text", "image"] } } },
+        },
+      });
+
+      const [merged] = mergeChatMetadata([liveRow("future", "Future")], metadata);
+
+      expect(merged?.input, JSON.stringify(modalities)).toEqual(expected);
+    }
   });
 
   test("an explicit false in metadata still wins over the live default", () => {
