@@ -138,6 +138,20 @@ describe("fetchLiveModels", () => {
     await expect(fetchLiveModels("key-123")).resolves.toEqual([]);
   });
 
+  test("Given a 200 envelope with success:false and a data array, when fetched, then it rejects instead of trusting the rows", async () => {
+    stubCatalog(() => json({ success: false, code: 401, data: [{ id: "not-an-entitlement" }] }));
+
+    await expect(fetchLiveModels("key-123")).rejects.toThrow(/reported failure/);
+  });
+
+  test("Given a 200 envelope with success:true and a data array, when fetched, then the rows are accepted", async () => {
+    stubCatalog(() => json({ success: true, data: [{ id: "entitled" }] }));
+
+    const models = await fetchLiveModels("key-123");
+
+    expect(models.map((model) => model.id)).toEqual(["entitled"]);
+  });
+
   test("Given a response body over 1MB, when fetched, then reading stops once the cap is crossed", async () => {
     const chunkSize = 65_536;
     const totalAvailable = LIVE_MODELS_MAX_BYTES * 3;
@@ -198,6 +212,22 @@ describe("fetchLiveModels", () => {
     stubCatalog(() => json({ error: "unauthorized" }, 401));
 
     await expect(fetchLiveModels("key-123")).rejects.toBeInstanceOf(Error);
+  });
+
+  test("Given a non-2xx response with an open body, when fetched, then it rejects and cancels the body", async () => {
+    const probe = { cancelCount: 0 };
+    const body = new ReadableStream<Uint8Array>({
+      pull() {
+        // Stays open until the reader cancels, like a stalled error response.
+      },
+      cancel() {
+        probe.cancelCount += 1;
+      },
+    });
+    stubCatalog(() => new Response(body, { status: 503 }));
+
+    await expect(fetchLiveModels("key-123")).rejects.toThrow(/503/);
+    expect(probe.cancelCount).toBe(1);
   });
 
   test("Given a non-JSON body, when fetched, then it rejects", async () => {

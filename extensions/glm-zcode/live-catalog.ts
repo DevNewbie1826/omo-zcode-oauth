@@ -80,7 +80,8 @@ async function readCappedUtf8(stream: ReadableStream<Uint8Array> | null, maxByte
  * back to the id. The live catalog supplies ids/names only, so rows carry the shared
  * ZCODE_CHAT_DEFAULTS through M's single chat builder (zero cost, 1M context,
  * 131072 max tokens, adaptive-thinking defaults, no image/video override for 5.4).
- * Non-2xx, non-JSON, oversize bodies and aborts reject; the caller decides how to degrade.
+ * Non-2xx (with its body cancelled), explicit `success:false`, non-JSON, oversize bodies
+ * and aborts reject; the caller decides how to degrade.
  */
 export async function fetchLiveModels(apiKey: string, signal?: AbortSignal): Promise<ZCodeChatModelConfig[]> {
   // Honor an already-aborted caller signal before touching the network; fetch only
@@ -96,7 +97,16 @@ export async function fetchLiveModels(apiKey: string, signal?: AbortSignal): Pro
     },
     signal: requestSignal,
   });
-  if (!response.ok) throw new Error(`live models request failed: ${response.status}`);
+  if (!response.ok) {
+    // The status error is the actionable one; still release the transport instead of
+    // leaving an unread body to the producer, timeout or runtime.
+    try {
+      await response.body?.cancel();
+    } catch {
+      // A body that cannot be cancelled must not hide the HTTP failure below.
+    }
+    throw new Error(`live models request failed: ${response.status}`);
+  }
 
   const text = await readCappedUtf8(response.body, LIVE_MODELS_MAX_BYTES);
 
@@ -105,6 +115,12 @@ export async function fetchLiveModels(apiKey: string, signal?: AbortSignal): Pro
     payload = JSON.parse(text);
   } catch (error: unknown) {
     throw new Error("live models response was not valid JSON", { cause: error });
+  }
+
+  // An explicit failure flag makes the envelope authoritative failure even at HTTP 200;
+  // a `data` array inside it is not evidence of membership.
+  if (isRecord(payload) && payload.success === false) {
+    throw new Error("live models response reported failure");
   }
 
   const entries = Array.isArray(payload)

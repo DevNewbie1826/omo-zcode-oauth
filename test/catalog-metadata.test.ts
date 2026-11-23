@@ -118,6 +118,40 @@ describe("parseModelsDevMetadata", () => {
     expect(parseModelsDevMetadata([]).size).toBe(0);
     expect(parseModelsDevMetadata({ [CATALOG_PROVIDER]: { models: { broken: { limit: { output: 1 } } } } }).size).toBe(0);
   });
+
+  test("an incomplete primary row leaves absent fields for the fallback section to state", () => {
+    const metadata = parseModelsDevMetadata({
+      [CATALOG_PROVIDER]: { models: { future: { limit: { context: 99 } } } },
+      [MODELS_DEV_FALLBACK_PROVIDER]: {
+        models: { future: { reasoning: true, limit: { context: 8_000, output: 400 }, modalities: { input: ["text", "image"] } } },
+      },
+    });
+
+    expect(metadata.get("future")).toEqual({
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 99,
+      maxTokens: 400,
+    });
+  });
+
+  test("an explicit false in the primary row is not replaced by a fallback true", () => {
+    const metadata = parseModelsDevMetadata({
+      [CATALOG_PROVIDER]: { models: { future: { reasoning: false, limit: { context: 99 } } } },
+      [MODELS_DEV_FALLBACK_PROVIDER]: { models: { future: { reasoning: true } } },
+    });
+
+    expect(metadata.get("future")?.reasoning).toBe(false);
+  });
+
+  test("a row that states no reasoning carries no reasoning field", () => {
+    const metadata = parseModelsDevMetadata({
+      [CATALOG_PROVIDER]: { models: { future: { limit: { context: 99 } } } },
+    });
+
+    expect(metadata.has("future")).toBe(true);
+    expect(metadata.get("future")?.reasoning).toBeUndefined();
+  });
 });
 
 describe("mergeChatMetadata", () => {
@@ -155,6 +189,45 @@ describe("mergeChatMetadata", () => {
       maxTokens: 131_072,
       reasoning: true,
     });
+  });
+
+  test("missing reasoning metadata does not override the live default or suppress secondary data", () => {
+    const metadata = parseModelsDevMetadata({
+      [CATALOG_PROVIDER]: { models: { future: { limit: { context: 99 } } } },
+      [MODELS_DEV_FALLBACK_PROVIDER]: {
+        models: { future: { reasoning: true, limit: { context: 8_000, output: 400 }, modalities: { input: ["text", "image"] } } },
+      },
+    });
+
+    const [merged] = mergeChatMetadata([liveRow("future", "Future")], metadata);
+
+    expect(merged).toMatchObject({
+      id: "future",
+      reasoning: true,
+      input: ["text", "image"],
+      contextWindow: 99,
+      maxTokens: 400,
+    });
+  });
+
+  test("when no source states reasoning, the live default survives instead of a manufactured false", () => {
+    const metadata = parseModelsDevMetadata({
+      [CATALOG_PROVIDER]: { models: { future: { limit: { context: 99 } } } },
+    });
+
+    const [merged] = mergeChatMetadata([liveRow("future", "Future")], metadata);
+
+    expect(merged).toMatchObject({ reasoning: true, contextWindow: 99, maxTokens: 131_072, input: ["text"] });
+  });
+
+  test("an explicit false in metadata still wins over the live default", () => {
+    const metadata = parseModelsDevMetadata({
+      [CATALOG_PROVIDER]: { models: { future: { reasoning: false, limit: { context: 99 } } } },
+    });
+
+    const [merged] = mergeChatMetadata([liveRow("future", "Future")], metadata);
+
+    expect(merged?.reasoning).toBe(false);
   });
 
   test("non-chat rows are skipped", () => {
@@ -196,6 +269,25 @@ describe("fetchModelsDevPayload", () => {
     }));
 
     await expect(fetchModelsDevPayload()).rejects.toThrow(/503/);
+  });
+
+  test("a non-2xx response with an open body rejects and cancels the body", async () => {
+    const probe = { cancelCount: 0 };
+    const body = new ReadableStream<Uint8Array>({
+      pull() {
+        // Stays open until the reader cancels, like a stalled error response.
+      },
+      cancel() {
+        probe.cancelCount += 1;
+      },
+    });
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) !== MODELS_DEV_API_URL) throw new Error(`unexpected request: ${String(input)}`);
+      return new Response(body, { status: 503 });
+    }));
+
+    await expect(fetchModelsDevPayload()).rejects.toThrow(/503/);
+    expect(probe.cancelCount).toBe(1);
   });
 });
 

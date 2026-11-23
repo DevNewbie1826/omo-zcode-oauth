@@ -58,6 +58,18 @@ export interface ZCodeChatModelMetadata {
   maxTokens: number;
 }
 
+/**
+ * What one models.dev row actually states. A field the row omits or writes
+ * invalidly stays absent, so a later section or the live defaults can supply it
+ * instead of a manufactured value masquerading as authoritative metadata.
+ */
+export interface ZCodeChatModelMetadataFields {
+  reasoning?: boolean;
+  input?: ZCodeInputModality[];
+  contextWindow?: number;
+  maxTokens?: number;
+}
+
 /** Defaults for live ids without models.dev metadata, including 5.4: text-only, 1M context, 131072 output. */
 export const ZCODE_CHAT_DEFAULTS: ZCodeChatModelMetadata = {
   reasoning: true,
@@ -272,19 +284,42 @@ export function catalogRowsFromModelsDev(payload: unknown): ZCodeChatModelConfig
 }
 
 /**
- * Per-id metadata keyed the same way as the live ids: `zai-coding-plan` first,
- * `zai` only for ids the primary section lacks. The winning row supplies input,
- * contextWindow, maxTokens and reasoning; ids and names are never read from it.
+ * The stated fields of one models.dev row. A row needs a usable context limit to
+ * count at all; beyond that, each field is kept only when the row states it — an
+ * absent `reasoning` is not `false`, and an absent output limit is not a default.
  */
-export function parseModelsDevMetadata(payload: unknown): Map<string, ZCodeChatModelMetadata> {
-  const metadata = new Map<string, ZCodeChatModelMetadata>();
-  for (const row of catalogRowsFromModelsDev(payload)) {
-    metadata.set(row.id, {
-      reasoning: row.reasoning,
-      input: metadataInput(row.input),
-      contextWindow: row.contextWindow,
-      maxTokens: row.maxTokens,
-    });
+function parseDevMetadataFields(model: unknown): ZCodeChatModelMetadataFields | undefined {
+  if (!isRecord(model)) return undefined;
+  const limit = model.limit;
+  if (!isRecord(limit) || !finiteNumber(limit.context) || limit.context <= 0) return undefined;
+
+  const modalities = isRecord(model.modalities) ? model.modalities : undefined;
+  return {
+    contextWindow: limit.context,
+    ...(typeof model.reasoning === "boolean" ? { reasoning: model.reasoning } : {}),
+    ...(modalities !== undefined && Array.isArray(modalities.input) ? { input: metadataInput(modalities.input) } : {}),
+    ...(finiteNumber(limit.output) && limit.output > 0 ? { maxTokens: limit.output } : {}),
+  };
+}
+
+/**
+ * Per-id metadata keyed the same way as the live ids: `zai-coding-plan` first,
+ * `zai` only for fields the primary section left unstated. The winning row supplies
+ * input, contextWindow, maxTokens and reasoning; ids and names are never read from it.
+ */
+export function parseModelsDevMetadata(payload: unknown): Map<string, ZCodeChatModelMetadataFields> {
+  const metadata = new Map<string, ZCodeChatModelMetadataFields>();
+  if (!isRecord(payload)) return metadata;
+  for (const section of [CATALOG_PROVIDER, MODELS_DEV_FALLBACK_PROVIDER]) {
+    const models = devSectionModels(payload, section);
+    if (!models) continue;
+    for (const [id, model] of Object.entries(models)) {
+      const fields = parseDevMetadataFields(model);
+      if (!fields) continue;
+      // Only unstated fields are filled, so an explicit primary value always wins:
+      // the already-recorded fields spread last and shadow the later section.
+      metadata.set(id, { ...fields, ...metadata.get(id) });
+    }
   }
   return metadata;
 }
@@ -294,18 +329,27 @@ export async function fetchModelsDevPayload(signal?: AbortSignal): Promise<unkno
   const timeoutSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
   const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
   const response = await fetch(MODELS_DEV_API_URL, { signal: requestSignal });
-  if (!response.ok) throw new Error(`models.dev catalog request failed: ${response.status}`);
+  if (!response.ok) {
+    // Cancel rather than abandon the body, so the failed read cannot hold transport
+    // resources after the caller has already degraded.
+    try {
+      await response.body?.cancel();
+    } catch {
+      // A body that cannot be cancelled must not hide the HTTP status error.
+    }
+    throw new Error(`models.dev catalog request failed: ${response.status}`);
+  }
   return response.json();
 }
 
 /**
  * Enriches catalog rows with models.dev metadata by id. Rows keep their own id, name
- * and thinking fields; only reasoning, input, contextWindow and maxTokens change.
- * Rows without metadata keep their live values (or the caller's defaults).
+ * and thinking fields; only the metadata fields a dev row actually states change, and
+ * anything it leaves unstated keeps the row's own value (the live defaults).
  */
 export function mergeChatMetadata(
   models: readonly ProviderModelConfig[],
-  metadata: ReadonlyMap<string, ZCodeChatModelMetadata>,
+  metadata: ReadonlyMap<string, ZCodeChatModelMetadataFields>,
 ): ZCodeChatModelConfig[] {
   const merged: ZCodeChatModelConfig[] = [];
   for (const model of models) {
@@ -316,11 +360,11 @@ export function mergeChatMetadata(
       toChatModelConfig(
         chat.id,
         chat.name,
-        enrichment ?? {
-          reasoning: chat.reasoning,
-          input: metadataInput(chat.input),
-          contextWindow: chat.contextWindow,
-          maxTokens: chat.maxTokens,
+        {
+          reasoning: enrichment?.reasoning ?? chat.reasoning,
+          input: enrichment?.input ?? metadataInput(chat.input),
+          contextWindow: enrichment?.contextWindow ?? chat.contextWindow,
+          maxTokens: enrichment?.maxTokens ?? chat.maxTokens,
         },
         chatThinkingConfig(chat),
       ),
