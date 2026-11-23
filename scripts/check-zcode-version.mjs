@@ -18,163 +18,16 @@ function normalizeVersion(raw) {
   return VERSION_PATTERN.test(value) ? value : null;
 }
 
-const VERSION_KEY_LINE = /^version:(?:[ \t]|$)/;
+// latest.yml is not parsed as YAML. The checker needs exactly one column-0
+// line `version: X.Y.Z` (optionally quoted); none or several exit 2. The value
+// must also equal the GitHub release tag, and the file is fetched from that
+// tag's own release directory, so a malformed or unusual document can only
+// produce exit 2 or a version the GitHub release independently confirms.
+const VERSION_LINE = /^version: ?(['"]?)(\d+\.\d+\.\d+)\1[ \t]*\r?$/gm;
 
-function isIndented(line) {
-  return line.startsWith(" ") || line.startsWith("\t");
-}
-
-// electron-builder writes latest.yml as one plain block mapping: identifier
-// keys at column 0, plain or quoted scalars, nested block collections and
-// `|`/`>` block scalars. Any other shape (a flow collection, an anchor, alias
-// or tag, a quoted or non-identifier root key, content on a document marker)
-// is refused rather than interpreted: guessing which nested scalar belongs to
-// the root is how a nested file "version" used to win.
-const ROOT_KEY_LINE = /^[A-Za-z_][A-Za-z0-9_-]*:(?:[ \t]|$)/;
-const BLOCK_SCALAR_START = /:[ \t]*[|>][-+0-9]*[ \t]*(?:#.*)?$/;
-const UNSUPPORTED_SYNTAX = /[{}\[\]&*!]/;
-const INDENTED_ENTRY = /^[ \t]+(?:-(?:[ \t]|$)|[A-Za-z_][A-Za-z0-9_-]*:(?:[ \t]|$))/;
-
-// Accepts only the line shapes electron-builder writes, for the whole document:
-// comments, identifier keys at column 0, indented `key:` or `- ` entries, and
-// opaque `|`/`>` block-scalar text. Every quoted value must close on its own
-// line. A document that starts indented, has a document marker, a continued or
-// unterminated quoted value, or any other line is refused, so the checker never
-// reads a version out of a document a YAML parser would reject or read differently.
-function hasSupportedShape(lines) {
-  let blockScalarIndent = -1;
-  let seenEntry = false;
-  for (const line of lines) {
-    if (/^[ \t]*$/.test(line)) continue;
-    const indent = /^[ \t]*/.exec(line)[0].length;
-    if (blockScalarIndent >= 0) {
-      if (indent > blockScalarIndent) continue;
-      blockScalarIndent = -1;
-    }
-    if (/^[ \t]*#/.test(line)) continue;
-    if (!seenEntry && indent > 0) return false;
-    seenEntry = true;
-    if (UNSUPPORTED_SYNTAX.test(line.replace(/[ \t]#.*$/, ""))) return false;
-    if (indent === 0 ? !ROOT_KEY_LINE.test(line) : !INDENTED_ENTRY.test(line)) return false;
-    let rest = line.slice(indent);
-    if (rest.startsWith("-")) rest = rest.slice(1).replace(/^[ \t]+/, "");
-    const keyed = /^[A-Za-z_][A-Za-z0-9_-]*:(.*)$/.exec(rest);
-    const value = (keyed ? keyed[1] : rest).replace(/^[ \t]+/, "");
-    if ((value.startsWith("'") || value.startsWith('"')) && readQuotedScalar([value]) === null) return false;
-    if (BLOCK_SCALAR_START.test(line)) blockScalarIndent = indent;
-  }
-  return seenEntry;
-}
-
-// Reads the document's top-level "version" entry as one YAML scalar: the text
-// after the key, then every indented continuation line, folded the way YAML
-// folds it. Returns null when the document has no such key, has more than one
-// (ambiguous), or writes the entry so the checker cannot prove it is a key at
-// all: "version:4.0.0" and "version:\"4.0.0\"" are plain scalars, not mappings.
-function readVersionField(yml) {
-  const lines = yml.split(/\r?\n/);
-  if (!hasSupportedShape(lines)) return null;
-  // In a supported document every column-0 line is a root key; block-scalar text is indented.
-  const keyIndexes = [];
-  for (let index = 0; index < lines.length; index++) {
-    if (VERSION_KEY_LINE.test(lines[index])) keyIndexes.push(index);
-  }
-  if (keyIndexes.length !== 1) return null;
-  return readScalarValue(entryParts(lines, keyIndexes[0], "version:".length));
-}
-
-// The value text of the root entry at keyIndex plus its indented continuation lines.
-function entryParts(lines, keyIndex, valueStart) {
-  const parts = [lines[keyIndex].slice(valueStart)];
-  for (let index = keyIndex + 1; index < lines.length; index++) {
-    const line = lines[index];
-    if (line !== "" && !isIndented(line)) break;
-    parts.push(line);
-  }
-  return parts;
-}
-
-function readScalarValue(parts) {
-  let start = 0;
-  while (start < parts.length && parts[start].trim() === "") start++;
-  if (start === parts.length) return null;
-  const body = parts.slice(start);
-  const first = body[0].trim();
-  if (first.startsWith('"') || first.startsWith("'")) return readQuotedScalar(body);
-  return readPlainScalar(body);
-}
-
-// A quoted scalar runs to its closing quote; an indented line break inside it
-// folds to a space and a blank line inside it to a newline. Anything after the
-// closing quote other than a comment makes the field unreadable.
-function readQuotedScalar(parts) {
-  const quote = parts[0].trim()[0];
-  let value = null;
-  let fold = " ";
-  for (let lineIndex = 0; lineIndex < parts.length; lineIndex++) {
-    const text = lineIndex === 0 ? parts[0].trim() : parts[lineIndex].trim();
-    if (lineIndex > 0) {
-      if (text === "") {
-        if (value !== null) fold = "\n";
-        continue;
-      }
-      if (value !== null) value += fold;
-      fold = " ";
-    }
-    if (value === null) value = "";
-    for (let index = lineIndex === 0 ? 1 : 0; index < text.length; index++) {
-      const char = text[index];
-      if (quote === '"' && char === "\\") {
-        const escaped = text[index + 1];
-        if (escaped === '"' || escaped === "\\") value += escaped;
-        else if (escaped === "n") value += "\n";
-        else if (escaped === "t") value += "\t";
-        else return null;
-        index += 1;
-        continue;
-      }
-      if (char !== quote) {
-        value += char;
-        continue;
-      }
-      if (quote === "'" && text[index + 1] === "'") {
-        value += "'";
-        index += 1;
-        continue;
-      }
-      const rest = text.slice(index + 1);
-      if (rest !== "" && !/^[ \t]+#/.test(rest)) return null;
-      for (let tail = lineIndex + 1; tail < parts.length; tail++) {
-        const extra = parts[tail].trim();
-        if (extra !== "" && !extra.startsWith("#")) return null;
-      }
-      return value;
-    }
-  }
-  return null;
-}
-
-// A plain scalar joins its indented continuation lines with a space and keeps a
-// blank line as a newline (so a value split over lines keeps its suffix and
-// fails validation). It ends at a comment that starts after whitespace;
-// "4.0.0#generated" is one token and fails too.
-function readPlainScalar(parts) {
-  let value = null;
-  let fold = " ";
-  for (const part of parts) {
-    const text = part.trim();
-    if (text === "" || text.startsWith("#")) {
-      if (value !== null) fold = "\n";
-      continue;
-    }
-    const commentStart = text.search(/[ \t]#/);
-    const content = (commentStart === -1 ? text : text.slice(0, commentStart)).trim();
-    if (content === "") break;
-    value = value === null ? content : value + fold + content;
-    fold = " ";
-    if (commentStart !== -1) break;
-  }
-  return value;
+function readVersionLine(yml) {
+  const matches = [...yml.matchAll(VERSION_LINE)];
+  return matches.length === 1 ? matches[0][2] : null;
 }
 
 function compareVersions(a, b) {
@@ -211,10 +64,9 @@ async function cdnRelease(version) {
   const res = await fetch(CDN_LATEST_YML(version), { signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`CDN latest.yml for ${version}: HTTP ${res.status}`);
   const yml = await res.text();
-  const rawVersion = readVersionField(yml);
-  const cdnVersion = normalizeVersion(rawVersion);
+  const cdnVersion = readVersionLine(yml);
   if (!cdnVersion) {
-    throw new Error(`CDN latest.yml for ${version}: missing or invalid version ${JSON.stringify(rawVersion)}`);
+    throw new Error(`CDN latest.yml for ${version}: no single \"version: X.Y.Z\" line`);
   }
   return {
     version: cdnVersion,
