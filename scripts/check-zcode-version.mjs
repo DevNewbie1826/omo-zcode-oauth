@@ -13,10 +13,10 @@ const CDN_LATEST_YML = (version) =>
 
 const VERSION_PATTERN = /^(?:0|[1-9]\d*)(?:\.(?:0|[1-9]\d*))*$/;
 
-function normalizeVersion(raw) {
+function normalizeVersion(raw, { allowTagPrefix = false } = {}) {
   if (typeof raw !== "string") return null;
   // No trimming: any surrounding character (including Unicode spaces) makes the version unreadable.
-  const value = raw.replace(/^v/, "");
+  const value = allowTagPrefix ? raw.replace(/^v/, "") : raw;
   return VERSION_PATTERN.test(value) ? value : null;
 }
 
@@ -59,7 +59,7 @@ async function latestGitHubRelease() {
   const res = await fetch(GITHUB_LATEST, { headers, signal: AbortSignal.timeout(15_000) });
   if (!res.ok) throw new Error(`GitHub releases: HTTP ${res.status}`);
   const body = await res.json();
-  const version = normalizeVersion(body?.tag_name);
+  const version = normalizeVersion(body?.tag_name, { allowTagPrefix: true });
   if (!version) throw new Error(`GitHub releases: missing or invalid tag_name ${JSON.stringify(body?.tag_name)}`);
   return { version, publishedAt: body.published_at };
 }
