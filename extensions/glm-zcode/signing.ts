@@ -50,6 +50,23 @@ const NONCE_BYTES = 16;
 const GATE_TTL_MS = 60 * 60 * 1000;
 const GATE_TIMEOUT_MS = 15_000;
 const HANDSHAKE_TIMEOUT_MS = 10_000;
+/**
+ * The only caller headers the feature gate receives: the app's source headers
+ * minus X-ZCode-Agent. Anything else on the request (Cookie, Authorization,
+ * caller-specific headers) stays off the gate request.
+ */
+const GATE_SOURCE_HEADERS: readonly string[] = [
+  "User-Agent",
+  "HTTP-Referer",
+  "X-Title",
+  "X-ZCode-App-Version",
+  "X-Release-Channel",
+  "X-Platform",
+  "X-Os-Category",
+  "X-Os-Version",
+  "X-Client-Language",
+  "X-Client-Timezone",
+];
 
 export type ZCodeApiKeyCredential = { apiKeyId: string; apiKeySecret: string };
 
@@ -312,10 +329,9 @@ export async function resolveZCodeSigningHeaders(
     if (!credential) return {};
     // Gate headers mirror the app: source headers only (no X-ZCode-Agent).
     const source: Record<string, string> = {};
-    for (const [key, value] of Object.entries(headers)) {
-      if (typeof value === "string" && value !== "" && key !== "X-ZCode-Agent" && key !== "Authorization" && !key.startsWith("x-") && !key.startsWith("X-Client")) {
-        source[key] = value;
-      }
+    for (const key of GATE_SOURCE_HEADERS) {
+      const value = headers[key];
+      if (typeof value === "string" && value !== "") source[key] = value;
     }
     if (!(await signingEnabled(apiKey, source))) return {};
     const privateKey = await ensurePrivateKey(credential);

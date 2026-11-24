@@ -308,6 +308,32 @@ describe("resolveZCodeSigningHeaders", () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 
+  test("Given caller Cookie and custom headers, when resolved, then the gate request carries only x-api-key and the ZCode source headers", async () => {
+    const { cipher } = await makePrivateCipher(credential);
+    const fetch = stubGateAndHandshake({ code: 0, msg: "", data: { codingPlanSignature: { enable: false } } }, cipher);
+    vi.stubGlobal("fetch", fetch);
+
+    await resolveZCodeSigningHeaders({ ...glmHeaders(apiKey), Cookie: "session=secret", "X-Caller-Secret": "leak" });
+
+    const gateCall = fetch.mock.calls.find((call) => String(call[0]) === SIGNING_GATE_URL);
+    const gateHeaders = new Headers(gateCall?.[1]?.headers);
+    expect([...gateHeaders.keys()].sort()).toEqual(
+      [
+        "http-referer",
+        "user-agent",
+        "x-api-key",
+        "x-client-language",
+        "x-client-timezone",
+        "x-os-category",
+        "x-os-version",
+        "x-platform",
+        "x-release-channel",
+        "x-title",
+        "x-zcode-app-version",
+      ],
+    );
+  });
+
   type GateCase =
     | { readonly kind: "payload"; readonly payload: unknown }
     | { readonly kind: "status"; readonly status: number }
