@@ -13,7 +13,7 @@ import { zcodeAppVersion } from "./models.js";
  *    Signing proceeds unless that flag is exactly false. An absent flag, a
  *    non-boolean enable, a non-2xx response, a payload whose code is not 0,
  *    malformed JSON, or a thrown fetch is no answer, and the request is still
- *    signed. ZCode 3.15.3 has no gate: its agent bundle never reads
+ *    signed. ZCode 4.0.0 has no gate: its agent bundle never reads
  *    codingPlanSignature.
  * 2. Handshake: POST https://api.z.ai/api/paas/c1f3a7e2/v2/client with the raw
  *    `{id}.{secret}` key as Authorization and a body proving knowledge of the

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import type { Context } from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/api/anthropic-messages";
 import type { Model } from "@earendil-works/pi-ai";
 import glmZcodeExtension, { buildZCodeSourceHeaders } from "../extensions/glm-zcode/index.js";
@@ -31,10 +31,10 @@ function wireModel(): Model<"anthropic-messages"> {
     maxTokens: 131_072,
     thinkingLevelMap: { minimal: "low", low: "low", medium: "low", high: "high", xhigh: "max", max: "max" },
     compat: { supportsDisabledThinking: false, forceAdaptiveThinking: true },
-  } as unknown as Model<"anthropic-messages">;
+  };
 }
 
-const context = {
+const context = normalizeContext({
   tools: [],
   messages: [
     {
@@ -43,7 +43,7 @@ const context = {
       timestamp: Date.now(),
     },
   ],
-} as unknown as Context;
+});
 
 afterEach(() => {
   vi.unstubAllEnvs();

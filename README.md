@@ -98,9 +98,9 @@ zcode://oauth/callback?code=<authorization-code>&state=<state>
 
 ## 모델
 
-로그인 후 Z.AI Coding Plan의 전체 모델 목록을 사용할 수 있습니다 (`glm-zcode/glm-5.3`, `glm-zcode/glm-5.3-flash`, `glm-zcode/glm-5.2`, `glm-zcode/glm-4.7` 등). 목록은 models.dev 카탈로그(`zai-coding-plan`)에서 동적으로 가져오므로 새 모델이 나오면 자동으로 반영됩니다.
+로그인 후 Z.AI Coding Plan의 전체 모델 목록을 사용할 수 있습니다 (`glm-zcode/glm-5.3`, `glm-zcode/glm-5.3-flash`, `glm-zcode/glm-5.2`, `glm-zcode/glm-4.7` 등). 목록의 기준은 로그인한 계정으로 조회하는 live 카탈로그(`GET https://api.z.ai/api/anthropic/v1/models`)이며, 30분마다 다시 확인하므로 새 모델이 나와도 코드 수정이나 재설치 없이 다음 갱신에 반영됩니다. models.dev(`zai-coding-plan` 우선, 없으면 `zai`)는 같은 ID의 입력 형식·컨텍스트·출력 한도·reasoning 메타데이터를 보강하는 데 쓰이고, live 목록을 쓸 수 없을 때만 Coding Plan 멤버십을 검증한 보조 목록으로 대신합니다.
 
-설정에서 사용하는 모델 ID는 소문자로 유지되고(예: `glm-zcode/glm-5.3`), 요청을 보내기 직전에 본문 model 값만 ZCode 3.15.3 앱의 공식 표기(예: `GLM-5.3`, `GLM-5.3-Flash`)로 바꾸며, 앱 모델 목록에 없는 ID(예: `glm-5.3-flashx`)는 바꾸지 않고 그대로 전송합니다.
+설정에서 사용하는 모델 ID는 소문자로 유지되고(예: `glm-zcode/glm-5.3`), 요청을 보내기 직전에 본문 model 값만 ZCode 4.0.0 앱의 공식 표기(예: `GLM-5.3`, `GLM-5.3-Flash`)로 바꿉니다. 앱이 이미 아는 ID는 4.0.0 앱 목록의 표기가 우선이고, 소문자가 공식 표기인 `glm-5.3-flashx`도 여기에 포함됩니다. 앱 목록에 없는 새 ID는 live/저장된 카탈로그의 `display_name`이 ID와 대소문자만 다를 때 그 표기를 쓰고(예: `glm-5.4` → `GLM-5.4`), 그 밖의 ID는 그대로 전송합니다. 선택 목록에 보이는 ID 자체는 원래 표기 그대로 유지됩니다.
 
 ## 클라이언트 서명과 150% 쿼터 캠페인
 
@@ -108,7 +108,7 @@ ZCode는 모델 요청에 **클라이언트 서명(ClientRequestSigningV4)** 을
 
 이 확장은 앱의 메커니즘을 재현합니다:
 
-1. `GET zcode.z.ai/api/v1/agent/configs` 로 서명 게이트(`codingPlanSignature.enable`)를 확인합니다. 플래그가 없거나 게이트에 도달할 수 없으면 서명하며, 명시적인 `false`일 때만 서명을 끕니다. ZCode 3.15.3 앱 자체는 이 플래그를 읽지 않고 Coding Plan 요청에 항상 서명합니다.
+1. `GET zcode.z.ai/api/v1/agent/configs` 로 서명 게이트(`codingPlanSignature.enable`)를 확인합니다. 이 확장은 플래그가 없거나 게이트에 도달할 수 없으면 서명하고, 명시적인 `false`일 때만 서명을 끄는 fail-open 호환 경로를 유지합니다. ZCode 4.0.0 앱은 이 플래그를 읽지 않고 Coding Plan 요청에 항상 서명합니다(4.0.0에서 해당 필드가 제거됨). 즉 이 게이트는 4.0.0 앱 동작의 재현이 아니라 플러그인 쪽의 호환용 확인입니다.
 2. `POST api.z.ai/api/paas/c1f3a7e2/v2/client` 핸드셰이크에서 API 키로 Ed25519 서명 키를 발급받습니다.
 3. 모든 모델 요청에 `X-Client-Sig`(Ed25519), `X-Client-Pow`(8-bit PoW), `X-Client-Ts/Nonce/Version`, `X-App-Id: zcode`, `X-Session-Id` 헤더를 붙여 `https://zcode.z.ai/api/v1/ultra-zai/anthropic` 로 전송합니다.
 
@@ -119,17 +119,20 @@ ZCode는 모델 요청에 **클라이언트 서명(ClientRequestSigningV4)** 을
 | 변수 | 기본값 | 설명 |
 |---|---|---|
 | `ZCODE_ANTHROPIC_BASE_URL` | `https://zcode.z.ai/api/v1/ultra-zai/anthropic` | 직접 엔드포인트(`https://api.z.ai/api/anthropic`)로 되돌릴 때 설정 |
-| `ZCODE_APP_VERSION` | `3.15.3` | User-Agent/`X-ZCode-App-Version`/`X-Client-Version` 공통 버전 |
+| `ZCODE_APP_VERSION` | `4.0.0` | User-Agent/`X-ZCode-App-Version`/`X-Client-Version` 공통 버전 기본값(환경 변수로 재정의 가능) |
 | `ZCODE_RELEASE_CHANNEL` | `production` | `X-Release-Channel` 값 |
 
 ## 모델 카탈로그
 
-모델 목록은 하드코딩되어 있지 않고 다음과 같이 관리됩니다.
+모델 목록은 하드코딩되어 있지 않고, 로그인한 계정의 live 카탈로그를 기준으로 관리됩니다.
 
-- **동적 조회**: `/login glm-zcode` 직후 첫 전체 갱신이 실행되고, 이후 models.dev의 `zai-coding-plan` 카탈로그에서 최신 목록을 가져옵니다.
-- **로컬 캐시**: 가져온 목록은 `models-store.json`에 24시간 TTL로 캐시됩니다. 오프라인 상태로 재시작해도 마지막으로 가져온 목록을 그대로 사용합니다.
-- **정적 폴백**: 카탈로그를 아직 가져오기 전(설치 직후 로그인 전 등)이거나 카탈로그에 연결할 수 없을 때는 정적 `glm-5.3` 폴백을 노출해 모델이 0개가 되는 일이 없습니다.
-- **강제 갱신**: `omo update --models`를 실행하면 TTL과 무관하게 카탈로그를 다시 가져옵니다.
+- **live 조회**: 액세스 키가 있으면 `GET https://api.z.ai/api/anthropic/v1/models`를 Bearer 인증으로 호출합니다. 응답의 ID가 목록의 유일한 기준이고 `display_name`은 표기 결정에만 쓰입니다. 비 2xx, 파싱 실패, 1 MiB 초과, 빈 목록은 실패로 처리하고 다음 폴백 단계로 넘어갑니다.
+- **갱신 주기**: 세션 시작 시 저장된 스냅샷이 없거나 30분 이상 지났으면 1회 갱신하고, 세션이 살아 있는 동안 30분마다 다시 확인합니다. 타이머는 `unref()` 되어 유휴 프로세스를 붙잡지 않으며 세션 종료 시 해제됩니다. 신선도는 요청 시작이 아니라 성공적으로 게시된 시각을 기준으로 계산합니다.
+- **메타데이터 보강**: 같은 갱신에서 models.dev(`zai-coding-plan` 우선, 없으면 `zai`)를 1회 읽어 입력 형식(텍스트/이미지), 컨텍스트 크기, 최대 출력, reasoning 여부를 채웁니다. 메타데이터가 없거나 조회에 실패해도 live 목록 게시는 막지 않으며, 기본값(텍스트, 1M 컨텍스트, 131072 출력, reasoning)을 사용합니다. 메타데이터는 ID와 이름을 바꾸지 않습니다.
+- **저장과 오프라인**: 성공한 목록은 모델 저장소(`models-store.json`)에 `checkedAt`과 함께 스냅샷으로 남습니다. 오프라인으로 재시작해도 이 스냅샷을 그대로 복원하며, 복원 자체는 네트워크를 쓰지 않습니다. `OFFLINE` 환경 변수가 설정되어 있으면(빈 값 포함) 네트워크 갱신을 시도하지 않고 캐시만 사용합니다. 실패한 갱신은 목록을 비우거나 `checkedAt`을 앞으로 당기거나 좋은 스냅샷을 기본값으로 덮어쓰지 않습니다.
+- **폴백**: 저장된 스냅샷도 없고 live·models.dev 목록도 쓸 수 없을 때(예: 설치 직후 첫 실행, 네트워크 없음)는 정적 폴백으로 `glm-5.3`(텍스트)과 `glm-5.4`(텍스트/이미지)를 노출해 목록이 비지 않게 합니다. 폴백은 표시용일 뿐이며 `checkedAt`을 만들지 않습니다.
+- **수동 갱신**: `/glm-models`는 이 provider만 갱신한 뒤 현재 ID와 마지막 성공 시각(ISO, 없으면 `never`)을 보여 줍니다. `/glm-models --force`는 저장된 스냅샷이 신선해도 즉시 온라인 갱신을 요청합니다. `OFFLINE`이 설정되어 있으면 `--force`여도 네트워크를 쓰지 않고 캐시만 보여 주며 오프라인임을 함께 알립니다. 잘못된 인자는 아무것도 하지 않고 사용법만 알려 줍니다.
+- **`omo update --models`**: 이 명령은 확장을 로드하지 않는 별도 경로라 `glm-zcode` 카탈로그를 갱신하지 않습니다. 새 모델을 즉시 확인하려면 `/glm-models --force`를 사용하세요.
 
 ## 동작 원리
 

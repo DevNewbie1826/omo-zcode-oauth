@@ -1,87 +1,59 @@
-import type { ProviderConfig } from "@code-yeongyu/senpi";
-import type { Model, RefreshModelsContext, ThinkingLevel } from "@earendil-works/pi-ai";
+import { hasApi, normalizeContext, type Model, type Provider, type RefreshModelsContext, type ThinkingLevel } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/api/anthropic-messages";
-import type { OAuthCredentials, OAuthLoginCallbacks } from "@earendil-works/pi-ai/compat";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import type { OAuthCredentials } from "@earendil-works/pi-ai/compat";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import glmZcodeExtension, { buildZCodeSourceHeaders } from "../extensions/glm-zcode/index.js";
 import {
   MODELS_DEV_API_URL,
   catalogToPersistedModels,
-  fetchCatalogModels,
+  catalogRowsFromModelsDev,
+  fetchModelsDevPayload,
   storedToConfig,
   thinkingConfigFor,
 } from "../extensions/glm-zcode/models.js";
-import { loginGlmZcode, refreshGlmZcode } from "../extensions/glm-zcode/oauth.js";
-import { applyOffPeakRouting } from "../extensions/glm-zcode/offpeak.js";
+import * as provisioning from "../extensions/glm-zcode/oauth.js";
+import { refreshGlmZcode } from "../extensions/glm-zcode/oauth.js";
 import { resolveZCodeSigningHeaders } from "../extensions/glm-zcode/signing.js";
-import { resetOffPeakStateForTests, setOffPeakClockForTests } from "../extensions/glm-zcode/index.js";
-import { webcrypto as nodeWebcrypto } from "node:crypto";
 
 vi.mock("../extensions/glm-zcode/signing.js", () => ({
   resolveZCodeSigningHeaders: vi.fn(async () => ({ "X-Client-Sig": "sig", "X-App-Id": "zcode" })),
 }));
 
-type RegisteredProvider = {
-  name: string;
-  config: {
-    name: string;
-    baseUrl: string;
-    api: string;
-    authHeader: boolean;
-    headers: Record<string, string>;
-    models: Array<Record<string, unknown>>;
-    refreshModels?: NonNullable<ProviderConfig["refreshModels"]>;
-    streamSimple?: NonNullable<ProviderConfig["streamSimple"]>;
-    oauth?: {
-      name: string;
-      login: (callbacks: OAuthLoginCallbacks) => Promise<OAuthCredentials>;
-      refreshToken: (credentials: OAuthCredentials, signal?: AbortSignal) => Promise<OAuthCredentials>;
-      getApiKey: (credentials: OAuthCredentials) => string;
-    };
-  };
-};
+function captureProvider(on = vi.fn()): Provider {
+  let registered: Provider | undefined;
+  const registerProvider = vi.fn((p: Provider | string) => {
+    if (typeof p === "string") throw new Error("Expected native provider registration");
+    registered = p;
+  });
+  glmZcodeExtension({ registerProvider, on, registerCommand: vi.fn() });
+  expect(registerProvider.mock.calls).toEqual([[registered]]);
+  if (!registered) throw new Error("Provider not registered");
+  return registered;
+}
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Proxy-based ExtensionAPI mock (as in PR #295): captures the registerProvider
- * call and swallows every other API method.
- */
-function captureProvider(): RegisteredProvider {
-  let captured: RegisteredProvider | undefined;
-  const pi = new Proxy(
-    {},
-    {
-      get: (_target, property) => {
-        if (property === "registerProvider") {
-          return (name: string, config: RegisteredProvider["config"]) => {
-            captured = { name, config };
-          };
-        }
-        return () => undefined;
-      },
-    },
-  );
-  glmZcodeExtension(pi as Parameters<typeof glmZcodeExtension>[0]);
-  if (!captured) throw new Error("glm-zcode extension did not register a provider");
-  return captured;
+function oauthAdapter() {
+  const oauth = captureProvider().auth.oauth;
+  if (!oauth) throw new Error("OAuth not registered");
+  return oauth;
 }
 
 function json(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), { status, headers: { "Content-Type": "application/json" } });
 }
 
+/** Exact-target double for the models.dev reader: any other URL rejects instead of answering. */
+function modelsDevOnly(payload: unknown): ReturnType<typeof vi.fn> {
+  return vi.fn(async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url !== MODELS_DEV_API_URL) throw new Error(`unexpected transport URL: ${url}`);
+    return json(payload);
+  });
+}
+
 function registeredModel(): Model<"anthropic-messages"> {
-  const { config } = captureProvider();
-  return {
-    provider: "glm-zcode",
-    api: "anthropic-messages",
-    baseUrl: config.baseUrl,
-    headers: config.headers,
-    ...config.models[0],
-  } as unknown as Model<"anthropic-messages">;
+  const model = captureProvider().getModels().find(m => m.id === "glm-5.3");
+  if (!model || !hasApi(model, "anthropic-messages")) throw new Error("Missing fallback model");
+  return model;
 }
 
 async function captureAnthropicWireBody(
@@ -92,6 +64,8 @@ async function captureAnthropicWireBody(
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.origin + url.pathname !== "https://zcode.z.ai/api/v1/ultra-zai/anthropic/v1/messages") throw new Error("unexpected transport URL");
       const rawBody = init?.body ?? (input instanceof Request ? await input.clone().text() : undefined);
       if (typeof rawBody !== "string") throw new Error("anthropic request had no JSON body");
       captured = JSON.parse(rawBody) as Record<string, unknown>;
@@ -101,7 +75,7 @@ async function captureAnthropicWireBody(
 
   await streamSimple(
     model,
-    { messages: [{ role: "user", content: "hello", timestamp: 0 }] },
+    normalizeContext({ messages: [{ role: "user", content: "hello", timestamp: 0 }] }),
     { apiKey: "test-key", reasoning, maxRetries: 0 },
   ).result();
 
@@ -118,7 +92,7 @@ const KEYS_URL = "https://api.z.ai/api/biz/v1/organization/org-id/projects/proj-
 function fetchMock(existingKeyId?: string): ReturnType<typeof vi.fn> {
   return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
-    if (url === BROKER_URL) return json({ data: { zai: { access_token: UPSTREAM_TOKEN } } });
+    if (url === BROKER_URL) return json({ data: { zai: { access_token: UPSTREAM_TOKEN }, token: "test-jwt" } });
     if (url.endsWith("/auth/z/login")) return json({ data: { access_token: BUSINESS_TOKEN } });
     if (url.endsWith("/getCustomerInfo"))
       return json({
@@ -148,15 +122,13 @@ function fetchMock(existingKeyId?: string): ReturnType<typeof vi.fn> {
 /** Drives loginGlmZcode with a pasted callback; {state} is replaced by the real state. */
 async function loginWithCallback(callback: string): Promise<{ credentials: OAuthCredentials; authUrl: string }> {
   let authUrl = "";
-  const credentials = await loginGlmZcode({
-    onAuth: ({ url }) => {
-      authUrl = url;
+  const credentials = await oauthAdapter().login({
+    signal: new AbortController().signal,
+    notify: event => { if (event.type === "auth_url") authUrl = event.url; },
+    prompt: async prompt => {
+      expect(prompt.type).toBe("manual_code");
+      return callback.replace("{state}", new URL(authUrl).searchParams.get("state") ?? "");
     },
-    onPrompt: async () => "",
-    onManualCodeInput: async () => callback.replace("{state}", new URL(authUrl).searchParams.get("state") ?? ""),
-    onDeviceCode: () => undefined,
-    onSelect: async () => undefined,
-    signal: undefined,
   });
   return { credentials, authUrl };
 }
@@ -171,7 +143,20 @@ const staleCredentials: OAuthCredentials = {
   accountId: "42",
 };
 
+beforeEach(() => {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(Date.UTC(2026, 10, 23, 12));
+  vi.stubEnv("ZCODE_DEVICE_ID", "test-device");
+  vi.stubEnv("OFFLINE", undefined);
+  vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
+  vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
+  vi.stubEnv("ZCODE_APP_VERSION", "4.0.0");
+  vi.stubEnv("ZCODE_RELEASE_CHANNEL", "production");
+  vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("Unexpected fetch"); }));
+});
 afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
 });
@@ -181,65 +166,61 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("glm-zcode extension", () => {
-  test("registers the glm-zcode provider with the Z.AI anthropic-compatible config", () => {
-    const { name, config } = captureProvider();
-
-    expect(name).toBe("glm-zcode");
-    expect(config.baseUrl).toBeUndefined();
-    expect(config.models[0].baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
-    expect(config.api).toBe("anthropic-messages");
-    expect(config.authHeader).toBe(true);
-    expect(config.headers).toEqual(buildZCodeSourceHeaders());
-    expect(config.headers["X-ZCode-Version"]).toBeUndefined();
-    expect(config.headers["X-ZCode-Agent"]).toBe("glm");
-    expect(config.headers["User-Agent"]).toMatch(/^ZCode\//);
-
-    expect(config.models[0]).toMatchObject({
-      id: "glm-5.3",
-      contextWindow: 1_000_000,
-      maxTokens: 131_072,
-      thinkingLevelMap: { medium: "low", xhigh: "max" },
-      compat: { supportsDisabledThinking: false, forceAdaptiveThinking: true },
+  test("registers one native provider with complete chat models and source headers in resolved auth", async () => {
+    const p = captureProvider();
+    expect(p.id).toBe("glm-zcode");
+    expect(p.name).toBe("GLM ZCode");
+    expect(p.auth.oauth?.name).toBe("GLM ZCode");
+    expect(p.baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
+    expect(p.getAllModels?.()).toEqual(p.getModels());
+    expect(p.stream).toBeTypeOf("function");
+    expect(p.streamSimple).toBeTypeOf("function");
+    expect(p.getModels().find(m => m.id === "glm-5.3")).toMatchObject({
+      api: "anthropic-messages", baseUrl: p.baseUrl, contextWindow: 1_000_000, maxTokens: 131_072,
+      thinkingLevelMap: { medium: "low", xhigh: "max" }, compat: { supportsDisabledThinking: false, forceAdaptiveThinking: true },
     });
+    const auth = await p.auth.oauth?.toAuth({ type: "oauth", access: "id.secret", refresh: "r", expires: 1 });
+    expect(auth).toEqual({ apiKey: "id.secret", headers: { ...buildZCodeSourceHeaders(), Authorization: "Bearer id.secret" } });
+    expect(auth?.headers).toMatchObject({ "X-ZCode-Agent": "glm", "User-Agent": expect.stringMatching(/^ZCode\//) });
+    expect(auth?.headers).not.toHaveProperty("X-ZCode-Version");
+  });
 
-    expect(config.oauth).toBeDefined();
-    expect(typeof config.oauth!.login).toBe("function");
-    expect(typeof config.oauth!.refreshToken).toBe("function");
-    expect(typeof config.oauth!.getApiKey).toBe("function");
-    // The factory must wire up the exact oauth functions from oauth.js.
-    expect(config.oauth!.login).toBe(loginGlmZcode);
-    expect(config.oauth!.refreshToken).toBe(refreshGlmZcode);
-    expect(config.oauth!.getApiKey({ access: "key-id.api-secret", refresh: "refresh", expires: 1 })).toBe(
-      "key-id.api-secret",
-    );
+  test("translates login interaction events, prompt types, and cancellation signals", async () => {
+    const signal = new AbortController().signal;
+    const local = new AbortController().signal;
+    const prompts = vi.fn(async () => "answer");
+    const notify = vi.fn();
+    vi.spyOn(provisioning, "loginGlmZcode").mockImplementationOnce(async cb => {
+      expect(cb.signal).toBe(signal);
+      cb.onAuth({ url: "https://example.invalid", instructions: "open" });
+      cb.onDeviceCode({ userCode: "fixture", verificationUri: "https://example.invalid" });
+      cb.onProgress?.("progress");
+      for (const type of [undefined, "secret", "manual_code"] as const) {
+        expect(await cb.onPrompt({ type, message: "prompt", signal: local })).toBe("answer");
+      }
+      expect(await cb.onSelect({ message: "select", options: [], signal: local })).toBe("answer");
+      expect(await cb.onManualCodeInput?.()).toBe("answer");
+      return { access: "key", refresh: "r", expires: 1, zcodeJwtToken: "jwt" };
+    });
+    expect(await oauthAdapter().login({ signal, prompt: prompts, notify })).toMatchObject({ type: "oauth", zcodeJwtToken: "jwt" });
+    expect(notify.mock.calls).toEqual([
+      [{ type: "auth_url", url: "https://example.invalid", instructions: "open" }],
+      [{ type: "device_code", userCode: "fixture", verificationUri: "https://example.invalid" }],
+      [{ type: "progress", message: "progress" }],
+    ]);
+    expect(prompts.mock.calls).toEqual([
+      ...["text", "secret", "manual_code"].map(type => [{ type, message: "prompt", signal: local }]),
+      [{ type: "select", message: "select", options: [], signal: local }],
+      [expect.objectContaining({ type: "manual_code" })],
+    ]);
   });
 
   test("wires before_provider_headers to client signing", async () => {
-    const handlers = new Map<string, (event: unknown) => Promise<void> | void>();
-    const pi = new Proxy(
-      {},
-      {
-        get: (_target, property) => {
-          if (property === "registerProvider") {
-            return (name: string, config: RegisteredProvider["config"]) => {
-              expect(name).toBe("glm-zcode");
-            };
-          }
-          if (property === "on") {
-            return (event: string, handler: (eventArg: unknown) => Promise<void> | void) => {
-              handlers.set(event, handler);
-            };
-          }
-          return () => undefined;
-        },
-      },
-    );
-    glmZcodeExtension(pi as Parameters<typeof glmZcodeExtension>[0]);
-
-    const handler = handlers.get("before_provider_headers");
-    expect(handler).toBeTypeOf("function");
-    const headers: Record<string, string | null> = { Authorization: "Bearer id.secret", "X-ZCode-Agent": "glm" };
-    await handler?.({ headers });
+    const on = vi.fn();
+    captureProvider(on);
+    const handler = on.mock.calls.find(([name]) => name === "before_provider_headers")?.[1];
+    const headers = { Authorization: "Bearer id.secret", "X-ZCode-Agent": "glm" };
+    await handler({ headers });
 
     const mocked = vi.mocked(resolveZCodeSigningHeaders);
     expect(mocked).toHaveBeenCalledTimes(1);
@@ -255,7 +236,7 @@ describe("glm-zcode extension", () => {
   test("honors ZCODE_ANTHROPIC_BASE_URL to revert to the direct endpoint", () => {
     vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", "https://api.z.ai/api/anthropic");
     try {
-      expect(captureProvider().config.models[0].baseUrl).toBe("https://api.z.ai/api/anthropic");
+      expect(registeredModel().baseUrl).toBe("https://api.z.ai/api/anthropic");
     } finally {
       vi.unstubAllEnvs();
     }
@@ -314,10 +295,11 @@ describe("glm-zcode extension", () => {
       expect(new Headers(call[1]?.headers).get("Authorization")).toBe(`Bearer ${BUSINESS_TOKEN}`);
     }
     const createBody = JSON.parse(String(fetch.mock.calls[5][1]?.body)) as Record<string, unknown>;
-    expect(createBody).toEqual({ name: "zcode-api-key" });
+    expect(createBody).toEqual({ name: "zcode-api-key", usageScene: 1 });
 
     // Provisioned credentials.
     expect(credentials).toMatchObject({
+      type: "oauth", zcodeJwtToken: "test-jwt",
       access: "key-id.api-secret",
       refresh: UPSTREAM_TOKEN,
       email: "user@example.com",
@@ -372,7 +354,8 @@ describe("glm-zcode extension", () => {
       vi.stubGlobal("fetch", fetch);
       const startedAt = Date.now();
 
-      const refreshed = await refreshGlmZcode(staleCredentials);
+      const refreshed = await oauthAdapter().refresh({ ...staleCredentials, type: "oauth", zcodeJwtToken: "jwt" }, new AbortController().signal);
+      expect(refreshed).toMatchObject({ type: "oauth", zcodeJwtToken: "jwt" });
 
       expect(refreshed).toMatchObject({
         access: "key-id.api-secret",
@@ -404,7 +387,7 @@ describe("glm-zcode extension", () => {
       const controller = new AbortController();
       controller.abort();
 
-      await expect(refreshGlmZcode(staleCredentials, controller.signal)).rejects.toThrow("re-login");
+      await expect(oauthAdapter().refresh({ ...staleCredentials, type: "oauth" }, controller.signal)).rejects.toThrow("re-login");
       expect(fetch).not.toHaveBeenCalled();
     });
 
@@ -527,7 +510,7 @@ describe("glm-zcode anthropic wire payloads", () => {
       ...registeredModel(),
       id: "glm-toggle",
       thinkingLevelMap: toggleThinkingConfig.thinkingLevelMap,
-      compat: toggleThinkingConfig.compat as Model<"anthropic-messages">["compat"],
+      compat: toggleThinkingConfig.compat,
     };
     const body = await captureAnthropicWireBody(toggleModel);
 
@@ -536,6 +519,18 @@ describe("glm-zcode anthropic wire payloads", () => {
     console.log(`glm-zcode toggle off wire body: ${JSON.stringify(body)}`);
   });
 });
+
+function publisher() {
+  return vi.fn<RefreshModelsContext["publish"]>(async publication => { publication.update?.(); return true; });
+}
+
+async function visibleAfterRefresh(ctx: RefreshModelsContext, provider = captureProvider()) {
+  if (!provider.refreshModels) throw new Error("Catalog not registered");
+  await expect(provider.refreshModels(ctx)).resolves.toBeUndefined();
+  return provider.getModels();
+}
+
+const fallbackIds = ["glm-5.3", "glm-5.4"];
 
 describe("dynamic model catalog", () => {
   const catalogPayload = {
@@ -598,21 +593,18 @@ describe("dynamic model catalog", () => {
       allowNetwork: true,
       stored: undefined,
       signal: new AbortController().signal,
-      publish: vi.fn(async () => true),
+      publish: publisher(),
       ...overrides,
     };
   }
 
-  function registeredRefreshModels(): NonNullable<ProviderConfig["refreshModels"]> {
-    const refreshModels = captureProvider().config.refreshModels;
-    if (!refreshModels) throw new Error("glm-zcode provider did not register refreshModels");
-    return refreshModels;
-  }
 
   test("maps valid catalog models and skips malformed entries", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => json(catalogPayload)));
+    const fetch = modelsDevOnly(catalogPayload);
+    vi.stubGlobal("fetch", fetch);
 
-    const models = await fetchCatalogModels();
+    const models = catalogRowsFromModelsDev(await fetchModelsDevPayload());
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([MODELS_DEV_API_URL]);
 
     expect(models).toEqual([
       {
@@ -630,7 +622,7 @@ describe("dynamic model catalog", () => {
         id: "glm-multimodal",
         name: "GLM Multimodal",
         reasoning: false,
-        input: ["text", "image", "video"],
+        input: ["text", "image"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: 250_000,
         maxTokens: 32_768,
@@ -655,8 +647,8 @@ describe("dynamic model catalog", () => {
   });
 
   test("persists and restores thinking configuration", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => json(catalogPayload)));
-    const models = await fetchCatalogModels();
+    vi.stubGlobal("fetch", modelsDevOnly(catalogPayload));
+    const models = catalogRowsFromModelsDev(await fetchModelsDevPayload());
 
     const persisted = catalogToPersistedModels(models);
 
@@ -682,12 +674,13 @@ describe("dynamic model catalog", () => {
     });
   });
 
-  test("refreshModels fetches, publishes, and returns valid models", async () => {
-    const fetch = vi.fn(async () => json(catalogPayload));
-    const publish = vi.fn<RefreshModelsContext["publish"]>(async () => true);
+  test("refreshModels publishes valid models to the registered getters", async () => {
+    const fetch = modelsDevOnly(catalogPayload);
+    const publish = publisher();
     vi.stubGlobal("fetch", fetch);
 
-    const models = await registeredRefreshModels()(context({ publish }));
+    const models = await visibleAfterRefresh(context({ publish }));
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([MODELS_DEV_API_URL]);
 
     expect(models).toHaveLength(3);
     expect(models.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal", "glm-noname"]);
@@ -712,25 +705,25 @@ describe("dynamic model catalog", () => {
     expect(publication?.persist?.checkedAt).toEqual(expect.any(Number));
   });
 
-  test("offline without stored models returns undefined without fetching", async () => {
-    const fetch = vi.fn(async () => json(catalogPayload));
+  test("offline without stored models keeps both emergency models without fetching", async () => {
+    const fetch = modelsDevOnly(catalogPayload);
     vi.stubGlobal("fetch", fetch);
 
-    const models = await registeredRefreshModels()(context({ allowNetwork: false, stored: undefined }));
+    const models = await visibleAfterRefresh(context({ allowNetwork: false, stored: undefined }));
 
-    expect(models).toBeUndefined();
+    expect(models.map(m => m.id).sort()).toEqual(fallbackIds);
     expect(fetch).not.toHaveBeenCalled();
   });
 
   test("offline with stored models restores them without fetching", async () => {
-    const fetch = vi.fn(async () => json(catalogPayload));
+    const fetch = modelsDevOnly(catalogPayload);
     vi.stubGlobal("fetch", fetch);
 
-    const models = await registeredRefreshModels()(
+    const models = await visibleAfterRefresh(
       context({ allowNetwork: false, stored: { models: [persistedModel], checkedAt: 123 } }),
     );
 
-    expect(models).toEqual([
+    expect(models).toMatchObject([
       {
         id: "glm-9",
         name: "GLM 9",
@@ -747,23 +740,23 @@ describe("dynamic model catalog", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  test("fetch failure returns undefined without throwing when no store exists", async () => {
+  test("fetch failure retains the fallback without throwing when no store exists", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => Promise.reject(new Error("catalog unavailable"))));
 
-    await expect(registeredRefreshModels()(context())).resolves.toBeUndefined();
+    expect((await visibleAfterRefresh(context())).map(m => m.id).sort()).toEqual(fallbackIds);
   });
 
-  test("malformed api.json without zai-coding-plan returns undefined", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => json({ anotherProvider: { models: {} } })));
+  test("malformed api.json without zai-coding-plan retains the fallback", async () => {
+    vi.stubGlobal("fetch", modelsDevOnly({ anotherProvider: { models: {} } }));
 
-    await expect(registeredRefreshModels()(context())).resolves.toBeUndefined();
+    expect((await visibleAfterRefresh(context())).map(m => m.id).sort()).toEqual(fallbackIds);
   });
 
   test("fresh stored models skip the catalog fetch", async () => {
-    const fetch = vi.fn(async () => json(catalogPayload));
+    const fetch = modelsDevOnly(catalogPayload);
     vi.stubGlobal("fetch", fetch);
 
-    const models = await registeredRefreshModels()(
+    const models = await visibleAfterRefresh(
       context({ stored: { models: [persistedModel], checkedAt: Date.now() } }),
     );
 
@@ -772,78 +765,44 @@ describe("dynamic model catalog", () => {
   });
 
   test("expired stored models trigger a catalog re-fetch", async () => {
-    const fetch = vi.fn(async () => json(catalogPayload));
+    const fetch = modelsDevOnly(catalogPayload);
     vi.stubGlobal("fetch", fetch);
 
-    const models = await registeredRefreshModels()(
+    const models = await visibleAfterRefresh(
       context({ stored: { models: [persistedModel], checkedAt: Date.now() - 25 * 60 * 60 * 1_000 } }),
     );
 
-    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([MODELS_DEV_API_URL]);
     expect(models?.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal", "glm-noname"]);
   });
 
   test("force bypasses the stored-model TTL", async () => {
-    const fetch = vi.fn(async () => json(catalogPayload));
+    const fetch = modelsDevOnly(catalogPayload);
     vi.stubGlobal("fetch", fetch);
 
-    const models = await registeredRefreshModels()(
+    const models = await visibleAfterRefresh(
       context({ force: true, stored: { models: [persistedModel], checkedAt: Date.now() } }),
     );
 
-    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([MODELS_DEV_API_URL]);
     expect(models?.map((model) => model.id)).toEqual(["glm-text", "glm-multimodal", "glm-noname"]);
   });
 
-  test("publish failure keeps existing models without throwing", async () => {
-    // pins current behavior — publish rejection discards the fresh list in favor of the stored snapshot; changing to return-fresh-on-publish-failure requires a production change (tracked in PR description).
-    const fetch = vi.fn(async () => json(catalogPayload));
-    vi.stubGlobal("fetch", fetch);
-
-    const models = await registeredRefreshModels()(
-      context({
-        publish: vi.fn(async () => {
-          throw new Error("disk full");
-        }),
-        stored: {
-          models: [
-            {
-              provider: "glm-zcode",
-              api: "anthropic-messages",
-              baseUrl: "https://api.z.ai/api/anthropic",
-              id: "glm-stored",
-              name: "GLM Stored",
-              reasoning: true,
-              input: ["text"],
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-              contextWindow: 1_000_000,
-              maxTokens: 131_072,
-            },
-          ],
-        },
-      }),
-    );
-
-    expect(models).toHaveLength(1);
-    expect(models?.[0]?.id).toBe("glm-stored");
-    expect(fetch).toHaveBeenCalledOnce();
-  });
-
-  test("publish failure without stored models returns undefined without throwing", async () => {
-    const fetch = vi.fn(async () => json(catalogPayload));
-    vi.stubGlobal("fetch", fetch);
-
-    await expect(
-      registeredRefreshModels()(
-        context({
-          publish: vi.fn(async () => {
-            throw new Error("disk full");
-          }),
-          stored: undefined,
-        }),
-      ),
-    ).resolves.toBeUndefined();
-    expect(fetch).toHaveBeenCalledOnce();
+  test.each([true, false])("publish rejection with store=%s retains the last visible list", async hasStore => {
+    vi.stubGlobal("fetch", vi.fn(async (url) => {
+      if (String(url) !== MODELS_DEV_API_URL) throw new Error("Unexpected URL");
+      return json(catalogPayload);
+    }));
+    const p = captureProvider();
+    const ctx = context({ stored: hasStore ? { models: [persistedModel] } : undefined,
+      publish: async publication => {
+        if (publication.persist) throw new Error("disk full");
+        publication.update?.();
+        return true;
+      },
+    });
+    await expect(p.refreshModels?.(ctx)).rejects.toThrow("disk full");
+    expect(p.getModels().map(m => m.id).sort()).toEqual(hasStore ? ["glm-9"] : fallbackIds);
   });
 });
 
@@ -888,17 +847,12 @@ describe("hybrid live model catalog", () => {
       allowNetwork: true,
       stored: undefined,
       signal: new AbortController().signal,
-      publish: vi.fn<RefreshModelsContext["publish"]>(async () => true),
+      publish: publisher(),
       credential: { type: "oauth", access: "key-id.secret", refresh: "refresh-token", expires: 1 },
       ...overrides,
     };
   }
 
-  function registeredRefreshModels(): NonNullable<ProviderConfig["refreshModels"]> {
-    const refreshModels = captureProvider().config.refreshModels;
-    if (!refreshModels) throw new Error("glm-zcode provider did not register refreshModels");
-    return refreshModels;
-  }
 
   /** Serves the live catalog from `live` and the models.dev catalog from `modelsDevPayload`. */
   function bothCatalogsFetch(live: () => Promise<Response>) {
@@ -910,12 +864,12 @@ describe("hybrid live model catalog", () => {
     });
   }
 
-  test("Given a credential and network access, when refreshing, then the live catalog is served with Bearer auth and ZCode source headers and models.dev is never called", async () => {
+  test("Given a credential and network access, when refreshing, then the live catalog is served with Bearer auth and ZCode source headers without adding models.dev fallback members", async () => {
     const fetch = bothCatalogsFetch(async () => json(liveEnvelope));
     vi.stubGlobal("fetch", fetch);
-    const publish = vi.fn<RefreshModelsContext["publish"]>(async () => true);
+    const publish = publisher();
 
-    const models = await registeredRefreshModels()(hybridContext({ publish }));
+    const models = await visibleAfterRefresh(hybridContext({ publish }));
 
     expect(models?.map((model) => model.id)).toEqual(["glm-live-a", "glm-live-b"]);
     expect(models?.[0]).toMatchObject({
@@ -926,13 +880,13 @@ describe("hybrid live model catalog", () => {
       contextWindow: 1_000_000,
       maxTokens: 131_072,
     });
-    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch).toHaveBeenCalledTimes(2);
     expect(String(fetch.mock.calls[0]?.[0])).toBe(LIVE_MODELS_URL);
     const headers = fetch.mock.calls[0]?.[1]?.headers;
     expect(new Headers(headers).get("Authorization")).toBe("Bearer key-id.secret");
     expect(new Headers(headers).get("Accept")).toBe("application/json");
     expect(Object.keys(headers ?? {}).some((key) => key.startsWith("X-ZCode-"))).toBe(true);
-    expect(fetch.mock.calls.map((call) => String(call[0]))).not.toContain(MODELS_DEV_API_URL);
+    expect(fetch.mock.calls.map((call) => String(call[0]))).toContain(MODELS_DEV_API_URL);
 
     expect(publish).toHaveBeenCalledOnce();
     const publication = publish.mock.calls[0]?.[0];
@@ -952,9 +906,9 @@ describe("hybrid live model catalog", () => {
   test("Given the live endpoint rejects, when refreshing, then it falls back to the models.dev catalog", async () => {
     const fetch = bothCatalogsFetch(async () => Promise.reject(new Error("live down")));
     vi.stubGlobal("fetch", fetch);
-    const publish = vi.fn<RefreshModelsContext["publish"]>(async () => true);
+    const publish = publisher();
 
-    const models = await registeredRefreshModels()(hybridContext({ publish }));
+    const models = await visibleAfterRefresh(hybridContext({ publish }));
 
     expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
     expect(models?.map((model) => model.id)).toEqual(["glm-dev"]);
@@ -966,7 +920,7 @@ describe("hybrid live model catalog", () => {
     const fetch = bothCatalogsFetch(async () => json({ error: "upstream down" }, 503));
     vi.stubGlobal("fetch", fetch);
 
-    const models = await registeredRefreshModels()(hybridContext());
+    const models = await visibleAfterRefresh(hybridContext());
 
     expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
     expect(models?.map((model) => model.id)).toEqual(["glm-dev"]);
@@ -975,31 +929,31 @@ describe("hybrid live model catalog", () => {
   test("Given both catalogs fail with a stored snapshot, when refreshing, then stored models are restored without publishing new models", async () => {
     const fetch = vi.fn<typeof globalThis.fetch>(async () => Promise.reject(new Error("catalog unavailable")));
     vi.stubGlobal("fetch", fetch);
-    const publish = vi.fn<RefreshModelsContext["publish"]>(async () => true);
+    const publish = publisher();
     const stored = { models: [storedModel], checkedAt: 123 };
 
-    const models = await registeredRefreshModels()(hybridContext({ publish, stored }));
+    const models = await visibleAfterRefresh(hybridContext({ publish, stored }));
 
     expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
-    expect(models).toEqual(applyOffPeakRouting(storedToConfig(stored), false));
-    expect(publish).not.toHaveBeenCalled();
+    expect(models.map(m => m.id)).toEqual(["glm-stored"]);
+    expect(publish.mock.calls).toEqual([[{ update: expect.any(Function) }]]);
   });
 
   test("Given both catalogs fail without a stored snapshot, when refreshing, then no catalog is returned and the registered static list is retained", async () => {
     const fetch = vi.fn<typeof globalThis.fetch>(async () => Promise.reject(new Error("catalog unavailable")));
     vi.stubGlobal("fetch", fetch);
 
-    const models = await registeredRefreshModels()(hybridContext({ stored: undefined }));
+    const models = await visibleAfterRefresh(hybridContext({ stored: undefined }));
 
     expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
-    expect(models).toBeUndefined();
+    expect(models.map(m => m.id).sort()).toEqual(fallbackIds);
   });
 
   test("Given the live catalog has zero usable models, when refreshing, then it falls back to the models.dev catalog", async () => {
     const fetch = bothCatalogsFetch(async () => json({ data: ["junk", { id: "   " }, { display_name: "no id" }] }));
     vi.stubGlobal("fetch", fetch);
 
-    const models = await registeredRefreshModels()(hybridContext());
+    const models = await visibleAfterRefresh(hybridContext());
 
     expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
     expect(models?.map((model) => model.id)).toEqual(["glm-dev"]);
@@ -1009,7 +963,7 @@ describe("hybrid live model catalog", () => {
     const fetch = bothCatalogsFetch(async () => json({ data: [{ id: "y".repeat(1_100_000) }] }));
     vi.stubGlobal("fetch", fetch);
 
-    const models = await registeredRefreshModels()(hybridContext());
+    const models = await visibleAfterRefresh(hybridContext());
 
     expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
     expect(models?.map((model) => model.id)).toEqual(["glm-dev"]);
@@ -1019,7 +973,7 @@ describe("hybrid live model catalog", () => {
     const fetch = bothCatalogsFetch(async () => json(liveEnvelope));
     vi.stubGlobal("fetch", fetch);
 
-    const models = await registeredRefreshModels()(hybridContext({ credential: undefined }));
+    const models = await visibleAfterRefresh(hybridContext({ credential: undefined }));
 
     expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([MODELS_DEV_API_URL]);
     expect(models?.map((model) => model.id)).toEqual(["glm-dev"]);
@@ -1029,7 +983,7 @@ describe("hybrid live model catalog", () => {
     const fetch = vi.fn(async () => json(liveEnvelope));
     vi.stubGlobal("fetch", fetch);
 
-    const models = await registeredRefreshModels()(
+    const models = await visibleAfterRefresh(
       hybridContext({ allowNetwork: false, stored: { models: [storedModel], checkedAt: 123 } }),
     );
 
@@ -1037,13 +991,13 @@ describe("hybrid live model catalog", () => {
     expect(models?.map((model) => model.id)).toEqual(["glm-stored"]);
   });
 
-  test("Given the network is disabled without stored models, when refreshing, then it returns undefined without fetching", async () => {
+  test("Given the network is disabled without stored models, when refreshing, then it keeps both emergency models without fetching", async () => {
     const fetch = vi.fn(async () => json(liveEnvelope));
     vi.stubGlobal("fetch", fetch);
 
-    const models = await registeredRefreshModels()(hybridContext({ allowNetwork: false }));
+    const models = await visibleAfterRefresh(hybridContext({ allowNetwork: false }));
 
-    expect(models).toBeUndefined();
+    expect(models.map(m => m.id).sort()).toEqual(fallbackIds);
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -1053,8 +1007,11 @@ describe("hybrid live model catalog", () => {
     const controller = new AbortController();
     controller.abort();
 
-    const models = await registeredRefreshModels()(
-      hybridContext({ signal: controller.signal, stored: { models: [storedModel], checkedAt: 123 } }),
+    const p = captureProvider();
+    await visibleAfterRefresh(hybridContext({ allowNetwork: false, stored: { models: [storedModel] } }), p);
+    const models = await visibleAfterRefresh(
+      hybridContext({ signal: controller.signal, stored: { models: [{ ...storedModel, id: "not-published" }] } }),
+      p,
     );
 
     expect(fetch).not.toHaveBeenCalled();
@@ -1065,7 +1022,7 @@ describe("hybrid live model catalog", () => {
     const fetch = bothCatalogsFetch(async () => json(liveEnvelope));
     vi.stubGlobal("fetch", fetch);
 
-    await registeredRefreshModels()(hybridContext({ credential: { type: "api_key", key: "sk-zcode-key" } }));
+    await visibleAfterRefresh(hybridContext({ credential: { type: "api_key", key: "sk-zcode-key" } }));
 
     expect(String(fetch.mock.calls[0]?.[0])).toBe(LIVE_MODELS_URL);
     expect(new Headers(fetch.mock.calls[0]?.[1]?.headers).get("Authorization")).toBe("Bearer sk-zcode-key");
@@ -1076,7 +1033,7 @@ describe("hybrid live model catalog", () => {
       const fetch = bothCatalogsFetch(async () => json(liveEnvelope));
       vi.stubGlobal("fetch", fetch);
 
-      const models = await registeredRefreshModels()(hybridContext({ credential }));
+      const models = await visibleAfterRefresh(hybridContext({ credential }));
 
       expect(fetch.mock.calls.map((call) => String(call[0]))).toEqual([MODELS_DEV_API_URL]);
       expect(models?.map((model) => model.id)).toEqual(["glm-dev"]);
@@ -1087,7 +1044,7 @@ describe("hybrid live model catalog", () => {
     const fetch = bothCatalogsFetch(async () => json(liveEnvelope));
     vi.stubGlobal("fetch", fetch);
 
-    const models = await registeredRefreshModels()(
+    const models = await visibleAfterRefresh(
       hybridContext({ force: true, stored: { models: [storedModel], checkedAt: Date.now() } }),
     );
 
@@ -1098,14 +1055,14 @@ describe("hybrid live model catalog", () => {
   test("Given a fresh stored snapshot without force, when refreshing with a credential, then neither catalog is fetched and stored models are served", async () => {
     const fetch = bothCatalogsFetch(async () => json(liveEnvelope));
     vi.stubGlobal("fetch", fetch);
-    const publish = vi.fn<RefreshModelsContext["publish"]>(async () => true);
+    const publish = publisher();
 
-    const models = await registeredRefreshModels()(
+    const models = await visibleAfterRefresh(
       hybridContext({ stored: { models: [storedModel], checkedAt: Date.now() }, publish }),
     );
 
     expect(fetch).not.toHaveBeenCalled();
-    expect(publish).not.toHaveBeenCalled();
+    expect(publish.mock.calls).toEqual([[{ update: expect.any(Function) }]]);
     expect(models?.map((model) => model.id)).toEqual(["glm-stored"]);
   });
 });

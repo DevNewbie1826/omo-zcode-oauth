@@ -20,7 +20,8 @@ import { buildZCodeSourceHeaders, resolveZCodeAnthropicBaseUrl } from "./models.
  *   POST /ticket/{id}/settle             -> {state:"settled"}
  * Requests carry Authorization: Bearer <jwt>, X-Coding-Plan-Api-Key, and
  * X-Off-Peak-Ticket-ID; error codes 3102 (wrong ticket), 3103 (take limit),
- * 3105 (not ready). Every failure degrades to the normal signed ultra path.
+ * 3105 (not ready). Unavailability degrades to the normal signed ultra path;
+ * cancellation ends the request.
  */
 
 export const OFFPEAK_BASE_URL = "https://zcode.z.ai/api/v1/off-peak/anthropic";
@@ -47,7 +48,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 async function ticketFetch(url: string, init: RequestInit): Promise<Response | undefined> {
   try {
-    return await fetch(url, { ...init, redirect: "manual", signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+    if (init.signal?.aborted) return undefined;
+    const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    return await fetch(url, { ...init, redirect: "manual", signal: init.signal ? AbortSignal.any([init.signal, timeout]) : timeout });
   } catch {
     return undefined;
   }
@@ -62,9 +65,9 @@ function ticketHeaders(jwt: string, apiKey: string): Record<string, string> {
 }
 
 /** Whether the plan currently grants an off-peak ticket. Any failure reads as false. */
-export async function fetchOffPeakAvailability(jwt: string, apiKey: string): Promise<boolean> {
+export async function fetchOffPeakAvailability(jwt: string, apiKey: string, signal?: AbortSignal): Promise<boolean> {
   const response = await ticketFetch(`${TICKET_BASE_URL}/availability`, {
-    method: "GET",
+    method: "GET", signal,
     headers: ticketHeaders(jwt, apiKey),
   });
   if (!response || !response.ok) return false;
@@ -78,8 +81,18 @@ export async function fetchOffPeakAvailability(jwt: string, apiKey: string): Pro
   return isRecord(record) && record.can_take_number === true;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal: AbortSignal | undefined, background: boolean): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise(resolve => {
+    const timer = setTimeout(done, ms);
+    if (background) timer.unref();
+    function done() {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    }
+    signal?.addEventListener("abort", done, { once: true });
+  });
 }
 
 /**
@@ -90,9 +103,11 @@ export async function ensureOffPeakTicket(
   jwt: string,
   apiKey: string,
   taskId: string,
+  signal?: AbortSignal,
+  { background = false }: { readonly background?: boolean } = {},
 ): Promise<string | undefined> {
   const take = await ticketFetch(TICKET_BASE_URL, {
-    method: "POST",
+    method: "POST", signal,
     headers: { ...ticketHeaders(jwt, apiKey), "Content-Type": "application/json" },
     body: JSON.stringify({ task_id: taskId }),
   });
@@ -111,13 +126,14 @@ export async function ensureOffPeakTicket(
   let state = ticket?.state;
   let pollIntervalMs = clampPollIntervalMs(ticket?.next_poll_after);
   const deadline = Date.now() + READY_WAIT_MS;
-  for (;;) {
+  while (!signal?.aborted) {
     if (state === "ready" || state === "active") return ticketId;
     if (state !== "queued") return undefined;
     if (Date.now() + pollIntervalMs > deadline) return undefined;
-    await sleep(pollIntervalMs);
+    await sleep(pollIntervalMs, signal, background);
+    if (signal?.aborted) return undefined;
     const status = await ticketFetch(`${TICKET_BASE_URL}/status`, {
-      method: "POST",
+      method: "POST", signal,
       headers: { ...ticketHeaders(jwt, apiKey), "Content-Type": "application/json" },
       body: JSON.stringify({ ticket_ids: [ticketId] }),
     });
@@ -206,9 +222,8 @@ export function offPeakRequestHeaders(jwt: string, apiKey: string, ticketId: str
 }
 
 /**
- * Routed-model detector. The provider composer clears model.headers when it
- * projects extension models, so baseUrl — which it preserves — is the only
- * reliable routing signal at request time.
+ * Identifies a routed row in the current catalog. A caller holding a model
+ * from a previous catalog cannot use this marker as routing authority.
  */
 export function isOffPeakRouted(model: { baseUrl?: string }): boolean {
   return model.baseUrl === OFFPEAK_BASE_URL;

@@ -180,7 +180,9 @@ async function provision(upstreamToken: string, signal: AbortSignal | undefined)
   const keys = Array.isArray(listed.data) ? listed.data.filter(isRecord) : [];
   let key = keys.find((entry) => entry.name === API_KEY_NAME);
   if (!key) {
-    key = data(await post(keysUrl, { name: API_KEY_NAME }, signal, "api_keys.create", businessToken));
+    key = data(
+      await post(keysUrl, { name: API_KEY_NAME, usageScene: 1 }, signal, "api_keys.create", businessToken),
+    );
   }
 
   const keyId = typeof key.apiKey === "string" ? key.apiKey : key.id;

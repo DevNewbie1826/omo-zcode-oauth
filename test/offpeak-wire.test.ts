@@ -1,54 +1,51 @@
-import { webcrypto as nodeWebcrypto } from "node:crypto";
-import { afterEach, describe, expect, test, vi } from "vitest";
-import type { ProviderConfig } from "@code-yeongyu/senpi";
-import { resetZCodeSigningState } from "../extensions/glm-zcode/signing.js";
-import glmZcodeExtension, {
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import type { Model, Provider, RefreshModelsContext, SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { normalizeContext } from "@earendil-works/pi-ai";
+import { buildZCodeSourceHeaders } from "../extensions/glm-zcode/models.js";
+import { MODELS_DEV_API_URL, ULTRA_BASE_URL } from "../extensions/glm-zcode/models.js";
+import {
+  resetZCodeSigningState,
+  resolveZCodeSigningHeaders,
+  SIGNING_GATE_URL,
+  SIGNING_HANDSHAKE_URL,
+  zcodeSessionId,
+} from "../extensions/glm-zcode/signing.js";
+import {
   resetOffPeakStateForTests,
   setOffPeakClockForTests,
   setOffPeakTransportForTests,
 } from "../extensions/glm-zcode/index.js";
+import { OFFPEAK_BASE_URL } from "../extensions/glm-zcode/offpeak.js";
+import { LIVE_MODELS_URL } from "../extensions/glm-zcode/live-catalog.js";
+import {
+  captureExtension,
+  cipherFixture,
+  jsonResponse,
+  offPeakCatalogRoutes,
+  publishOffPeakCatalog,
+  registeredHook,
+  signingRoutes,
+  type HeadersHook,
+  type RequestHook,
+} from "./support/wire-fixture.js";
 
-/**
- * Wire-level off-peak routing tests through the REAL provider stream path:
- * real signer (gate/handshake stubbed, cipher generated locally), real pi-ai
- * anthropic client (fetch stubbed), and models shaped exactly as the senpi
- * provider composer emits them — baseUrl preserved, headers cleared.
- */
-
-const subtle = nodeWebcrypto.subtle;
 const KEY = "wire-key-id.wire-secret";
 const JWT = "wire-jwt";
-const OFFPEAK_MESSAGES = "https://zcode.z.ai/api/v1/off-peak/anthropic/v1/messages";
-const ULTRA_MESSAGES = "https://zcode.z.ai/api/v1/ultra-zai/anthropic/v1/messages";
-const IN_WINDOW = new Date("2026-09-09T18:00:00Z"); // 03:00 KST
-const WINDOW_EDGE = new Date("2026-09-09T00:59:59.500Z"); // 09:59:59.5 KST
-const OUT_WINDOW = new Date("2026-09-09T08:00:00Z"); // 17:00 KST
+const TICKET_BASE = "https://zcode.z.ai/api/v1/off-peak/ticket";
+const IN_WINDOW = new Date("2026-09-09T18:00:00Z");
+const WINDOW_EDGE = new Date("2026-09-09T00:59:59.500Z");
+const OUT_WINDOW = new Date("2026-09-09T08:00:00Z");
+const AFTER_TICKET_TTL = new Date(IN_WINDOW.getTime() + 11 * 60_000);
+const FAKE_HOST = "https://fake-glm-host.example/anthropic";
+const MESSAGE_ENDPOINTS = new Set([
+  `${OFFPEAK_BASE_URL}/v1/messages`,
+  `${ULTRA_BASE_URL}/v1/messages`,
+  `${FAKE_HOST}/v1/messages`,
+]);
 
-type Registered = { name: string; config: ProviderConfig };
-
-function captureProvider(): Registered {
-  let captured: Registered | undefined;
-  const pi = new Proxy(
-    {},
-    {
-      get: (_target, property) => {
-        if (property === "registerProvider") {
-          return (name: string, config: ProviderConfig) => {
-            captured = { name, config };
-          };
-        }
-        return () => undefined;
-      },
-    },
-  );
-  glmZcodeExtension(pi as Parameters<typeof glmZcodeExtension>[0]);
-  if (!captured) throw new Error("provider not registered");
-  return captured;
-}
-
-function json(payload: unknown, status = 200): Response {
-  return new Response(JSON.stringify(payload), { status, headers: { "Content-Type": "application/json" } });
-}
+const transcript = normalizeContext({
+  messages: [{ role: "user", content: [{ type: "text", text: "Say OK" }], timestamp: 0 }],
+});
 
 function sseResponse(): Response {
   const frames = [
@@ -63,66 +60,191 @@ function sseResponse(): Response {
   return new Response(body, { status: 200, headers: { "Content-Type": "text/event-stream" } });
 }
 
-async function hkdf(secret: string, info: string): Promise<Uint8Array> {
-  const key = await subtle.importKey("raw", new TextEncoder().encode(secret), "HKDF", false, ["deriveBits"]);
-  const bits = await subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt: new TextEncoder().encode("WD_CLIENT_SIGN_KDF_SALT"), info: new TextEncoder().encode(info) }, key, 256);
-  return new Uint8Array(bits);
-}
-
-/** Server-shaped privateCipher for the real signing handshake. */
-async function cipherFixture(): Promise<string> {
-  const pair = (await subtle.generateKey("Ed25519", true, ["sign", "verify"])) as CryptoKeyPair;
-  const pkcs8 = await subtle.exportKey("pkcs8", pair.privateKey);
-  const aes = await subtle.importKey("raw", await hkdf("wire-secret", "ed25519_priv"), "AES-GCM", false, ["encrypt"]);
-  const iv = new Uint8Array(12);
-  nodeWebcrypto.getRandomValues(iv);
-  const sealed = new Uint8Array(await subtle.encrypt({ additionalData: new TextEncoder().encode("wire-key-id"), iv, name: "AES-GCM", tagLength: 128 } as unknown as Algorithm, aes, new TextEncoder().encode(Buffer.from(pkcs8).toString("base64"))));
-  const out = new Uint8Array(iv.length + sealed.length);
-  out.set(iv);
-  out.set(sealed, iv.length);
-  return Buffer.from(out).toString("base64");
-}
-
-/** A model exactly as the provider composer projects it: headers cleared, baseUrl kept. */
-function composedOffPeakModel() {
+function wireModel(baseUrl: string, id = "glm-5.3-flash"): Model<"anthropic-messages"> {
   return {
     provider: "glm-zcode",
     api: "anthropic-messages",
-    baseUrl: "https://zcode.z.ai/api/v1/off-peak/anthropic",
-    headers: undefined,
-    id: "glm-5.3-flash",
-    name: "GLM-5.3-Flash",
+    baseUrl,
+    id,
+    name: id === "glm-5.3-flash" ? "GLM-5.3-Flash" : id,
     reasoning: true,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 1_000_000,
     maxTokens: 131_072,
-  } as unknown as Parameters<NonNullable<ProviderConfig["streamSimple"]>>[0];
+    thinkingLevelMap: { minimal: "low", low: "low", medium: "low", high: "high", xhigh: "max", max: "max" },
+    compat: { supportsDisabledThinking: false, forceAdaptiveThinking: true },
+  };
 }
 
-/** Composer-shaped glm-zcode model with a fake host and no off-peak routing marker. */
-function composedPassthroughModel() {
+type WireEntry = { url: string; pathname: string; query: string; headers: Record<string, string>; body: string };
+type Route = (url: string, init?: RequestInit) => Response | undefined | Promise<Response | undefined>;
+
+function wireFetch(wire: WireEntry[], route: Route = () => undefined) {
+  return vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input);
+    const routed = await route(url, init);
+    if (routed) return routed;
+    const parsed = new URL(url);
+    const endpoint = parsed.origin + parsed.pathname;
+    if (!MESSAGE_ENDPOINTS.has(endpoint)) throw new Error(`unexpected request: ${url}`);
+    if (parsed.search !== "?beta=true") throw new Error(`unexpected message query: ${url}`);
+    const raw = init?.body;
+    wire.push({
+      url,
+      pathname: endpoint,
+      query: parsed.search,
+      headers: Object.fromEntries(new Headers(init?.headers).entries()),
+      body: typeof raw === "string" ? raw : raw == null ? "" : String(raw),
+    });
+    return sseResponse();
+  });
+}
+
+function withCatalog(route: Route): Route {
+  const catalog = offPeakCatalogRoutes();
+  return (url, init) => catalog(url, init) ?? route(url, init);
+}
+
+function messageUrl(wire: WireEntry[]): WireEntry {
+  const entry = wire.find((item) => item.pathname.endsWith("/v1/messages"));
+  if (!entry) throw new Error("no /v1/messages request was recorded");
+  return entry;
+}
+
+function refreshHost(overrides: Partial<RefreshModelsContext> = {}): RefreshModelsContext {
   return {
-    provider: "glm-zcode",
-    api: "anthropic-messages",
-    baseUrl: "https://fake-glm-host.example/anthropic",
-    headers: undefined,
-    id: "glm-5.3-flash",
-    name: "GLM-5.3-Flash",
-    reasoning: true,
-    input: ["text"],
-    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 1_000_000,
-    maxTokens: 131_072,
-  } as unknown as Parameters<NonNullable<ProviderConfig["streamSimple"]>>[0];
+    allowNetwork: true,
+    force: true,
+    signal: new AbortController().signal,
+    credential: { type: "oauth", access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT },
+    publish: async (publication) => {
+      publication.update?.();
+      return true;
+    },
+    ...overrides,
+  };
 }
 
-const wireContext = {
-  tools: [],
-  messages: [{ role: "user" as const, content: [{ type: "text" as const, text: "Say OK" }], timestamp: Date.now() }],
-} as unknown as Parameters<NonNullable<ProviderConfig["streamSimple"]>>[1];
+async function signedHeaders(
+  provider: Provider,
+  on: ReturnType<typeof vi.fn>,
+  credential: { access: string; jwt?: string } = { access: KEY, jwt: JWT },
+): Promise<Record<string, string | null>> {
+  const oauth = provider.auth.oauth;
+  if (!oauth) throw new Error("OAuth auth not registered");
+  const auth = await oauth.toAuth({
+    type: "oauth",
+    access: credential.access,
+    refresh: "r",
+    expires: 1,
+    ...(credential.jwt === undefined ? {} : { zcodeJwtToken: credential.jwt }),
+  });
+  const headers = auth.headers ?? {};
+  await registeredHook<HeadersHook>(on, "before_provider_headers")({ headers });
+  return headers;
+}
 
-type WireEntry = { url: string; headers: Record<string, string> };
+async function assembledHeaders(access: string): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {
+    ...buildZCodeSourceHeaders(),
+    "X-ZCode-Agent": "glm",
+    Authorization: `Bearer ${access}`,
+  };
+  return { ...headers, ...(await resolveZCodeSigningHeaders(headers)) };
+}
+
+/**
+ * Publishes the live catalog so the extension accepts its own off-peak route:
+ * a caller-held model URL is no longer routing authority, and the publication's
+ * warm-up is the first ticket take.
+ */
+async function publishRoute(
+  provider: Provider,
+  credential: { readonly access: string; readonly jwt: string } = { access: KEY, jwt: JWT },
+): Promise<void> {
+  await publishOffPeakCatalog(provider, credential);
+}
+
+async function runStream(
+  provider: Provider,
+  auth: Record<string, string | null>,
+  options: Partial<SimpleStreamOptions> = {},
+  apiKey = KEY,
+) {
+  return provider.streamSimple(wireModel(OFFPEAK_BASE_URL), transcript, { apiKey, headers: auth, maxRetries: 0, ...options }).result();
+}
+
+async function within<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+function deferredTake() {
+  const state: { started: () => void; startedPromise: Promise<void>; release: () => void } = {
+    started: () => {},
+    startedPromise: Promise.resolve(),
+    release: () => {},
+  };
+  state.startedPromise = new Promise<void>((resolve) => {
+    state.started = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    state.release = resolve;
+  });
+  return {
+    startedPromise: state.startedPromise,
+    started: state.started,
+    release: state.release,
+    async take(ticketId: string): Promise<Response> {
+      state.started();
+      await gate;
+      return jsonResponse({ ticket_id: ticketId, state: "ready" });
+    },
+  };
+}
+
+function ticketSequence(tickets: readonly (string | undefined)[]) {
+  let takes = 0;
+  return {
+    get takes() { return takes; },
+    take(): Response {
+      takes += 1;
+      const ticket = tickets[takes - 1];
+      if (!ticket) return jsonResponse({ code: 3103, msg: "limit" }, 429);
+      return jsonResponse({ ticket_id: ticket, state: "ready" });
+    },
+  };
+}
+
+function expectSignedUltra(model: WireEntry, bearer: string): void {
+  expect(model.pathname).toBe(`${ULTRA_BASE_URL}/v1/messages`);
+  expect(model.query).toBe("?beta=true");
+  expect(model.headers.authorization).toBe(`Bearer ${bearer}`);
+  expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
+  expect(model.headers["x-session-id"]).toBe(zcodeSessionId());
+  expect(model.headers["x-off-peak-ticket-id"]).toBeUndefined();
+  expect(model.headers["x-coding-plan-api-key"]).toBeUndefined();
+}
+
+beforeEach(() => {
+  // Explicit preconditions: an operator's ambient ZCODE_* settings must not reach the assertions.
+  vi.stubEnv("OFFLINE", undefined);
+  vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
+  vi.stubEnv("ZCODE_ANTHROPIC_BASE_URL", undefined);
+  vi.stubEnv("ZCODE_APP_VERSION", "4.0.0");
+  vi.stubEnv("ZCODE_RELEASE_CHANNEL", "production");
+  vi.stubEnv("ZCODE_DEVICE_ID", "wire-device-fixture");
+});
 
 afterEach(() => {
   setOffPeakClockForTests(undefined);
@@ -133,36 +255,46 @@ afterEach(() => {
   vi.unstubAllEnvs();
 });
 
-describe("off-peak wire routing (real signer, composer-shaped models)", () => {
+describe("off-peak wire routing (native provider, signed request path)", () => {
   test("fresh ticket in-window: off-peak gateway, JWT auth, no signature headers", async () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakClockForTests(IN_WINDOW);
-    const { config } = captureProvider();
-    config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
+    const cipher = await cipherFixture();
     const wire: WireEntry[] = [];
+    const tickets = ticketSequence(["t-1"]);
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        const url = String(input);
-        if (url.endsWith("/off-peak/ticket")) return json({ ticket_id: "t-1", state: "ready" });
-        wire.push({ url, headers: Object.fromEntries(new Headers(init?.headers).entries()) });
-        return sseResponse();
-      }),
+      wireFetch(wire, withCatalog((url) => {
+        if (url === TICKET_BASE) return tickets.take();
+        return signingRoutes(cipher)(url);
+      })),
     );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
+    expect(auth.Authorization).toBe(`Bearer ${KEY}`);
+    expect(auth["X-Client-Sig"]).toMatch(/^\S+$/);
 
-    const stream = config.streamSimple!(composedOffPeakModel(), wireContext, {
+    const stream = provider.streamSimple(wireModel(OFFPEAK_BASE_URL), transcript, {
       apiKey: KEY,
-      headers: { Authorization: `Bearer ${KEY}`, "X-ZCode-Agent": "glm" },
-    } as never);
+      headers: auth,
+      maxRetries: 0,
+    });
     const message = await stream.result();
 
     expect(message.content).toEqual([{ type: "text", text: "OK" }]);
-    const model = wire.find((entry) => entry.url.includes("/v1/messages"))!;
-    expect(model.url).toBe(OFFPEAK_MESSAGES);
+    const model = messageUrl(wire);
+    expect(model.pathname).toBe(`${OFFPEAK_BASE_URL}/v1/messages`);
+    expect(model.query).toBe("?beta=true");
     expect(model.headers.authorization).toBe(`Bearer ${JWT}`);
     expect(model.headers["x-off-peak-ticket-id"]).toBe("t-1");
     expect(model.headers["x-coding-plan-api-key"]).toBe(KEY);
     expect(model.headers["x-client-sig"]).toBeUndefined();
+    expect(model.headers["x-zcode-agent"]).toBe("glm");
+    expect(tickets.takes).toBe(1);
+    const body = JSON.parse(model.body) as { model: string; stream: boolean };
+    expect(body.model).toBe("glm-5.3-flash");
+    expect(body.stream).toBe(true);
   });
 
   test("ticket failure and outside window: signed ultra fallback through the real signer", async () => {
@@ -173,313 +305,451 @@ describe("off-peak wire routing (real signer, composer-shaped models)", () => {
       ["out-of-window", OUT_WINDOW, 200],
     ] as const) {
       resetZCodeSigningState();
-      setOffPeakClockForTests(clock);
-      const { config } = captureProvider();
-      config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
+      resetOffPeakStateForTests();
+      setOffPeakClockForTests(IN_WINDOW);
       const wire: WireEntry[] = [];
       const gate: string[] = [];
+      const tickets = ticketSequence(["t-route"]);
       vi.stubGlobal(
         "fetch",
-        vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-          const url = String(input);
-          if (url.endsWith("/off-peak/ticket")) return json({ code: 3103, msg: "limit" }, takeStatus);
-          if (url.endsWith("/agent/configs")) {
-            gate.push(url);
-            return json({ code: 0, data: { codingPlanSignature: { enable: true } } });
+        wireFetch(wire, withCatalog((url) => {
+          if (url === TICKET_BASE) {
+            return takeStatus === 429
+              ? jsonResponse({ code: 3103, msg: "limit" }, 429)
+              : tickets.take();
           }
-          if (url.endsWith("/api/paas/c1f3a7e2/v2/client")) return json({ code: 200, data: { privateCipher: cipher } });
-          wire.push({ url, headers: Object.fromEntries(new Headers(init?.headers).entries()) });
-          return sseResponse();
-        }),
+          if (url === SIGNING_GATE_URL) gate.push(url);
+          return signingRoutes(cipher)(url);
+        })),
       );
+      const { provider, on } = captureExtension();
+      const auth = await signedHeaders(provider, on);
+      await publishRoute(provider);
+      setOffPeakClockForTests(clock);
 
-      const stream = config.streamSimple!(composedOffPeakModel(), wireContext, {
+      const stream = provider.streamSimple(wireModel(OFFPEAK_BASE_URL), transcript, {
         apiKey: KEY,
-        headers: { Authorization: `Bearer ${KEY}`, "X-ZCode-Agent": "glm" },
-      } as never);
+        headers: auth,
+        maxRetries: 0,
+      });
       const message = await stream.result();
 
       expect(message.content, `${label} content`).toEqual([{ type: "text", text: "OK" }]);
       expect(gate, `${label} signing gate consulted`).toHaveLength(1);
-      const model = wire.find((entry) => entry.url.includes("/v1/messages"))!;
-      expect(model.url).toBe(ULTRA_MESSAGES);
-      expect(model.headers.authorization).toBe(`Bearer ${KEY}`);
-      expect(model.headers["x-off-peak-ticket-id"]).toBeUndefined();
-      expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
+      expectSignedUltra(messageUrl(wire), KEY);
+      expect(JSON.parse(messageUrl(wire).body).model).toBe("glm-5.3-flash");
     }
+  });
+
+  test("signed ultra carries source marker, bearer, signed version and matching session metadata", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    vi.stubEnv("ZCODE_DEVICE_ID", "wire-device");
+    setOffPeakClockForTests(OUT_WINDOW);
+    const cipher = await cipherFixture();
+    const wire: WireEntry[] = [];
+    vi.stubGlobal("fetch", wireFetch(wire, signingRoutes(cipher)));
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+
+    const payload = { model: "glm-5.3-flash", messages: [{ role: "user", content: "hi" }] } as Record<string, unknown>;
+    const hook = registeredHook<RequestHook>(on, "before_provider_request");
+    const message = await provider.streamSimple(wireModel(OFFPEAK_BASE_URL), transcript, {
+      apiKey: KEY,
+      headers: auth,
+      maxRetries: 0,
+      onPayload: () => hook({ payload, model: { provider: "glm-zcode" } }),
+    }).result();
+
+    expect(message.content).toEqual([{ type: "text", text: "OK" }]);
+    const model = messageUrl(wire);
+    expect(model.pathname).toBe(`${ULTRA_BASE_URL}/v1/messages`);
+    expect(model.headers["x-zcode-agent"]).toBe("glm");
+    expect(model.headers.authorization).toBe(`Bearer ${KEY}`);
+    expect(model.headers["x-client-version"]).toBe("4.0.0");
+    expect(model.headers["x-session-id"]).toBe(zcodeSessionId());
+    const sent = JSON.parse(model.body) as { metadata: { user_id: string } };
+    const meta = JSON.parse(sent.metadata.user_id) as { device_id: string; session_id: string };
+    expect(meta.device_id).toBe("wire-device");
+    expect(meta.session_id).toBe(model.headers["x-session-id"]);
   });
 
   test("window closing during ticket acquisition falls back to signed ultra", async () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
-    setOffPeakClockForTests(WINDOW_EDGE);
-    const { config } = captureProvider();
-    config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
+    setOffPeakClockForTests(IN_WINDOW);
+    const cipher = await cipherFixture();
     const wire: WireEntry[] = [];
-    let releaseTake: (() => void) | undefined;
-    let takeStarted: (() => void) | undefined;
-    const takeStartedPromise = new Promise<void>((resolve) => {
-      takeStarted = resolve;
-    });
+    const deferred = deferredTake();
+    let takes = 0;
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        const url = String(input);
-        if (url.endsWith("/off-peak/ticket")) {
-          takeStarted?.();
-          await new Promise<void>((resolve) => {
-            releaseTake = resolve;
-          });
-          return json({ ticket_id: "t-late", state: "ready" });
-        }
-        if (url.endsWith("/agent/configs")) return json({ code: 0, data: { codingPlanSignature: { enable: true } } });
-        if (url.endsWith("/api/paas/c1f3a7e2/v2/client")) return json({ code: 200, data: { privateCipher: await cipherFixture() } });
-        wire.push({ url, headers: Object.fromEntries(new Headers(init?.headers).entries()) });
-        return sseResponse();
-      }),
+      wireFetch(wire, withCatalog(async (url) => {
+        if (url !== TICKET_BASE) return signingRoutes(cipher)(url);
+        takes += 1;
+        if (takes > 1) throw new Error(`unexpected extra ticket take ${takes}`);
+        return deferred.take("t-late");
+      })),
     );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+    // Acceptance starts the session-owned warm-up take, which this request then waits on.
+    await publishRoute(provider);
+    await within(deferred.startedPromise, 2_000, "take never started");
 
-    const stream = config.streamSimple!(composedOffPeakModel(), wireContext, {
+    const pending = provider.streamSimple(wireModel(OFFPEAK_BASE_URL), transcript, {
       apiKey: KEY,
-      headers: { Authorization: `Bearer ${KEY}`, "X-ZCode-Agent": "glm" },
-    } as never);
-    const pending = stream.result();
-    await Promise.race([takeStartedPromise, new Promise((_, reject) => setTimeout(() => reject(new Error("take never started")), 2_000))]);
-    setOffPeakClockForTests(new Date("2026-09-09T01:00:01Z")); // window closed mid-acquisition
-    releaseTake?.();
+      headers: auth,
+      maxRetries: 0,
+    }).result();
+    setOffPeakClockForTests(new Date("2026-09-09T01:00:01Z"));
+    deferred.release();
     const message = await pending;
 
     expect(message.content).toEqual([{ type: "text", text: "OK" }]);
-    const model = wire.find((entry) => entry.url.includes("/v1/messages"))!;
-    expect(model.url).toBe(ULTRA_MESSAGES);
-    expect(model.headers.authorization).toBe(`Bearer ${KEY}`);
-    expect(model.headers["x-off-peak-ticket-id"]).toBeUndefined();
-    expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
+    expectSignedUltra(messageUrl(wire), KEY);
   });
 
-  test("transport failure: refreshModels never routes flash off-peak despite a valid window", async () => {
+  test("full stream keeps an off-peak-routed model on the signed ultra path", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakClockForTests(IN_WINDOW);
+    const cipher = await cipherFixture();
+    const wire: WireEntry[] = [];
+    const tickets = ticketSequence(["t-full"]);
+    vi.stubGlobal(
+      "fetch",
+      wireFetch(wire, withCatalog((url) => {
+        if (url === TICKET_BASE) return tickets.take();
+        return signingRoutes(cipher)(url);
+      })),
+    );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
+
+    const message = await provider.stream(wireModel(OFFPEAK_BASE_URL), transcript, {
+      apiKey: KEY,
+      headers: auth,
+      maxRetries: 0,
+      thinkingEnabled: false,
+    }).result();
+
+    expect(message.content).toEqual([{ type: "text", text: "OK" }]);
+    expectSignedUltra(messageUrl(wire), KEY);
+  });
+
+  test("transport disabled: refreshModels never routes flash off-peak despite a valid window", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakTransportForTests(false);
     setOffPeakClockForTests(IN_WINDOW);
-    const { config } = captureProvider();
+    const { provider } = captureExtension();
     const requests: string[] = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: string | URL | Request) => {
         const url = String(input);
         requests.push(url);
-        if (url === "https://api.z.ai/api/anthropic/v1/models") {
-          return json({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
+        if (url === LIVE_MODELS_URL) {
+          return jsonResponse({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
         }
+        if (url === MODELS_DEV_API_URL) return jsonResponse({});
         throw new Error(`unexpected request: ${url}`);
       }),
     );
 
-    const refreshed = await config.refreshModels!({
-      allowNetwork: true,
-      signal: new AbortController().signal,
-      credential: { type: "oauth", access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT },
-      publish: async () => {},
-      force: true,
-    } as never);
+    await provider.refreshModels!(refreshHost());
 
-    expect(refreshed?.map((model) => model.id).sort()).toEqual(["glm-5.3", "glm-5.3-flash"]);
-    const flash = refreshed?.find((model) => model.id.includes("flash"));
-    expect(flash?.baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
-    expect(requests).toEqual(["https://api.z.ai/api/anthropic/v1/models"]);
+    expect(provider.getModels().map((model) => model.id).sort()).toEqual(["glm-5.3", "glm-5.3-flash"]);
+    expect(provider.getModels().find((model) => model.id === "glm-5.3-flash")?.baseUrl).toBe(ULTRA_BASE_URL);
+    expect(requests).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]);
   });
 
   test("transport ready with availability and ticket: refreshModels routes flash off-peak", async () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakClockForTests(IN_WINDOW);
-    const { config } = captureProvider();
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request) => {
-        const url = String(input);
-        if (url === "https://api.z.ai/api/anthropic/v1/models") {
-          return json({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
-        }
-        if (url === "https://zcode.z.ai/api/v1/off-peak/ticket/availability") {
-          return json({ code: 0, data: { can_take_number: true } });
-        }
-        if (url === "https://zcode.z.ai/api/v1/off-peak/ticket") {
-          return json({ ticket_id: "t-refresh", state: "ready" });
-        }
-        throw new Error(`unexpected request: ${url}`);
-      }),
-    );
-
-    const refreshed = await config.refreshModels!({
-      allowNetwork: true,
-      signal: new AbortController().signal,
-      credential: { type: "oauth", access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT },
-      publish: async () => {},
-      force: true,
-    } as never);
-
-    const flash = refreshed?.find((model) => model.id.includes("flash"));
-    const plain = refreshed?.find((model) => !model.id.includes("flash"));
-    expect(flash?.baseUrl).toBe("https://zcode.z.ai/api/v1/off-peak/anthropic");
-    expect(plain?.baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
-    vi.unstubAllEnvs();
-  });
-});
-
-describe("pending ticket lifecycle (retry and reacquisition)", () => {
-  const routedModel = () => composedOffPeakModel();
-  const run = (config: ProviderConfig, clock: Date) =>
-    config.streamSimple!(routedModel(), wireContext, { apiKey: KEY, headers: { Authorization: `Bearer ${KEY}`, "X-ZCode-Agent": "glm" } } as never).result();
-
-  test("a failed request-time acquisition is retried on the next request", async () => {
-    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
-    setOffPeakClockForTests(IN_WINDOW);
-    let takes = 0;
-    const wire: string[] = [];
+    const { provider } = captureExtension();
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
         const url = String(input);
-        if (url.endsWith("/off-peak/ticket")) {
-          takes += 1;
-          return takes === 1 ? json({ code: 3103, msg: "limit" }, 429) : json({ ticket_id: "t-retry", state: "ready" });
-        }
-        if (url.endsWith("/agent/configs")) return json({ code: 0, data: { codingPlanSignature: { enable: true } } });
-        if (url.endsWith("/api/paas/c1f3a7e2/v2/client")) return json({ code: 200, data: { privateCipher: await cipherFixture() } });
-        wire.push(url);
-        return sseResponse();
+        const catalog = offPeakCatalogRoutes();
+        const routed = catalog(url, init);
+        if (routed) return routed;
+        if (url === TICKET_BASE) return jsonResponse({ ticket_id: "t-refresh", state: "ready" });
+        throw new Error(`unexpected request: ${url}`);
       }),
     );
 
-    const { config } = captureProvider();
-    config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
-    await run(config, IN_WINDOW);
-    await run(config, IN_WINDOW);
+    await provider.refreshModels!(refreshHost());
 
-    expect(takes).toBe(2);
-    expect(wire).toEqual([ULTRA_MESSAGES, OFFPEAK_MESSAGES]);
+    expect(provider.getModels().find((model) => model.id === "glm-5.3-flash")?.baseUrl).toBe(OFFPEAK_BASE_URL);
+    expect(provider.getModels().find((model) => model.id === "glm-5.3")?.baseUrl).toBe(ULTRA_BASE_URL);
+  });
+});
+
+describe("negative wire fallbacks (native transport)", () => {
+  test("missing JWT: signed ultra, no ticket or coding-plan headers, no ticket traffic", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakClockForTests(IN_WINDOW);
+    const cipher = await cipherFixture();
+    const wire: WireEntry[] = [];
+    const auxiliary: string[] = [];
+    const ticketCalls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      wireFetch(wire, (url) => {
+        if (url === TICKET_BASE || url === `${TICKET_BASE}/availability`) {
+          ticketCalls.push(url);
+          return jsonResponse({ ticket_id: "unexpected", state: "ready" });
+        }
+        return signingRoutes(cipher, auxiliary)(url);
+      }),
+    );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on, { access: KEY });
+
+    const message = await runStream(provider, auth);
+
+    expect(message.content).toEqual([{ type: "text", text: "OK" }]);
+    const model = messageUrl(wire);
+    expectSignedUltra(model, KEY);
+    expect(model.headers.authorization).not.toBe(`Bearer ${JWT}`);
+    expect(ticketCalls).toEqual([]);
+    expect(auxiliary).toEqual([SIGNING_GATE_URL, SIGNING_HANDSHAKE_URL]);
+  });
+
+  test("mismatched credential: another account's key never reuses the ticket owner's request", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakClockForTests(IN_WINDOW);
+    const accountA = "account-a-key.account-a-secret";
+    const accountB = "account-b-key.account-b-secret";
+    const jwtA = "jwt-account-a";
+    const cipherA = await cipherFixture({ apiKeyId: "account-a-key", apiKeySecret: "account-a-secret" });
+    const cipherB = await cipherFixture({ apiKeyId: "account-b-key", apiKeySecret: "account-b-secret" });
+    const wire: WireEntry[] = [];
+    const tickets: WireEntry[] = [];
+    const sequence = ticketSequence(["t-account-a"]);
+    vi.stubGlobal(
+      "fetch",
+      wireFetch(wire, withCatalog((url, init) => {
+        if (url === TICKET_BASE) {
+          tickets.push({
+            url,
+            pathname: url,
+            query: "",
+            headers: Object.fromEntries(new Headers(init?.headers).entries()),
+            body: typeof init?.body === "string" ? init.body : "",
+          });
+          return sequence.take();
+        }
+        return signingRoutes((apiKey) => (apiKey === accountB ? cipherB : cipherA))(url, init);
+      })),
+    );
+    const { provider, on } = captureExtension();
+    const authA = await signedHeaders(provider, on, { access: accountA, jwt: jwtA });
+    await publishRoute(provider, { access: accountA, jwt: jwtA });
+    await runStream(provider, authA, {}, accountA);
+    const authB = await assembledHeaders(accountB);
+    const message = await runStream(provider, authB, {}, accountB);
+
+    expect(message.content).toEqual([{ type: "text", text: "OK" }]);
+    expect(wire).toHaveLength(2);
+    expect(wire[0].pathname).toBe(`${OFFPEAK_BASE_URL}/v1/messages`);
+    expect(wire[0].headers.authorization).toBe(`Bearer ${jwtA}`);
+    expect(wire[0].headers["x-off-peak-ticket-id"]).toBe("t-account-a");
+    expect(wire[0].headers["x-coding-plan-api-key"]).toBe(accountA);
+    expectSignedUltra(wire[1], accountB);
+    expect(wire[1].headers.authorization).not.toBe(`Bearer ${jwtA}`);
+    expect(sequence.takes).toBe(1);
+    expect(tickets[0].headers.authorization).toBe(`Bearer ${jwtA}`);
+    expect(tickets[0].headers["x-coding-plan-api-key"]).toBe(accountA);
+  });
+
+  test("expired ticket with no usable replacement: signed ultra", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakClockForTests(IN_WINDOW);
+    const cipher = await cipherFixture();
+    const wire: WireEntry[] = [];
+    const sequence = ticketSequence(["t-expiring", undefined]);
+    vi.stubGlobal(
+      "fetch",
+      wireFetch(wire, withCatalog((url) => {
+        if (url === TICKET_BASE) return sequence.take();
+        return signingRoutes(cipher)(url);
+      })),
+    );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
+    await runStream(provider, auth);
+    expect(wire[0].headers["x-off-peak-ticket-id"]).toBe("t-expiring");
+
+    setOffPeakClockForTests(AFTER_TICKET_TTL);
+    const message = await runStream(provider, auth);
+
+    expect(message.content).toEqual([{ type: "text", text: "OK" }]);
+    expectSignedUltra(wire[1], KEY);
+    expect(wire[1].headers.authorization).not.toBe(`Bearer ${JWT}`);
+    expect(sequence.takes).toBe(2);
+  });
+
+  test("transport disabled while eligible and opted in: signed ultra, no ticket traffic", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakTransportForTests(false);
+    setOffPeakClockForTests(IN_WINDOW);
+    const cipher = await cipherFixture();
+    const wire: WireEntry[] = [];
+    const ticketCalls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      wireFetch(wire, (url) => {
+        if (url === TICKET_BASE || url === `${TICKET_BASE}/availability`) {
+          ticketCalls.push(url);
+          return jsonResponse({ ticket_id: "unexpected", state: "ready" });
+        }
+        return signingRoutes(cipher)(url);
+      }),
+    );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+
+    const message = await runStream(provider, auth);
+
+    expect(message.content).toEqual([{ type: "text", text: "OK" }]);
+    expectSignedUltra(messageUrl(wire), KEY);
+    expect(ticketCalls).toEqual([]);
+  });
+});
+
+describe("pending ticket lifecycle (retry and reacquisition)", () => {
+  const pathnames = (wire: WireEntry[]) => wire.map((entry) => entry.pathname);
+
+  test("a failed request-time acquisition is retried on the next request", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakClockForTests(IN_WINDOW);
+    const cipher = await cipherFixture();
+    const sequence = ticketSequence(["t-warm", undefined, "t-retry"]);
+    const wire: WireEntry[] = [];
+    vi.stubGlobal(
+      "fetch",
+      wireFetch(wire, withCatalog((url) => {
+        if (url === TICKET_BASE) return sequence.take();
+        return signingRoutes(cipher)(url);
+      })),
+    );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
+    await runStream(provider, auth);
+    setOffPeakClockForTests(AFTER_TICKET_TTL);
+    await runStream(provider, auth);
+    await runStream(provider, auth);
+
+    expect(sequence.takes).toBe(3);
+    expect(pathnames(wire)).toEqual([
+      `${OFFPEAK_BASE_URL}/v1/messages`,
+      `${ULTRA_BASE_URL}/v1/messages`,
+      `${OFFPEAK_BASE_URL}/v1/messages`,
+    ]);
   });
 
   test("a refresh warm-up does not bypass ticket expiry (refresh-first flow)", async () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakClockForTests(IN_WINDOW);
-    let takes = 0;
+    const cipher = await cipherFixture();
+    const sequence = ticketSequence(["t-warm-1", "t-warm-2"]);
+    const wire: WireEntry[] = [];
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: string | URL | Request) => {
-        const url = String(input);
-        if (url.endsWith("/off-peak/ticket")) {
-          takes += 1;
-          return json({ ticket_id: `t-warm-${takes}`, state: "ready" });
-        }
-        if (url.endsWith("/off-peak/ticket/availability")) return json({ code: 0, data: { can_take_number: true } });
-        throw new Error(`unexpected ${url}`);
-      }),
+      wireFetch(wire, withCatalog((url) => {
+        if (url === TICKET_BASE) return sequence.take();
+        return signingRoutes(cipher)(url);
+      })),
     );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+    await provider.refreshModels!(refreshHost());
+    expect(provider.getModels().find((model) => model.id === "glm-5.3-flash")?.baseUrl).toBe(OFFPEAK_BASE_URL);
+    await runStream(provider, auth);
+    setOffPeakClockForTests(AFTER_TICKET_TTL);
+    await runStream(provider, auth);
 
-    const wire: string[] = [];
-    const usedTickets: string[] = [];
-    const { config } = captureProvider();
-    config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        const url = String(input);
-        if (url === "https://api.z.ai/api/anthropic/v1/models") {
-          return json({ data: [{ id: "glm-5.3-flash", display_name: "GLM-5.3-Flash" }, { id: "glm-5.3", display_name: "GLM-5.3" }] });
-        }
-        if (url.endsWith("/off-peak/ticket")) {
-          takes += 1;
-          return json({ ticket_id: `t-warm-${takes}`, state: "ready" });
-        }
-        if (url.endsWith("/off-peak/ticket/availability")) return json({ code: 0, data: { can_take_number: true } });
-        if (url.endsWith("/agent/configs")) return json({ code: 0, data: { codingPlanSignature: { enable: true } } });
-        if (url.endsWith("/api/paas/c1f3a7e2/v2/client")) return json({ code: 200, data: { privateCipher: await cipherFixture() } });
-        if (url.includes("/v1/messages")) {
-          wire.push(url);
-          usedTickets.push(new Headers(init?.headers).get("x-off-peak-ticket-id") ?? "?");
-          return sseResponse();
-        }
-        throw new Error(`unexpected ${url}`);
-      }),
-    );
-    const refreshed = await config.refreshModels!({
-      allowNetwork: true,
-      signal: new AbortController().signal,
-      credential: { type: "oauth", access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT },
-      publish: async () => {},
-      force: true,
-    } as never);
-    expect(refreshed?.find((model) => model.id.includes("flash"))?.baseUrl).toBe("https://zcode.z.ai/api/v1/off-peak/anthropic");
-    expect(takes).toBe(1); // the refresh warm-up itself took the ticket
-    await run(config, IN_WINDOW); // uses the warm ticket
-    setOffPeakClockForTests(new Date(IN_WINDOW.getTime() + 11 * 60_000)); // TTL expiry
-    await run(config, IN_WINDOW); // must re-take with a NEW ticket id
-
-    expect(takes).toBe(2); // warm take + one reacquisition after TTL
-    expect(wire).toEqual([OFFPEAK_MESSAGES, OFFPEAK_MESSAGES]);
-    expect(usedTickets[0]).not.toBe(usedTickets[1]);
-    expect(usedTickets[1]).toBe("t-warm-2");
-    vi.unstubAllEnvs();
+    expect(sequence.takes).toBe(2);
+    expect(pathnames(wire)).toEqual([`${OFFPEAK_BASE_URL}/v1/messages`, `${OFFPEAK_BASE_URL}/v1/messages`]);
+    expect(wire[0].headers["x-off-peak-ticket-id"]).toBe("t-warm-1");
+    expect(wire[1].headers["x-off-peak-ticket-id"]).toBe("t-warm-2");
   });
 
   test("a fulfilled pending promise does not outlive the ticket TTL", async () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakClockForTests(IN_WINDOW);
-    let takes = 0;
+    const cipher = await cipherFixture();
+    const sequence = ticketSequence(["t-1", "t-2"]);
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: string | URL | Request) => {
-        const url = String(input);
-        if (url.endsWith("/off-peak/ticket")) {
-          takes += 1;
-          return json({ ticket_id: `t-${takes}`, state: "ready" });
-        }
-        throw new Error(`unexpected ${url}`);
-      }),
+      wireFetch([], withCatalog((url) => {
+        if (url === TICKET_BASE) return sequence.take();
+        return signingRoutes(cipher)(url);
+      })),
     );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
+    await runStream(provider, auth);
+    setOffPeakClockForTests(AFTER_TICKET_TTL);
+    await runStream(provider, auth);
 
-    const { config } = captureProvider();
-    config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
-    await run(config, IN_WINDOW); // take 1, cached fresh
-    setOffPeakClockForTests(new Date(IN_WINDOW.getTime() + 11 * 60_000)); // TTL expired, same window
-    await run(config, IN_WINDOW); // must re-take, not reuse the fulfilled promise
+    expect(sequence.takes).toBe(2);
+  });
 
-    expect(takes).toBe(2);
+  test("a valid ticket is reacquired after expiry when the server grants another", async () => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakClockForTests(IN_WINDOW);
+    const cipher = await cipherFixture();
+    const sequence = ticketSequence(["t-reacquired-1", "t-reacquired-2"]);
+    const wire: WireEntry[] = [];
+    vi.stubGlobal(
+      "fetch",
+      wireFetch(wire, withCatalog((url) => {
+        if (url === TICKET_BASE) return sequence.take();
+        return signingRoutes(cipher)(url);
+      })),
+    );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
+    await runStream(provider, auth);
+    setOffPeakClockForTests(AFTER_TICKET_TTL);
+    await runStream(provider, auth);
+
+    expect(sequence.takes).toBe(2);
+    expect(pathnames(wire)).toEqual([`${OFFPEAK_BASE_URL}/v1/messages`, `${OFFPEAK_BASE_URL}/v1/messages`]);
+    expect(wire[1].headers["x-off-peak-ticket-id"]).toBe("t-reacquired-2");
   });
 });
 
 describe("device identity metadata (PR10)", () => {
-  const captured = (handlers: Record<string, unknown[]>) => {
-    let config: ProviderConfig | undefined;
-    const pi = new Proxy({}, { get: (_t: any, p: any) => (p === "registerProvider" ? (_n: string, c: ProviderConfig) => { config = c; } : (p === "on" ? (e: string, h: any) => { (handlers[e] ??= []).push(h); } : () => undefined)) });
-    glmZcodeExtension(pi as Parameters<typeof glmZcodeExtension>[0]);
-    if (!config) throw new Error("not registered");
-    return config;
-  };
-
   test("before_provider_request injects metadata.user_id with the machine device id", async () => {
     vi.stubEnv("ZCODE_DEVICE_ID", "test-device-1234");
-    const handlers: Record<string, unknown[]> = {};
-    captured(handlers);
-    expect(handlers["before_provider_request"]).toHaveLength(1);
-    expect(handlers["before_provider_headers"]).toHaveLength(1);
-    const hook = handlers["before_provider_request"][0] as (e: any) => unknown;
+    const { on } = captureExtension();
+    expect(on.mock.calls.filter(([name]) => name === "before_provider_request")).toHaveLength(1);
+    expect(on.mock.calls.filter(([name]) => name === "before_provider_headers")).toHaveLength(1);
+    const hook = registeredHook<RequestHook>(on, "before_provider_request");
     const payload: Record<string, unknown> = { model: "glm-5.3-flash", messages: [] };
-    const model = { provider: "glm-zcode" };
-    const result = hook({ payload, model });
-    const meta = JSON.parse((payload.metadata as { user_id: string }).user_id);
+    const result = hook({ payload, model: { provider: "glm-zcode" } });
+    const meta = JSON.parse((payload.metadata as { user_id: string }).user_id) as {
+      device_id: string;
+      account_uuid: string;
+      session_id: string;
+    };
     expect(meta.device_id).toBe("test-device-1234");
     expect(meta.account_uuid).toBe("");
-    expect(typeof meta.session_id).toBe("string");
+    expect(meta.session_id).toBe(zcodeSessionId());
     expect(result).toBe(payload);
-    vi.unstubAllEnvs();
   });
 
   test("foreign providers and pre-existing metadata are untouched", async () => {
     vi.stubEnv("ZCODE_DEVICE_ID", "test-device-1234");
-    const handlers: Record<string, unknown[]> = {};
-    captured(handlers);
-    expect(handlers["before_provider_request"]).toHaveLength(1);
-    const hook = handlers["before_provider_request"][0] as (e: any) => unknown;
+    const { on } = captureExtension();
+    const hook = registeredHook<RequestHook>(on, "before_provider_request");
     const foreign: Record<string, unknown> = { model: "x", messages: [] };
     hook({ payload: foreign, model: { provider: "openai" } });
     expect(foreign.metadata).toBeUndefined();
@@ -490,23 +760,21 @@ describe("device identity metadata (PR10)", () => {
 
   test("off-peak routing requires ZCODE_OFFPEAK_ENABLE=1", async () => {
     setOffPeakClockForTests(IN_WINDOW);
+    const { provider } = captureExtension();
+    const requests: string[] = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: string | URL | Request) => {
         const url = String(input);
-        if (url === "https://api.z.ai/api/anthropic/v1/models") return json({ data: [{ id: "glm-5.3-flash" }] });
-        throw new Error(`unexpected ${url}`);
+        requests.push(url);
+        if (url === LIVE_MODELS_URL) return jsonResponse({ data: [{ id: "glm-5.3-flash" }] });
+        if (url === MODELS_DEV_API_URL) return jsonResponse({});
+        throw new Error(`unexpected request: ${url}`);
       }),
     );
-    const { config } = captureProvider();
-    const refreshed = await config.refreshModels!({
-      allowNetwork: true,
-      signal: new AbortController().signal,
-      credential: { type: "oauth", access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT },
-      publish: async () => {},
-      force: true,
-    } as never);
-    expect(refreshed?.[0].baseUrl).toBe("https://zcode.z.ai/api/v1/ultra-zai/anthropic");
+    await provider.refreshModels!(refreshHost());
+    expect(provider.getModels().find((model) => model.id === "glm-5.3-flash")?.baseUrl).toBe(ULTRA_BASE_URL);
+    expect(requests).toEqual([LIVE_MODELS_URL, MODELS_DEV_API_URL]); // No availability/take, even if a failure would be swallowed.
   });
 });
 
@@ -514,31 +782,15 @@ describe("stale off-peak routing guard", () => {
   test("flag unset: off-peak-routed model falls back to signed ultra at request time", async () => {
     const cipher = await cipherFixture();
     setOffPeakClockForTests(IN_WINDOW);
-    const { config } = captureProvider();
-    config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
     const wire: WireEntry[] = [];
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        const url = String(input);
-        if (url.endsWith("/agent/configs")) return json({ code: 0, data: { codingPlanSignature: { enable: true } } });
-        if (url.endsWith("/api/paas/c1f3a7e2/v2/client")) return json({ code: 200, data: { privateCipher: cipher } });
-        wire.push({ url, headers: Object.fromEntries(new Headers(init?.headers).entries()) });
-        return sseResponse();
-      }),
-    );
+    vi.stubGlobal("fetch", wireFetch(wire, signingRoutes(cipher)));
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
 
-    const stream = config.streamSimple!(composedOffPeakModel(), wireContext, {
-      apiKey: KEY,
-      headers: { Authorization: `Bearer ${KEY}`, "X-ZCode-Agent": "glm" },
-    } as never);
-    const message = await stream.result();
+    const message = await runStream(provider, auth);
 
     expect(message.content).toEqual([{ type: "text", text: "OK" }]);
-    const model = wire.find((entry) => entry.url.includes("/v1/messages"))!;
-    expect(model.url).toBe(ULTRA_MESSAGES);
-    expect(model.headers.authorization).toBe(`Bearer ${KEY}`);
-    expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
+    expectSignedUltra(messageUrl(wire), KEY);
   });
 });
 
@@ -546,29 +798,27 @@ describe("off-peak flag gates cached tickets too", () => {
   test("warm cache is bypassed when ZCODE_OFFPEAK_ENABLE is unset mid-flight", async () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakClockForTests(IN_WINDOW);
-    let takes = 0;
-    const wire: string[] = [];
+    const cipher = await cipherFixture();
+    const sequence = ticketSequence(["t-c"]);
+    const wire: WireEntry[] = [];
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        const url = String(input);
-        if (url.endsWith("/off-peak/ticket")) { takes += 1; return json({ ticket_id: "t-c", state: "ready" }); }
-        if (url.endsWith("/agent/configs")) return json({ code: 0, data: { codingPlanSignature: { enable: true } } });
-        if (url.endsWith("/api/paas/c1f3a7e2/v2/client")) return json({ code: 200, data: { privateCipher: await cipherFixture() } });
-        if (url.includes("/v1/messages")) { wire.push(url); return sseResponse(); }
-        throw new Error(`unexpected ${url}`);
-      }),
+      wireFetch(wire, withCatalog((url) => {
+        if (url === TICKET_BASE) return sequence.take();
+        return signingRoutes(cipher)(url);
+      })),
     );
-    const { config } = captureProvider();
-    config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
-    const run = () => config.streamSimple!(composedOffPeakModel(), wireContext, { apiKey: KEY, headers: { Authorization: `Bearer ${KEY}`, "X-ZCode-Agent": "glm" } } as never).result();
-    await run(); // warms the ticket cache (off-peak)
-    expect(wire[0]).toBe(OFFPEAK_MESSAGES);
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
+    await runStream(provider, auth);
+    expect(wire[0]?.pathname).toBe(`${OFFPEAK_BASE_URL}/v1/messages`);
 
-    vi.unstubAllEnvs(); // flag OFF mid-flight, cache still warm
-    await run(); // must ignore the warm cache and fall back to signed ultra
-    expect(wire[1]).toBe(ULTRA_MESSAGES);
-    expect(takes).toBe(1); // no new acquisition either
+    // Only the flag changes: un-stubbing would restore an operator's ambient value.
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
+    await runStream(provider, auth);
+    expect(wire[1]?.pathname).toBe(`${ULTRA_BASE_URL}/v1/messages`);
+    expect(sequence.takes).toBe(1);
   });
 });
 
@@ -577,72 +827,101 @@ describe("flag drops mid-acquisition", () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
     setOffPeakClockForTests(IN_WINDOW);
     const cipher = await cipherFixture();
-    const { config } = captureProvider();
-    config.oauth!.getApiKey({ access: KEY, refresh: "r", expires: 1, zcodeJwtToken: JWT });
     const wire: WireEntry[] = [];
-    let releaseTake: (() => void) | undefined;
-    let takeStarted: (() => void) | undefined;
-    const takeStartedPromise = new Promise<void>((resolve) => { takeStarted = resolve; });
+    const deferred = deferredTake();
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        const url = String(input);
-        if (url.endsWith("/off-peak/ticket")) {
-          takeStarted?.();
-          await new Promise<void>((resolve) => { releaseTake = resolve; });
-          return json({ ticket_id: "t-midflight", state: "ready" });
-        }
-        if (url.endsWith("/agent/configs")) return json({ code: 0, data: { codingPlanSignature: { enable: true } } });
-        if (url.endsWith("/api/paas/c1f3a7e2/v2/client")) return json({ code: 200, data: { privateCipher: cipher } });
-        wire.push({ url, headers: Object.fromEntries(new Headers(init?.headers).entries()) });
-        return sseResponse();
-      }),
+      wireFetch(wire, withCatalog(async (url) => {
+        if (url !== TICKET_BASE) return signingRoutes(cipher)(url);
+        return deferred.take("t-midflight");
+      })),
     );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
+    await within(deferred.startedPromise, 2_000, "take never started");
 
-    const pending = config.streamSimple!(composedOffPeakModel(), wireContext, {
-      apiKey: KEY,
-      headers: { Authorization: `Bearer ${KEY}`, "X-ZCode-Agent": "glm" },
-    } as never).result();
-    await Promise.race([takeStartedPromise, new Promise((_, reject) => setTimeout(() => reject(new Error("take never started")), 2_000))]);
-    vi.unstubAllEnvs(); // flag unset while the take is in flight
-    releaseTake?.();
+    const pending = runStream(provider, auth);
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
+    deferred.release();
     const message = await pending;
 
     expect(message.content).toEqual([{ type: "text", text: "OK" }]);
-    const model = wire.find((entry) => entry.url.includes("/v1/messages"))!;
-    expect(model.url).toBe(ULTRA_MESSAGES);
-    expect(model.headers.authorization).toBe(`Bearer ${KEY}`);
-    expect(model.headers["x-off-peak-ticket-id"]).toBeUndefined();
-    expect(model.headers["x-client-sig"]).toMatch(/^\S+$/);
+    expectSignedUltra(messageUrl(wire), KEY);
   });
 });
 
 describe("non-routed passthrough wire", () => {
+  test.each(["ready", "refused"])("host-selected URL beats the accepted route with warm-up %s", async outcome => {
+    vi.stubEnv("ZCODE_OFFPEAK_ENABLE", "1");
+    setOffPeakClockForTests(IN_WINDOW);
+    const cipher = await cipherFixture();
+    const wire: WireEntry[] = [];
+    const unexpected: string[] = [];
+    const sequence = ticketSequence([outcome === "ready" ? "warm" : undefined]);
+    vi.stubGlobal("fetch", wireFetch(wire, withCatalog((url, init) => {
+      if (url === TICKET_BASE) {
+        if (sequence.takes !== 0) {
+          unexpected.push(url);
+          throw new Error(`unexpected request-time take: ${url}`);
+        }
+        return sequence.take();
+      }
+      const signing = signingRoutes(cipher)(url, init);
+      if (signing || MESSAGE_ENDPOINTS.has(new URL(url).origin + new URL(url).pathname)) return signing;
+      unexpected.push(url);
+      throw new Error(`unexpected request: ${url}`);
+    })));
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
+    await publishRoute(provider);
+
+    const result = await provider.streamSimple(wireModel(FAKE_HOST), transcript, {
+      apiKey: KEY, headers: auth, maxRetries: 0,
+    }).result();
+
+    expect(result.content).toEqual([{ type: "text", text: "OK" }]);
+    expect(wire.map(entry => entry.pathname)).toEqual([`${FAKE_HOST}/v1/messages`]);
+    expect(wire[0].headers.authorization).toBe(`Bearer ${KEY}`);
+    expect(wire[0].headers["x-client-sig"]).toMatch(/^\S+$/);
+    expect(wire[0].headers["x-off-peak-ticket-id"]).toBeUndefined();
+    expect(sequence.takes).toBe(1);
+    expect(unexpected).toEqual([]);
+  });
+
   test("plain glm-zcode model hits only the model baseUrl /v1/messages", async () => {
     vi.stubEnv("ZCODE_OFFPEAK_ENABLE", undefined);
-    const { config } = captureProvider();
-    const FAKE_MESSAGES = "https://fake-glm-host.example/anthropic/v1/messages";
-    const wire: (WireEntry & { body: string })[] = [];
+    const cipher = await cipherFixture();
+    const wire: WireEntry[] = [];
+    const auxiliary: string[] = [];
+    const unexpectedAuxiliary: string[] = [];
     vi.stubGlobal(
       "fetch",
-      vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        const url = String(input);
-        const raw = init?.body;
-        wire.push({ url, headers: Object.fromEntries(new Headers(init?.headers).entries()), body: typeof raw === "string" ? raw : raw == null ? "" : String(raw) });
-        return sseResponse();
+      wireFetch(wire, (url) => {
+        if (url === SIGNING_GATE_URL || url === SIGNING_HANDSHAKE_URL) return signingRoutes(cipher, auxiliary)(url);
+        if (url !== `${FAKE_HOST}/v1/messages?beta=true`) {
+          unexpectedAuxiliary.push(url);
+          throw new Error(`unexpected auxiliary request: ${url}`);
+        }
       }),
     );
+    const { provider, on } = captureExtension();
+    const auth = await signedHeaders(provider, on);
 
-    const stream = config.streamSimple!(composedPassthroughModel(), wireContext, {
+    const message = await provider.streamSimple(wireModel(FAKE_HOST), transcript, {
       apiKey: KEY,
-      headers: { Authorization: `Bearer ${KEY}`, "X-ZCode-Agent": "glm" },
-    } as never);
-    const message = await stream.result();
+      headers: auth,
+      maxRetries: 0,
+    }).result();
 
     expect(message.content).toEqual([{ type: "text", text: "OK" }]);
     expect(wire).toHaveLength(1);
-    expect(wire[0].url).toBe(FAKE_MESSAGES);
+    expect(wire[0].pathname).toBe(`${FAKE_HOST}/v1/messages`);
+    expect(wire[0].query).toBe("?beta=true");
     expect(JSON.parse(wire[0].body).model).toBe("glm-5.3-flash");
-    expect(wire.some((entry) => /\/off-peak\/ticket|\/agent\/configs|\/api\/paas\//.test(entry.url))).toBe(false);
+    expect(wire[0].headers["x-off-peak-ticket-id"]).toBeUndefined();
+    expect(wire[0].headers["x-coding-plan-api-key"]).toBeUndefined();
+    expect(auxiliary).toEqual([SIGNING_GATE_URL, SIGNING_HANDSHAKE_URL]);
+    expect(unexpectedAuxiliary).toEqual([]);
   });
 });
